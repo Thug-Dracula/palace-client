@@ -9,10 +9,28 @@ This file exists so a **fresh session** can resume without carrying a long conve
 
 ## Where the code is
 
-Milestone branch: **`feat/palace-ui`**, developed in the worktree
-`~/ProgramFiles/palace-client-ui` (added with
-`git -C ~/ProgramFiles/palace-client worktree add ~/ProgramFiles/palace-client-ui -b feat/palace-ui`).
-The main checkout `~/ProgramFiles/palace-client` is untouched.
+**Branch `feat/palace-ui` is MERGED to `master`** (merge commit `de0969c`, no conflicts). Everything described below is on master now.
+
+A worktree `~/ProgramFiles/palace-client-ui` may still exist — it was left in place because the live demo was launched from it. It is now redundant (same content as master). Remove it when you no longer need the running demo:
+
+```bash
+tmux kill-session -t app; tmux kill-session -t vite
+git -C ~/ProgramFiles/palace-client worktree remove --force ~/ProgramFiles/palace-client-ui
+git worktree prune && git branch -d feat/palace-ui
+```
+
+### Running the app
+
+```bash
+cd ~/ProgramFiles/palace-client
+bun install          # first time only
+bun run dev          # Vite on :1420 — REQUIRED for a debug build
+cargo run -p palace-app
+```
+
+**Gotcha that cost real time:** a debug `cargo build`/`cargo run` loads `devUrl` (`http://localhost:1420`) from `tauri.conf.json`, **not** the bundled frontend. Without Vite running you get a WebKit page reading `Could not connect to localhost: Connection refused` — which looks like a WebKitGTK failure but is not. For a standalone binary use `cargo build --release -p palace-app` or `bun run tauri build`, which use `frontendDist`.
+
+**Trap:** never `pkill -f "<pattern>"` where the pattern appears in your own command string — it kills the shell running it (documented in `~/AGENTS.md`; it killed a tmux server here). Use `pgrep -x`/`pkill -x` or kill by PID.
 
 **397 tests passing, clippy clean, `cargo check` clean, `svelte-check` clean.**
 
