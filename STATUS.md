@@ -29,14 +29,11 @@ These exist because a subagent, trying to satisfy a "watch the window resize" in
 
 ## Where the code is
 
-**Branch `feat/palace-ui` is MERGED to `master`** (merge commit `de0969c`, no conflicts). Everything described below is on master now.
-
-A worktree `~/ProgramFiles/palace-client-ui` may still exist — it was left in place because the live demo was launched from it. It is now redundant (same content as master). Remove it when you no longer need the running demo:
+**Everything described below is on `master`.** The only worktree is `~/ProgramFiles/palace-client`: `palace-client-ui` and `palace-client-ipt` were removed once their branches (`feat/palace-ui`, `feat/events`) were verified contained in master. The branches are kept as a safety net, so nothing is unrecoverable.
 
 ```bash
-tmux kill-session -t app; tmux kill-session -t vite
-git -C ~/ProgramFiles/palace-client worktree remove --force ~/ProgramFiles/palace-client-ui
-git worktree prune && git branch -d feat/palace-ui
+git worktree list              # ~/ProgramFiles/palace-client [master]
+git branch --no-merged master  # empty — every branch is in master
 ```
 
 ### Running the app
@@ -149,7 +146,7 @@ tested. Outgoing chat still uses plaintext `talk` (the server relays it).
 
 ## What is verified, and how
 
-**Hermetic (no network), `cargo test --workspace` — 569 pass:**
+**Hermetic (no network), `cargo test` — 621 pass** (run it in the main worktree; see the `--workspace` caution under operational rules):
 
 * `crates/palace-client/tests/fixture_replay.rs` replays every server frame of
   `fixtures/logon-run1/` through `SessionState` and asserts 81 rooms, Balamb
@@ -328,10 +325,10 @@ The correct method: use the reference registry (OpenPalace `IptDefaultCommands.a
 ## Running it
 
 ```bash
-cd ~/ProgramFiles/palace-client-ui
+cd ~/ProgramFiles/palace-client
 bun install
 bun run check && bun run build          # frontend
-cargo test --workspace                  # 569 tests, no network
+cargo test                              # 621 tests, no network
 bun run tauri dev                       # window; auto-connects to localhost:9998
 
 # headless live checks
