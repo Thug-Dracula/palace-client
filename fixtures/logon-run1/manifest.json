@@ -1,0 +1,169 @@
+{
+  "byte_order": "little",
+  "format": "palace-fixture/1",
+  "frame_count": 16,
+  "frames": [
+    {
+      "decoded": "handshake MSG_TIYID",
+      "direction": "server",
+      "file": "frames/0000-server-tiyr.bin",
+      "length": 0,
+      "opcode": "tiyr",
+      "opcode_value": 1953069426,
+      "ref_num": 13,
+      "seq": 0
+    },
+    {
+      "decoded": "logon: user=\"RustProbe\" reserved=\"SCOUT1\" caps=up:0x41/down:0x151 auxFlags=0x80000008",
+      "direction": "client",
+      "file": "frames/0001-client-regi.bin",
+      "length": 128,
+      "opcode": "regi",
+      "opcode_value": 1919248233,
+      "ref_num": 0,
+      "seq": 1
+    },
+    {
+      "decoded": "server version 1.22",
+      "direction": "server",
+      "file": "frames/0002-server-vers.bin",
+      "length": 0,
+      "opcode": "vers",
+      "opcode_value": 1986359923,
+      "ref_num": 65558,
+      "seq": 2
+    },
+    {
+      "decoded": "server info: name=\"Balamb Garden\" permissions=0x00002e7f (AllowGuests|AllowCyborgs|AllowPainting|AllowCustomProps|AllowWizards|WizardsMayKill|WizardsMayAuthor|DeathPenalty|PurgeInactiveProps|KillFlooders|MemberCreatedRooms)",
+      "direction": "server",
+      "file": "frames/0003-server-sinf.bin",
+      "length": 18,
+      "opcode": "sinf",
+      "opcode_value": 1936289382,
+      "ref_num": 13,
+      "seq": 3
+    },
+    {
+      "decoded": "user status: user_id=13 flags=0x0000 (none) raw_len=44",
+      "direction": "server",
+      "file": "frames/0004-server-uSta.bin",
+      "length": 44,
+      "opcode": "uSta",
+      "opcode_value": 1968403553,
+      "ref_num": 13,
+      "seq": 4
+    },
+    {
+      "decoded": "user logon: user_id=13 total_users=2",
+      "direction": "server",
+      "file": "frames/0005-server-log_.bin",
+      "length": 4,
+      "opcode": "log ",
+      "opcode_value": 1819240224,
+      "ref_num": 13,
+      "seq": 5
+    },
+    {
+      "decoded": "media server: https://media.palace.example.info/palace/media",
+      "direction": "server",
+      "file": "frames/0006-server-HTTP.bin",
+      "length": 47,
+      "opcode": "HTTP",
+      "opcode_value": 1213486160,
+      "ref_num": 0,
+      "seq": 6
+    },
+    {
+      "decoded": "room description: id=901 name=\"Balamb Garden\" picture=\"sqoom23.gif\" artist=\"Psycrow\" hotspots=6 pictures=1 draws=0 props=0 people=1 var_bytes=1184",
+      "direction": "server",
+      "file": "frames/0007-server-room.bin",
+      "length": 1228,
+      "opcode": "room",
+      "opcode_value": 1919905645,
+      "ref_num": 0,
+      "seq": 7
+    },
+    {
+      "decoded": "room user list: 1 users",
+      "direction": "server",
+      "file": "frames/0008-server-rprs.bin",
+      "length": 124,
+      "opcode": "rprs",
+      "opcode_value": 1919971955,
+      "ref_num": 1,
+      "seq": 8
+    },
+    {
+      "decoded": "end of room description",
+      "direction": "server",
+      "file": "frames/0009-server-endr.bin",
+      "length": 0,
+      "opcode": "endr",
+      "opcode_value": 1701733490,
+      "ref_num": 0,
+      "seq": 9
+    },
+    {
+      "decoded": "user entered: id=13 name=\"RustProbe\"",
+      "direction": "server",
+      "file": "frames/0010-server-nprs.bin",
+      "length": 124,
+      "opcode": "nprs",
+      "opcode_value": 1852863091,
+      "ref_num": 13,
+      "seq": 10
+    },
+    {
+      "decoded": "room list: 0 rooms",
+      "direction": "client",
+      "file": "frames/0011-client-rLst.bin",
+      "length": 0,
+      "opcode": "rLst",
+      "opcode_value": 1917612916,
+      "ref_num": 0,
+      "seq": 11
+    },
+    {
+      "decoded": "room list: 81 rooms",
+      "direction": "server",
+      "file": "frames/0012-server-rLst.bin",
+      "length": 2068,
+      "opcode": "rLst",
+      "opcode_value": 1917612916,
+      "ref_num": 81,
+      "seq": 12
+    },
+    {
+      "decoded": "user list: 0 users",
+      "direction": "client",
+      "file": "frames/0013-client-uLst.bin",
+      "length": 0,
+      "opcode": "uLst",
+      "opcode_value": 1967944564,
+      "ref_num": 0,
+      "seq": 13
+    },
+    {
+      "decoded": "user list: 2 users",
+      "direction": "server",
+      "file": "frames/0014-server-uLst.bin",
+      "length": 40,
+      "opcode": "uLst",
+      "opcode_value": 1967944564,
+      "ref_num": 2,
+      "seq": 14
+    },
+    {
+      "decoded": "bye (logoff)",
+      "direction": "client",
+      "file": "frames/0015-client-bye_.bin",
+      "length": 0,
+      "opcode": "bye ",
+      "opcode_value": 1652122912,
+      "ref_num": 0,
+      "seq": 15
+    }
+  ],
+  "generated_by": "palace-wire 0.1.0",
+  "server": "localhost:9998"
+}
