@@ -303,28 +303,80 @@ Current result (PalaceChat dialect, seed 0):
 | ran clean | **3791 (99.6%)** |
 | files fully clean | 2382 (99.4%) |
 
-**Parse failures (4).** All four are genuinely malformed source, not tokenizer
-gaps: a stray `(` (`11054_hs1.txt`), two stray `)` (`13009_hs0.txt`,
-`7665_hs0.txt`) and a stray `@` outside a string (`9211_hs29.txt`). The
-reference tokenizer throws on exactly these characters too.
+### Failure distribution, by cause
 
-**Run failures (14).** Three causes, none a VM bug:
+Every failure is sorted into the four classes the milestone names — a large
+cluster in (a) or (c) would mean the core is wrong; a long tail of (b) is the
+plan — by `iptscrae_palace::classify`, which the report also prints:
 
-1. **Extended commands that this milestone does not implement.** Six failures
-   (`7022_hs2`, `7028_hs0`, `7030_hs0`, `7031_hs0`, `7034_hs0`, `7035_hs0`, all
-   `ON ROOMREADY`) use `HTTPGET`, a PalaceChat-5 extension with no documented
-   signature. It lexes as a variable — exactly as it would in OpenPalace, which
-   does not know it either — so the operands it should have consumed shift the
-   stack. A later milestone adds it.
-2. **Cross-script global state.** Five failures (`144_hs1`, `144_hs2`, `889_hs0`,
-   `5308_hs4`, `14463_hs2`, `14463_hs3`) read globals such as `prar`, `iam` and
-   `cname` that are set by a *different script* in the live server. The harness
-   isolates globals per script file, so those reads see `0`. In a real session
-   with all scripts loaded they resolve.
-3. **A documented divergence.** One failure (`167_hs0`) does
-   `"…id=" TOPPROP &`, concatenating `TOPPROP`'s integer with a string using `&`.
-   The guide and OpenPalace both make `&` strict, so this fails in the reference
-   implementation too; the live client apparently coerced. See the next section.
+| Class | Parse | Run | Meaning |
+|---|---|---|---|
+| (a) tokenizer gap | 0 | 0 | a character the reference accepts and we reject — **should never be non-zero** |
+| (b) unimplemented command | 0 | 7 | the handler calls an extension this milestone does not ship |
+| (c) semantics / environment | 0 | 7 | the reference agrees with us; the script needed host state we did not provide |
+| (d) malformed source | 4 | 0 | the reference tokenizer rejects it too |
+
+**Parse failures (4) — all (d).** All four are genuinely malformed source, not
+tokenizer gaps: a stray `(` (`11054_hs1.txt`), two stray `)` (`13009_hs0.txt`,
+`7665_hs0.txt`) and a stray `@` outside a string (`9211_hs29.txt`). The reference
+tokenizer throws on exactly these characters, so no implementation could have run
+them. (a) is zero *by construction*: `reference_accepts` is asserted against the
+lexer's character set in `classify::tests` and is enforced at lex time, so a
+tokenizer gap would have to be a set-membership contradiction.
+
+**Run failures (14) — 7 (b), 7 (c).**
+
+1. **(b) Six `ON ROOMREADY` handlers** (`7022_hs2`, `7028_hs0`, `7030_hs0`,
+   `7031_hs0`, `7034_hs0`, `7035_hs0`) call `HTTPGET`, a PalaceChat-5 extension
+   with no documented signature. It lexes as a variable — exactly as it would in
+   OpenPalace, which does not know it either — so the operands it should have
+   consumed shift the stack and the next `IF` sees a string. Every one of these
+   handlers also names `CONFIRMBOX` and `PALACECHAT`. A later milestone adds
+   them.
+2. **(b) `167_hs0`** names `ENCODEURL` (and `SETTOOLTIP`/`CLEARTOOLTIP` elsewhere)
+   but the fault actually fires *before* `ENCODEURL`: see the hand trace below.
+   This is the one case where the automatic class and the true cause differ, which
+   is why the report prints the unregistered names next to every failure.
+3. **(c) Five handlers read globals set by a different script** (`144_hs1`,
+   `144_hs2`, `9211_hs2`, `5308_hs4`, `889_hs0`): `hnd EXEC`, `prar EXEC` and
+   friends read a global that another hotspot (or the cyborg) set. The harness
+   isolates globals per file, so those reads see `0`, `EXEC 0` is the documented
+   silent no-op, and the next assignment underflows. Running with
+   `--shared-globals` proves the point: **3796 of 3805 handlers (99.8%) run
+   clean** and the (c) count falls from 7 to 2.
+4. **(c) The two that survive `--shared-globals`** (`5308_hs4`, `889_hs0`) still
+   underflow inside a `&`, because the global they need is set by a script that
+   is not in this corpus directory at all (the harvest is per-hotspot; the
+   room-wide script is a separate payload).
+
+### Hand trace: the `&` divergence (category (c), one script)
+
+`167_hs0.txt`, `ON SELECT`, first line:
+
+```text
+"{\"files\":[\"https://animanic.de/animanicapis/avatar_proxy/avatar.php?id=" TOPPROP & "\"]}" & ENCODEURL storagepath =
+```
+
+Run it through OpenPalace's ActionScript semantics by hand:
+
+1. `"…"` pushes `StringToken`.
+2. `TOPPROP` is `TOPPROPCommand` → pushes `IntegerToken`.
+3. `&` is `ConcatOperator`:
+   ```actionscript
+   var arg2:StringToken = context.stack.popType(StringToken);   // IntegerToken → throws
+   var arg1:StringToken = context.stack.popType(StringToken);
+   ```
+   `popType(StringToken)` does not coerce; it throws
+   `"Expected StringToken element. Got IntegerToken element instead."`
+
+So the reference implementation errors here too — this is a **divergence between
+the guide/reference and the live client that produced the corpus**, not a VM bug.
+The script is a working URL builder (`animanic.de` avatar proxy), so the 1990s
+client evidently coerced the integer. We keep `&` strict because the guide
+("Concatenates string1 and string2"), OpenPalace, *and the task's language facts*
+all say strict, and because coercion is a superset that only rescues scripts — it
+is recorded here rather than silently adopted. Exactly one corpus handler depends
+on it.
 
 ## Divergences and uncertainties
 
@@ -343,60 +395,74 @@ Iptscrae Language Guide* (Communities.com, February 2000).
 | 4 | recursion | 256-list call-stack limit | frame-depth cap, checked before push | explicit, no native recursion |
 | 5 | errors from `WHILE`/`FOREACH` frames | **silently swallowed** (a reference bug) | always propagated | a swallowed error is worse than a reported one |
 | 6 | `EXIT` flag | never cleared; unwinds everything | same effect, via frame truncation | equivalent, clearer |
+| 7 | a fault while parsing one handler | `parseEventHandlers` catches it, logs, and returns `{}` — the **whole file** is discarded | the file is an `Err` carrying the offset | a silent drop hides a broken script; this is why the four malformed corpus files are reported rather than vanishing |
 
 ### Faithful-to-reference quirks (keep them)
 
 | # | Behaviour | Note |
 |---|---|---|
-| 7 | `A-5` is `A`, `-5` | `-` before a digit is a literal sign |
-| 8 | trailing `-` is integer `0` | `parseInt("-")` → `NaN` → `0` |
-| 9 | `==` case-insensitive, `!=`/`<>` case-sensitive | reference asymmetry; the guide says all are case-insensitive — we follow the reference |
-| 10 | only integer `0` is false; `""` is true | `StringToken` does not override `toBoolean` |
-| 11 | `EXEC` on integer `0` is a no-op | intentional idiom, not a bug |
-| 12 | `ARRAY n` with `n < 0` pushes integer `0` | not an empty array |
-| 13 | `SUBSTR` is a containment test | `SUBSTRING` extracts |
-| 14 | division/modulo by zero yield `0` | `int(Infinity)`/`int(NaN)` |
-| 15 | `IFELSE` true clause first; `WHILE` body first | unusual operand order, per the guide |
-| 16 | `PICK -1` is an error | the reference's `uint` coercion |
-| 17 | `TOPTYPE` of a symbol is `2`; `VARTYPE` dereferences | |
-| 18 | integers wrap at 32 bits | |
-| 19 | `ATOI` auto-detects `0x` hex | AS3 `parseInt` without a radix |
-| 20 | `SINE`/`COSINE`/`TANGENT` are `round(x*1000)` | fixed point |
-| 21 | NUL ends the script | reference loop guard |
+| 8 | `A-5` is `A`, `-5` | `-` before a digit is a literal sign |
+| 9 | trailing `-` is integer `0` | `parseInt("-")` → `NaN` → `0`. `5 3 - ` (with a trailing space) subtracts; `5 3 -` at end of input pushes `5 3 0` |
+| 10 | `==` case-insensitive, `!=`/`<>` case-sensitive | reference asymmetry (`EqualityOperator` upper-cases, `InequalityOperator` does not); the guide says all are case-insensitive — we follow the reference |
+| 11 | only integer `0` is false; `""` is true | `StringToken` does not override `toBoolean` |
+| 12 | `EXEC` on integer `0` is a no-op | intentional idiom, not a bug |
+| 13 | `ARRAY n` with `n < 0` pushes integer `0` | not an empty array |
+| 14 | `SUBSTR` is a containment test | `SUBSTRING` extracts |
+| 15 | division/modulo by zero yield `0` | `int(Infinity)`/`int(NaN)` |
+| 16 | `IFELSE` true clause first; `WHILE` body first | unusual operand order, per the guide |
+| 17 | `PICK -1` is an error | the reference's `uint` coercion |
+| 18 | `TOPTYPE` of a symbol is `2`; `VARTYPE` dereferences | |
+| 19 | integers wrap at 32 bits | |
+| 20 | `ATOI` auto-detects `0x` hex | AS3 `parseInt` without a radix |
+| 21 | `SINE`/`COSINE`/`TANGENT` are `round(x*1000)` | fixed point. Rust rounds halves away from zero where JS `Math.round` rounds them up, so an exact `.5` can differ by one — no corpus value lands on a half |
+| 22 | NUL ends the script | reference loop guard |
+| 23 | `BREAK` outside a loop ends the **whole script** | `IptTokenList.step` ends on `breakRequested` and there is no enclosing loop to catch it, so the flag unwinds every frame |
+| 24 | `]` whose `[` mark was already consumed drains the entire stack into the array | `ArrayParseToken` pops "until the mark **or the stack runs out**"; only a `]` with no `[` at all is a lex error |
+| 25 | `RANDOM` with a non-positive bound yields `0` | AS3 computes `int(random()*n)`, which yields `≤ 0` for negative `n`; we clamp instead. No corpus script passes a negative bound |
+| 26 | `&=` requires a string on both sides | `ConcatAssignmentOperator` calls `popType(StringToken)` twice; iptService.js's numeric logical-and fallback is not in the reference |
 
 ### Uncertainties and judgements
 
 | # | Question | Resolution |
 |---|---|---|
-| 22 | Is `&` strict or does it coerce integers? | **Strict**, matching the guide and OpenPalace. Corpus counterexample: `167_hs0.txt` (`TOPPROP &`). Recorded, not silently "fixed". |
-| 23 | Is there a 31-character symbol limit? | The guide says yes; OpenPalace enforces nothing. We do not enforce it either, and document `MAX_SYMBOL_LEN = 31`. No corpus symbol exceeds 18 characters. |
-| 24 | What is a `\x` escape with fewer than two hex digits? | Decoded as a Windows-1252 byte with the digits present; zero digits is byte 0, matching `writeByte(parseInt("0x"))`. |
-| 25 | Do handler names compare case-sensitively? | The reference preserves case and compares exactly; we preserve case and compare case-insensitively (a superset that cannot change a well-formed script). |
-| 26 | Are `\f`/`\v` whitespace? | The reference's main tokenizer accepts only space/tab/CR/LF; its `ON` lookahead uses `/^\s/`, which also accepts `\f`/`\v`. We use the four-character set everywhere, so `ON\fENTER` is not recognised. No corpus occurrence. |
-| 27 | `SGLOBAL` | Not in OpenPalace. The corpus uses `sym SGLOBAL` exactly as `sym GLOBAL` (54 `DUP GLOBAL` vs 12 `DUP SGLOBAL`, always immediately before a condition), and IF only balances if `SGLOBAL` consumes one operand. Registered as an alias of `GLOBAL`. |
-| 28 | Extended PalaceChat commands | Not registered. This crate has no source for their stack effects; registering a guessed arity would corrupt the stack. As variables they behave as they do in OpenPalace. |
-| 29 | Regex | `GREPSTR` is host-provided. The bundled engine supports `^ $ . […] [^…] * + ? () |` and `\xNN`, is step-bounded, and returns only the whole match, so `GREPSUB` substitutes `$0` but leaves `$1`…`$9` alone. A production host supplies a complete engine. |
-| 30 | `STRLEN`/`STRINDEX`/`SUBSTRING` units | AS3 counts UTF-16 code units; we match (`encode_utf16().count()`), except `SUBSTRING` which slices by `char`. Identical for ASCII, which is all the corpus contains. |
-| 31 | `ITOA`/`LOWERCASE`/`UPPERCASE` case mapping | Rust's Unicode mapping, not AS3's. Identical for ASCII. |
-| 32 | `DATETIME`/`TICKS`/`RANDOM` | Host-provided and therefore deterministic in tests and the corpus run (fixed clock, seeded generator). The VM itself never reads a clock or an entropy source. |
-| 33 | `DELAY`, `BEEP`, `_BREAKPOINT` | No-ops here, as in the reference. `ALARMEXEC`/`SETALARM` are handed to the host. |
-| 34 | Where exactly does a command error get attributed? | `IptError::in_command` wraps a fault with the command that raised it, so diagnostics read `GET: array index 5 out of range`. Category is inherited from the underlying fault. |
+| 27 | `SUBSTRING` with a negative `len` | The guide says "negative `len` means the rest of the string"; AS3's `substr` returns empty for `len <= 0`. We follow the **reference** (empty) and follow the **guide** for a negative `offset` (an error, where AS3 counts from the end). The corpus never uses `SUBSTRING` (0 of 2400 files), so nothing supports either side. Recorded, not hidden. |
+| 28 | Is `&` strict or does it coerce integers? | **Strict**, matching the guide, OpenPalace's `popType(StringToken)` and the task's language facts. Corpus counterexample: `167_hs0.txt` (`TOPPROP &`) — one handler, traced by hand in the corpus section above. Recorded, not silently "fixed". |
+| 29 | Is there a 31-character symbol limit? | The guide says yes; OpenPalace enforces nothing. We do not enforce it either, and document `MAX_SYMBOL_LEN = 31`. Verified across the corpus: the longest real symbol is **17** characters (`SETSPOTSTATELOCAL`), so enforcing it would change nothing and rejecting a symbol outright is worse than accepting it. |
+| 30 | What is a `\x` escape with fewer than two hex digits? | Decoded as a Windows-1252 byte with the digits present; zero digits is byte 0, matching `writeByte(parseInt("0x"))`. |
+| 31 | Do handler names compare case-sensitively? | The reference preserves case and compares exactly; we preserve case and compare case-insensitively (a superset that cannot change a well-formed script). |
+| 32 | Are `\f`/`\v` whitespace? | The reference's main tokenizer accepts only space/tab/CR/LF; its `ON` lookahead uses `/^\s/`, which also accepts `\f`/`\v`. We use the four-character set everywhere, so `ON\fENTER` is not recognised. No corpus occurrence. |
+| 33 | `SGLOBAL` | Not in OpenPalace. The corpus uses `sym SGLOBAL` exactly as `sym GLOBAL` (54 `DUP GLOBAL` vs 12 `DUP SGLOBAL`, always immediately before a condition), and IF only balances if `SGLOBAL` consumes one operand. Registered as an alias of `GLOBAL`. |
+| 34 | Extended PalaceChat commands | Not registered. This crate has no source for their stack effects; registering a guessed arity would corrupt the stack. As variables they behave as they do in OpenPalace. The corpus names 25+ of them (`HTTPGET`, `CONFIRMBOX`, `PALACECHAT`, `ENCODEURL`, `HIDESMILEYS`, `LOCKUSERPROPS`, …). |
+| 35 | Regex | `GREPSTR` is host-provided. The bundled engine supports `^ $ . […] [^…] * + ? () \|` and `\xNN`, is step-bounded, and returns only the whole match, so `GREPSUB` substitutes `$0` but leaves `$1`…`$9` alone. A production host supplies a complete engine. |
+| 36 | `STRLEN`/`STRINDEX`/`SUBSTRING` units | AS3 counts UTF-16 code units; we match (`encode_utf16().count()`), except `SUBSTRING` which slices by `char`. Identical for ASCII, which is all the corpus contains. |
+| 37 | `ITOA`/`LOWERCASE`/`UPPERCASE` case mapping | Rust's Unicode mapping, not AS3's. Identical for ASCII. |
+| 38 | `DATETIME`/`TICKS`/`RANDOM` | Host-provided and therefore deterministic in tests and the corpus run (fixed clock, seeded generator). The VM itself never reads a clock or an entropy source. |
+| 39 | `DELAY`, `BEEP`, `_BREAKPOINT` | No-ops here, as in the reference (`DELAYCommand` pops and comments "Do nothing"). `ALARMEXEC`/`SETALARM` are handed to the host. |
+| 40 | Where exactly does a command error get attributed? | `IptError::in_command` wraps a fault with the command that raised it, so diagnostics read `GET: array index 5 out of range`. Category is inherited from the underlying fault. |
+| 41 | How is a corpus failure classed? | `iptscrae_palace::classify`. Parse faults: (a) if the rejected character is one the reference accepts, else (d). Run faults: (b) only when the handler names an unregistered **command-spelled** symbol *and* the fault is not an underflow — an unregistered command leaves its operands behind (a type mismatch), whereas missing host state denies a value (`EXEC 0` no-ops, then the next assignment underflows). The rule and its limits are documented in the module; the report prints the unregistered names so the call can be checked. |
 
 ## Testing
 
 ```bash
 cargo test -p iptscrae          # unit + conformance + hostile-input suites
-cargo test -p iptscrae-palace   # Palace surface (and the corpus test if available)
+cargo test -p iptscrae-palace   # Palace surface, the failure classifier, and the corpus test if available
 cargo clippy --workspace --all-targets
 ```
 
 * `tests/conformance.rs` — one case per operator, command and control-flow form.
+  Every arithmetic, comparison, logic, string, stack, array and host-backed
+  command in the registry has a case, as does every control-flow form.
 * `tests/hostile.rs` — deterministic random token soup and random bytes through
   the lexer, parser and VM (no panic), plus direct tests of every budget:
   endless `WHILE`, hidden recursion, oversized array, unbounded string, deep
-  nesting, stack overflow.
+  nesting, stack overflow. 12,000 randomised runs, all asserted to terminate.
+* `iptscrae-palace/src/classify.rs` — the failure taxonomy's own tests: which
+  character set the reference accepts, how a command spelling is recognised, and
+  how each fault shape maps to a class.
 * `iptscrae-palace/tests/corpus.rs` — runs the harvested corpus when
-  `IPTSCRAE_CORPUS` points at it, asserting ≥99% parse and ≥99% clean.
+  `IPTSCRAE_CORPUS` points at it, asserting ≥99% parse and ≥99% clean. The
+  `corpus` subcommand takes `--shared-globals` to quantify how much of the
+  residual failure set is per-file global isolation rather than a VM fault.
 
 Panic freedom is enforced structurally as well as by test: the crate is
 `#![forbid(unsafe_code)]`, denies `unwrap`/`expect`/`panic` outside tests, uses

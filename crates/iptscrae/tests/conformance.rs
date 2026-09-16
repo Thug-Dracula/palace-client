@@ -370,3 +370,168 @@ fn grepstr_drives_a_branch_and_grepsub_substitutes() {
         "<1>"
     );
 }
+
+// ------------------------------------------------------- host-backed commands
+
+#[test]
+fn trigonometry_is_fixed_point_degrees() {
+    assert_eq!(int("0 SINE"), 0);
+    assert_eq!(int("30 SINE"), 500);
+    assert_eq!(int("90 SINE"), 1000);
+    assert_eq!(int("0 COSINE"), 1000);
+    assert_eq!(int("180 COSINE"), -1000);
+    assert_eq!(int("0 TANGENT"), 0);
+    assert_eq!(int("45 TANGENT"), 1000);
+}
+
+#[test]
+fn random_stays_in_range_and_repeats_for_a_seed() {
+    for source in ["100 RANDOM", "1 RANDOM", "0 RANDOM", "-5 RANDOM"] {
+        let value = int(source);
+        assert!(
+            (0..100).contains(&value),
+            "{source:?} produced {value}, outside the host's bound"
+        );
+    }
+    assert_eq!(int("0 RANDOM"), 0, "a zero bound cannot produce a value");
+    assert_eq!(int("-5 RANDOM"), 0, "the VM clamps a non-positive bound");
+
+    let mut a = Engine::new(TestHost::seeded(9));
+    let mut b = Engine::new(TestHost::seeded(9));
+    assert_eq!(
+        a.run_source_resolved("1000 RANDOM").unwrap(),
+        b.run_source_resolved("1000 RANDOM").unwrap(),
+        "the same seed gives the same stream"
+    );
+}
+
+#[test]
+fn ticks_and_datetime_are_whatever_the_host_says() {
+    let mut engine = Engine::new(TestHost::seeded(1));
+    engine.host.tick = 1234;
+    engine.host.datetime = 42;
+    assert_eq!(
+        engine.run_source_resolved("TICKS DATETIME").unwrap(),
+        vec![Value::Int(1234), Value::Int(42)]
+    );
+}
+
+#[test]
+fn iptversion_is_one() {
+    assert_eq!(int("IPTVERSION"), 1);
+}
+
+#[test]
+fn trace_and_tracestack_write_through_the_host() {
+    let mut engine = Engine::new(TestHost::seeded(1));
+    engine.run_source("\"hello\" _TRACE").unwrap();
+    assert_eq!(engine.host.trace, vec!["hello".to_owned()]);
+
+    let mut engine = Engine::new(TestHost::seeded(1));
+    engine.run_source("7 8 TRACESTACK").unwrap();
+    assert_eq!(engine.host.trace.len(), 2, "TRACESTACK dumps the stack");
+    assert_eq!(
+        engine.run_source_resolved("STACKDEPTH").unwrap(),
+        vec![Value::Int(0)]
+    );
+}
+
+#[test]
+fn alarmexec_hands_the_atomlist_to_the_host() {
+    let mut engine = Engine::new(TestHost::seeded(1));
+    engine.run_source("{ 1 } 60 ALARMEXEC").unwrap();
+    assert_eq!(engine.host.alarms.len(), 1);
+    let (ticks, spot, body) = &engine.host.alarms[0];
+    assert_eq!((*ticks, *spot), (60, 0));
+    assert_eq!(body.ops().len(), 1);
+}
+
+#[test]
+fn trace_is_registered_only_with_the_underscore_spelling() {
+    assert_eq!(
+        int("TRACE"),
+        0,
+        "a bare TRACE is a variable, as in the reference"
+    );
+    assert_eq!(int("1 _BREAKPOINT"), 1);
+    assert_eq!(int("1 60 DELAY"), 1);
+    assert_eq!(int("1 BEEP"), 1);
+}
+
+// -------------------------------------------------------- more edge semantics
+
+#[test]
+fn length_accepts_arrays_only() {
+    assert_eq!(fails("\"abc\" LENGTH").category(), "type");
+    assert_eq!(fails("5 LENGTH").category(), "type");
+}
+
+#[test]
+fn concat_assign_needs_a_string_on_both_sides() {
+    assert_eq!(text("\"a\" x = \"b\" x &= x"), "ab");
+    assert_eq!(fails("5 x = \"a\" x &=").category(), "type");
+    assert_eq!(fails("\"a\" x = 5 x &=").category(), "type");
+}
+
+#[test]
+fn substring_clamps_a_non_positive_length_to_empty_and_rejects_a_negative_offset() {
+    assert_eq!(
+        text("\"hello\" 1 -1 SUBSTRING"),
+        "",
+        "the reference's substr returns empty for len <= 0; the guide says 'rest of string'"
+    );
+    assert_eq!(text("\"hello\" 1 0 SUBSTRING"), "");
+    assert_eq!(
+        fails("\"hello\" -1 2 SUBSTRING").category(),
+        "type",
+        "the guide makes a negative offset an error"
+    );
+}
+
+#[test]
+fn atoi_takes_the_longest_numeric_prefix_and_detects_hex() {
+    assert_eq!(int("\"  -12abc\" ATOI"), -12);
+    assert_eq!(int("\"0x1f\" ATOI"), 31);
+    assert_eq!(int("\"\" ATOI"), 0);
+    assert_eq!(int("\"abc\" ATOI"), 0);
+    assert_eq!(int("\"+\" ATOI"), 0);
+}
+
+#[test]
+fn a_symbol_glued_to_an_operator_splits_the_way_the_reference_splits_it() {
+    assert_eq!(int("A-5"), -5, "A-5 is A then -5, never a subtraction");
+    assert_eq!(int("5 A-5 + "), -5);
+}
+
+#[test]
+fn exit_from_a_nested_atomlist_stops_the_whole_script() {
+    assert_eq!(int("1 { 2 EXIT 3 } EXEC 4"), 2, "4 never runs");
+    assert_eq!(int("{ 5 EXIT } { 1 } WHILE 9"), 5, "9 never runs");
+}
+
+#[test]
+fn break_leaves_a_foreach() {
+    assert_eq!(
+        int("0 n = { POP n ++ { BREAK } n 2 == IF } [ 9 9 9 9 ] FOREACH n"),
+        2
+    );
+}
+
+#[test]
+fn break_outside_a_loop_ends_the_script_as_it_does_in_the_reference() {
+    assert_eq!(int("1 { BREAK 2 } EXEC 3"), 1, "2 and 3 never run");
+}
+
+#[test]
+fn a_variable_holding_an_atomlist_can_be_executed() {
+    assert_eq!(int("{ 3 } f = f EXEC"), 3);
+}
+
+#[test]
+fn foreach_sees_an_array_that_the_body_mutates() {
+    assert_eq!(
+        int("0 s = [ 1 2 3 ] a = { s += } a FOREACH s"),
+        6,
+        "the array is walked by index, so PUT inside the body is visible"
+    );
+}
