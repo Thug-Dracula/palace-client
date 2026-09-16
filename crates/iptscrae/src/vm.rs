@@ -362,12 +362,17 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
         }
     }
 
+    /// `]` — collect everything above the nearest mark into an array.
+    ///
+    /// Faithful to the reference's `ArrayParseToken`, which pops until it finds
+    /// the mark *or the stack runs out*, so a `[` whose mark was consumed (by
+    /// `POP`, say) turns the whole remaining stack into an array rather than
+    /// faulting. A `]` with no `[` at all never reaches here — the lexer rejects
+    /// it, as the reference tokenizer does.
     fn array_close(&mut self) -> Result<()> {
         let mut items = Vec::new();
-        let mut closed = false;
         while let Some(value) = self.stack.pop_opt() {
             if matches!(value, Value::Mark) {
-                closed = true;
                 break;
             }
             if items.len() >= self.limits.array_elements {
@@ -378,7 +383,6 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
             }
             items.push(value);
         }
-        let _ = closed;
         items.reverse();
         self.stack.push(Value::array(items))
     }

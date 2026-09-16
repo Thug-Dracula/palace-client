@@ -46,10 +46,12 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+pub mod classify;
 pub mod commands;
 pub mod harness;
 pub mod traits;
 
+pub use classify::{classify_parse, classify_run, FailureClass, SourceSpellings};
 pub use commands::{
     command_spec, register_palace_commands, CommandSpec, PalaceCommands, Push, PALACE_COMMANDS,
 };

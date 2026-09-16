@@ -15,6 +15,9 @@ Palace. This crate adds the layer that does:
   registered IPTSCRAE commands. This is the shape the full command set takes:
   one match arm per command, each reading its operands from `args` in push order.
 * **`SkeletonHost`** — a no-authority host used to run the harvested corpus.
+* **`classify`** — the failure taxonomy the corpus report is built from, and the
+  `SourceSpellings` scanner that recovers a symbol's original case (the lexer
+  upper-cases it before the VM ever sees it).
 
 ## Writing a command
 
@@ -73,8 +76,18 @@ Two deliberate omissions, both recorded in the `iptscrae` README:
 cargo run -p iptscrae-palace --bin iptscrae -- eval '2 3 + ITOA'
 cargo run -p iptscrae-palace --bin iptscrae -- run path/to/script.txt [--handler SELECT]
 cargo run -p iptscrae-palace --bin iptscrae -- corpus ~/palace-corpus/scripts_clean/by_script
+cargo run -p iptscrae-palace --bin iptscrae -- corpus ~/palace-corpus/scripts_clean/by_script --shared-globals
 ```
 
-`corpus` parses and executes every handler, prints the parse/run/failure
-distribution, and lists which Palace commands the corpus exercises. See the
-`iptscrae` README for the current numbers and a classification of every failure.
+`corpus` parses and executes every handler, prints the parse/run distribution,
+sorts every failure into the milestone's four classes, lists the unregistered
+symbols each failing handler named, and reports which Palace commands the corpus
+exercises. See the `iptscrae` README for the current numbers and a
+classification of every failure.
+
+`--shared-globals` runs the whole corpus through one global store instead of
+isolating each file, which is how a real session behaves. It is the evidence for
+the report's claim that the residual failures are environmental: sharing globals
+rescues 5 handlers (3791 → 3796 of 3805 clean) and leaves the 7 (b) failures
+untouched. Both modes are gated by `tests/corpus.rs` when `IPTSCRAE_CORPUS` is
+set.

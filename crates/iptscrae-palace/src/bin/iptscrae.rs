@@ -9,7 +9,13 @@
 //! `run` and `eval` execute a script against the skeleton host and print the
 //! final stack. `corpus` walks a directory of harvested scripts, parses and
 //! executes every handler, and prints the parse/run/failure distribution that
-//! the milestone report is built from.
+//! the milestone report is built from. Every failure is sorted into the
+//! milestone's four classes — tokenizer gap, unimplemented command, semantics or
+//! environment, malformed source — by [`iptscrae_palace::classify`].
+//!
+//! `--shared-globals` runs the whole corpus through one global store instead of
+//! isolating each file, which is how a real session behaves: scripts that read a
+//! global another script in the room set can then run.
 //!
 //! The skeleton host implements no Palace command: it consumes the documented
 //! operands and pushes neutral defaults. So `corpus` measures the VM core, not
@@ -23,6 +29,9 @@ use std::process::ExitCode;
 use iptscrae::budget::{Limits, StackDialect};
 use iptscrae::parse_script;
 use iptscrae::value::Value;
+use iptscrae_palace::classify::{
+    self, classify_parse, classify_run, FailureClass, SourceSpellings, ALL_CLASSES,
+};
 use iptscrae_palace::harness::SkeletonHost;
 
 fn main() -> ExitCode {
@@ -50,7 +59,7 @@ fn print_usage() {
 USAGE:
   iptscrae run    <file> [--handler NAME] [--dialect D] [--seed N] [--trace]
   iptscrae eval   \"<source>\"
-  iptscrae corpus <dir>  [--dialect D] [--seed N] [--examples N]
+  iptscrae corpus <dir>  [--dialect D] [--seed N] [--examples N] [--shared-globals]
 
 DIALECTS: windows (256) | palacechat (1024, default) | openpalace (2048)"
     );
@@ -172,18 +181,35 @@ fn cmd_eval(args: &[String]) -> ExitCode {
 struct FailureTally {
     messages: BTreeMap<String, u64>,
     examples: Vec<String>,
+    classes: BTreeMap<FailureClass, u64>,
+    names: BTreeMap<String, u64>,
 }
 
 impl FailureTally {
-    fn record(&mut self, message: String, example: String, keep_examples: usize) {
+    fn record(
+        &mut self,
+        class: FailureClass,
+        message: String,
+        names: &[String],
+        example: String,
+        keep_examples: usize,
+    ) {
+        *self.classes.entry(class).or_insert(0) += 1;
         *self.messages.entry(message).or_insert(0) += 1;
+        for name in names {
+            *self.names.entry(name.clone()).or_insert(0) += 1;
+        }
         if self.examples.len() < keep_examples {
             self.examples.push(example);
         }
     }
 
     fn total(&self) -> u64 {
-        self.messages.values().sum()
+        self.classes.values().sum()
+    }
+
+    fn of(&self, class: FailureClass) -> u64 {
+        self.classes.get(&class).copied().unwrap_or(0)
     }
 
     fn top(&self, n: usize) -> Vec<(&str, u64)> {
@@ -196,6 +222,20 @@ impl FailureTally {
         rows.truncate(n);
         rows
     }
+
+    fn top_names(&self, n: usize) -> Vec<(&str, u64)> {
+        let mut rows: Vec<(&str, u64)> = self.names.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        rows.truncate(n);
+        rows
+    }
+
+    fn report(&self, out: &mut String, heading: &str) {
+        let _ = writeln!(out, "\n{heading}");
+        for class in ALL_CLASSES {
+            let _ = writeln!(out, "  {:<30} {}", class.label(), self.of(class));
+        }
+    }
 }
 
 fn cmd_corpus(args: &[String]) -> ExitCode {
@@ -206,6 +246,7 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
     let mut dialect = StackDialect::PalaceChat;
     let mut seed = 0u64;
     let mut examples = 12usize;
+    let mut shared_globals = false;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -227,6 +268,7 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
                 index += 1;
                 examples = args.get(index).and_then(|s| s.parse().ok()).unwrap_or(12);
             }
+            "--shared-globals" => shared_globals = true,
             other => eprintln!("corpus: ignoring unknown argument {other:?}"),
         }
         index += 1;
@@ -256,8 +298,6 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
     let mut handlers_clean = 0u64;
     let mut parse_failures = FailureTally::default();
     let mut run_failures = FailureTally::default();
-    let mut run_categories: BTreeMap<&'static str, u64> = BTreeMap::new();
-    let mut parse_categories: BTreeMap<&'static str, u64> = BTreeMap::new();
 
     for path in &files {
         let label = path
@@ -267,9 +307,12 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
+                let message = format!("unreadable: {e}");
                 parse_failures.record(
-                    format!("unreadable: {e}"),
-                    format!("{label}: {e}"),
+                    FailureClass::MalformedSource,
+                    message.clone(),
+                    &[],
+                    format!("{label}: {message}"),
                     examples,
                 );
                 continue;
@@ -279,13 +322,22 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
         let script = match parse_script(&source, &commands, &limits) {
             Ok(s) => s,
             Err(e) => {
-                *parse_categories.entry(e.category()).or_insert(0) += 1;
-                parse_failures.record(e.to_string(), format!("{label}: {e}"), examples);
+                let class = classify_parse(&e);
+                parse_failures.record(
+                    class,
+                    e.to_string(),
+                    &[],
+                    format!("{label}: [{} {class:?}] {e}", e.category()),
+                    examples,
+                );
                 continue;
             }
         };
         parsed_files += 1;
-        engine.reset_globals();
+        if !shared_globals {
+            engine.reset_globals();
+        }
+        let spellings = SourceSpellings::scan(&source);
         let mut file_clean = true;
         for (name, chunk) in script.handlers() {
             handlers_total += 1;
@@ -293,8 +345,24 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
                 Ok(_) => handlers_clean += 1,
                 Err(e) => {
                     file_clean = false;
-                    *run_categories.entry(e.category()).or_insert(0) += 1;
-                    run_failures.record(e.to_string(), format!("{label} ON {name}: {e}"), examples);
+                    let unknown = spellings.unknown_in(chunk, &commands);
+                    let class = classify_run(&e, &unknown);
+                    let fault = classify::faulting_command(&e).unwrap_or("-");
+                    let names = if unknown.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  unregistered: {}", unknown.join(" "))
+                    };
+                    run_failures.record(
+                        class,
+                        e.to_string(),
+                        &unknown,
+                        format!(
+                            "{label} ON {name}: [{} {class:?}] {fault}: {e}{names}",
+                            e.category()
+                        ),
+                        examples,
+                    );
                 }
             }
         }
@@ -312,6 +380,15 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
         dialect.stack_depth()
     );
     let _ = writeln!(report, "  seed           : {seed}");
+    let _ = writeln!(
+        report,
+        "  globals        : {}",
+        if shared_globals {
+            "shared across the whole run (--shared-globals)"
+        } else {
+            "isolated per script file"
+        }
+    );
     let _ = writeln!(report, "  files          : {}", files.len());
     let _ = writeln!(
         report,
@@ -339,10 +416,9 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
         percent(clean_files, parsed_files)
     );
 
-    let _ = writeln!(report, "\nParse failures by category:");
-    for (category, count) in &parse_categories {
-        let _ = writeln!(report, "  {category:8} {count}");
-    }
+    parse_failures.report(&mut report, "Parse failure classification:");
+    run_failures.report(&mut report, "Run failure classification:");
+
     let _ = writeln!(report, "\nParse failures by message:");
     for (message, count) in parse_failures.top(12) {
         let _ = writeln!(report, "  {count:5}  {message}");
@@ -354,15 +430,19 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
         }
     }
 
-    let _ = writeln!(report, "\nRun failures by category:");
-    for (category, count) in &run_categories {
-        let _ = writeln!(report, "  {category:8} {count}");
-    }
     let _ = writeln!(report, "\nRun failures by message:");
     for (message, count) in run_failures.top(15) {
         let _ = writeln!(report, "  {count:5}  {message}");
     }
-
+    if !run_failures.names.is_empty() {
+        let _ = writeln!(
+            report,
+            "\nUnregistered symbols named by failing handlers (spelling as written):"
+        );
+        for (name, count) in run_failures.top_names(20) {
+            let _ = writeln!(report, "  {count:5}  {name}");
+        }
+    }
     if !run_failures.examples.is_empty() {
         let _ = writeln!(report, "\nExample failures:");
         for example in &run_failures.examples {
