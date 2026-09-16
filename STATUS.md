@@ -247,6 +247,52 @@ Measured against the 2,400-script corpus, not assumed.
 
 **So event dispatch is a wiring job, not an implementation job:** the script text is already extracted and validated (`crates/palace-room/tests/corpus_scripts.rs`, 2400/2400), the `ON`-block splitter and VM already exist, and every command is registered. What is missing is mapping the 24 event names above onto runtime events and supplying the host.
 
+## Event dispatch bridge (implemented 2026-09-16)
+
+`crates/palace-client/src/dispatch.rs` holds the bridge. `script_event()` maps a
+`ClientEvent` onto the script event a hotspot answers; `Dispatcher::dispatch_scripts()`
+runs that handler for every hotspot in the room, keeping globals between dispatches
+the way the reference client does.
+
+| Runtime event | Script event |
+|---|---|
+| `RoomEntered` | `ENTER` |
+| `Chat` where the speaker is self | `OUTCHAT` |
+| `Chat` otherwise (`Talk` / `Whisper`) | `INCHAT` |
+| `Chat` of kind `System` / `Error` | `SERVERMSG` |
+| `Status::Connected` | `SIGNON` |
+| `Banner`, `Rooms`, `Users`, `Screen`, `Note` | none |
+
+**Evidence**, from tests that run with no server and no window: **781 rooms answer
+`ON ENTER`, 1951 handlers matched**, and `matched == ran + errors` holds — no
+matched handler is skipped silently. The earlier claim in this file that
+"demonstrating dispatch needs the GUI running" was **wrong**; the bridge is fully
+testable headless.
+
+### Correction: "100% command coverage" ≠ "the host implements it"
+
+Coverage above means every command *lexes and is registered*. `PalaceHost` **refuses**
+a command it does not implement rather than ignoring it, so re-running the same corpus
+against a two-command host (`chat`, `goto_room`) turns **1264 of the 1951** handlers
+into refusals. That refusal tally is the real remaining work, ranked from live scripts:
+
+| Command | refusals | | Command | refusals |
+|---|---|---|---|---|
+| `PAINTCLEAR` | 331 | | `GETSPOTSTATE` | 16 |
+| `ALARMEXEC` | 308 | | `NBRROOMUSERS` | 15 |
+| `ME` | 151 | | `CLEARLOOSEPROPS` | 10 |
+| `ISGOD` | 118 | | `SETPOS` | 9 |
+| `SOUND` | 92 | | `SETSPOTSTATELOCAL` | 8 |
+| `LOCALMSG` | 63 | | `STATUSMSG` | 6 |
+| `DIMROOM` | 45 | | `MIDILOOP` | 4 |
+| `SETPROPS` | 42 | | `OPENPALACE` / `PENCOLOR` | 1 / 1 |
+| `ROOMID` | 23 | | | |
+| `MIDISTOP` | 20 | | | |
+
+Two caveats. It is measured from `ON ENTER` only — the other 23 events will add more.
+And `ALARMEXEC` is the timer callback (`SETALARM` schedules it), not a user command,
+so it is really engine work rather than host work.
+
 ### Measurement caution — two earlier attempts at this metric were wrong
 
 1. Counting every uppercase token as a command reported **43.3% coverage**. Wrong: it counted `CHATSTR` (a special *variable*), the `ON`-block *event names*, and user variables such as `DT`, `HP`, `X2`, `S1`, `SR`.
