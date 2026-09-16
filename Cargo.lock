@@ -2205,6 +2205,8 @@ dependencies = [
 name = "palace-client"
 version = "0.1.0"
 dependencies = [
+ "iptscrae",
+ "iptscrae-palace",
  "palace-asset",
  "palace-prop",
  "palace-render",
