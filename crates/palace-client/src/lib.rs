@@ -24,6 +24,7 @@
 )]
 
 pub mod assets;
+pub mod dispatch;
 pub mod error;
 pub mod frame;
 pub mod runtime;

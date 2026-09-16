@@ -13,6 +13,8 @@ palace-room = { workspace = true }
 palace-prop = { workspace = true }
 palace-asset = { workspace = true }
 palace-render = { workspace = true }
+iptscrae = { workspace = true }
+iptscrae-palace = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
