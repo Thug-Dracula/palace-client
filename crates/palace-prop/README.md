@@ -301,11 +301,11 @@ read whole.
 | File | Blobs | Decoded | Rejected | Note |
 |---|---|---|---|---|
 | `pserver_full2.prp` | 178,839 | 178,832 | 7 | same 7 bad props |
-| `pserver_src_frozen.prp` | 178,858 | 178,851 | 7 | same 7 |
-| `prp_now.prp` | 42,053 | 42,052 | 0 | 8-bit only, older snapshot |
-| `pserver_new.prp` | 42,326 | 42,325 | 0 | 8-bit only |
-| `BACKUPS_20260912_102742/server_pserver.prp` | 436 | 435 | 0 | the 317 KB worked example |
-| `reference/prp-variants/pserver_full.prp` | 178,839 | 42,325 | **136,513** | **corrupt, see §7** |
+| `pserver_src_frozen.prp` | 178,857 | 178,850 | 7 | same 7 |
+| `prp_now.prp` | 42,052 | 42,052 | 0 | 8-bit only, older snapshot |
+| `pserver_new.prp` | 42,325 | 42,325 | 0 | 8-bit only |
+| `BACKUPS_20260912_102742/server_pserver.prp` | 435 | 435 | 0 | the 317 KB worked example |
+| `reference/prp-variants/pserver_full.prp` | 178,838 | 42,325 | **136,513** | **corrupt, see §7** |
 
 ---
 
@@ -484,7 +484,7 @@ pre-rendered comparison) and `gen_palette.py` (the palette generator/verifier).
 ## 9. Reproducing the numbers in this document
 
 ```bash
-cd $REPO-prop
+cd $REPO
 
 cargo test -p palace-prop
 

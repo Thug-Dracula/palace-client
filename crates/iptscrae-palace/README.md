@@ -4,9 +4,10 @@ The `iptscrae` crate implements the language and deliberately knows nothing abou
 Palace. This crate adds the layer that does:
 
 * **`PalaceHost`** — the capability trait every Palace command is written
-  against. It mirrors OpenPalace's `IPalaceController` (~90 methods): `chat`,
-  `goto_room`, `set_props`, `get_spot_state`, the paint and sound operations, and
-  so on. Every method has a default, so a headless or cyborg-only host is a few
+  against. It mirrors OpenPalace's `IPalaceController` (83 methods there); this
+  crate's trait declares 111 (`src/traits.rs`): `chat`, `goto_room`, `set_props`,
+  `get_spot_state`, the paint and sound operations, and so on. Every method has a
+  default, so a headless or cyborg-only host is a few
   lines, and an unsupported operation fails with
   `IptError::CommandUnavailable` rather than silently doing nothing.
 * **`PALACE_COMMANDS`** — every Palace command whose stack effect the reference
@@ -54,11 +55,17 @@ it fails that instruction instead of quietly misusing the stack.
 
 ## Scope
 
-This milestone implements the trait, the registry and a handful of commands
-(`SAY`, `CHAT`, `SAYAT`, `PRIVATEMSG`, `SETPOS`, `GOTOROOM`, `USERID`,
-`WHOME`, `USERNAME`) as proof that the layers fit together. The remaining
-Palace commands are registered with their documented stack effects and stubbed by
-the harness; implementing them is the next milestone.
+This crate supplies the trait, the registry and the adapter. `PalaceCommands`
+implements a handful of commands (`SAY`, `CHAT`, `SAYAT`, `PRIVATEMSG`, `SETPOS`,
+`GOTOROOM`, `USERID`, `WHOME`, `USERNAME`) as proof that the layers fit together,
+and `SkeletonHost` stubs the rest for corpus runs.
+
+The full command surface is no longer stubbed anywhere that matters:
+`crates/palace-host`'s `ScriptHost` implements the `PalaceHost` surface over a
+capability snapshot and encodes every effect as a protocol frame (see the
+Event dispatch section in `STATUS.md`). The remaining work in *this* crate is the
+`PalaceCommands` adapter, which the live runtime does not use; `palace-host` wires
+the engine directly.
 
 Two deliberate omissions, both recorded in the `iptscrae` README:
 

@@ -51,18 +51,18 @@ cargo run -p palace-app
 
 **621 tests passing, clippy clean, `cargo check` clean.** The frontend's `svelte-check` was clean when last run in the `palace-client-ui` worktree; that worktree is gone, so run `bun install && bun run check` here to re-confirm it.
 
-### The six original crates (unchanged contracts)
+### The eight original crates (unchanged contracts)
 
 | Crate | State | Evidence |
 |---|---|---|
 | `palace-wire` | ✅ done | framing, `ByteOrder`, 75-opcode table, codecs. **`navr_frame` fixed** (see below). |
 | `palace-probe` | ✅ done | live logon; 81 rooms / 2 users. |
 | `palace-room` | ✅ done | 804/804 corpus records parse clean. |
-| `palace-prop` | ✅ done | 5 decoders + S20 encoder; 3,000-prop differential = 0 disagreements. |
+| `palace-prop` | ✅ done | 5 decoders + S20 encoder; 227,874-prop differential = 0 disagreements (7 rejections, the same props the reference rejects). |
 | `palace-asset` | ✅ done | `qAst`/`sAst`/`rAst`, paced scheduler, media HTTP. |
 | `palace-render` | ✅ done | composites rooms → PNG; coordinate mapping round-trip tested. |
-| `iptscrae` | ✅ done | lexer (718 lines), parser, VM, stack, budget enforcement, capability trait, regex engine; 143 tests. **Zero dependencies.** |
-| `iptscrae-palace` | ✅ done | 497-line host trait, 371 lines of Palace commands, CLI, corpus harness; 29 tests. Corpus: **2396/2400 files parse · 3791/3805 handlers clean · 0 tokenizer gaps.** |
+| `iptscrae` | ✅ done | lexer (718 lines), parser, VM, stack, budget enforcement, capability trait, regex engine; 144 tests (plus 1 doctest). **Zero dependencies.** |
+| `iptscrae-palace` | ✅ done | 497-line host trait, 371 lines of Palace commands, CLI, corpus harness; 33 tests (plus 1 doctest). Corpus: **2396/2400 files parse · 3791/3805 handlers clean · 0 tokenizer gaps.** |
 
 ### What this milestone added
 
@@ -112,7 +112,7 @@ TcpStream ─► Connection (palace-wire framing)
 * `SceneBuilder::media_mut()` / `props_mut()` — let a live client fill the stores.
 * `PropBackend::Memory` — an in-memory prop source.
 
-All additions; no existing behaviour changed. The 372 original tests still pass.
+All additions; no existing behaviour changed. The six Palace protocol and render crates (`palace-wire`, `palace-probe`, `palace-room`, `palace-prop`, `palace-asset`, `palace-render`) now total 373 tests, excluding doctests and ignored, and all pass.
 
 ---
 
@@ -191,19 +191,25 @@ tested. Outgoing chat still uses plaintext `talk` (the server relays it).
   final zoom/1:1/resize evidence is the numeric sweep above plus unit tests.
   Everything is wired to the same `set_viewport` command, but a human should
   still click the slider once.
-* **Avatars are not drawn yet.** On Balamb Garden the logged-on user arrives with
-  `props=0`, so there is nothing to draw; the renderer hides avatars whose prop
-  art has not arrived rather than littering the room with magenta placeholders.
-  Prop art for other users would need successful asset transfer (untested live —
-  no other users were online).
+* **Avatar drawing exists; avatar *art transfer* is the untested part.** The
+  composite pipeline draws avatars y-ordered (`draw_avatar`, layer 6), and
+  `renders/1672-ludo-ii-props-avatars.png` shows three. What is unproven live is
+  art for other users: on Balamb Garden the logged-on user arrives with
+  `props=0`, so there is nothing to draw, and the runtime hides avatars whose
+  prop art has not arrived rather than filling the room with magenta
+  placeholders. That needs another user online, which QA never had.
 * **Server churn during QA.** Repeated connections from one host in quick
   succession made the server send `bye` (len 4, ref = the *previous* session's
   user id, i.e. a server-side logoff notice) and close. The client
   auto-reconnects with backoff and now **restores the room the user was in**
   (`Shared::last_room`). A single normal session is unaffected; the first smoke
   runs ran 22 s cleanly.
-* **No IPTSCRAE, hotspot clicks, sounds, drawing, deco, prop editing, web panes,
-  theming** — all explicitly out of scope for this milestone.
+* **Still out of scope:** sound and MIDI playback (`SOUND`, `MIDIPLAY`,
+  `MIDILOOP`, `MIDISTOP` and `BEEP` are dispatched and reported, but nothing is
+  played), `LINE` / `LINETO` rasterization (the effects are dispatched and
+  dropped), deco, a prop editor UI, web panes (`WEBEMBED` is not registered, and
+  `GOTOURL` is reported rather than opened), and theming. IPTSCRAE dispatch and
+  hotspot clicks are no longer on this list; see the dispatch section below.
 * `Message::Logoff` still prints a diagnostic transcript line rather than being
   interpreted; see the note above.
 * Name tags and chat text are not rasterized into the frame (presentation-layer
@@ -240,7 +246,7 @@ Measured against the 2,400-script corpus, not assumed.
 
 `ENTER` + `SELECT` + `LEAVE` + `OUTCHAT` + `ALARM` + `INCHAT` alone are ~92% of all handler invocations.
 
-**Command coverage: 100%.** All 102 distinct commands the corpus uses — 391,129 occurrences — are already implemented. The registry holds **191 names**: 72 core in `iptscrae/src/registry.rs` + 121 Palace bindings in `iptscrae-palace/src/commands.rs`. **No command implementation work remains for dispatch.**
+**Command coverage: 100%.** All 102 distinct commands the corpus uses — 391,129 occurrences — are already implemented. The registry holds **192 names**: 72 core in `iptscrae/src/registry.rs` + 120 Palace bindings in `iptscrae-palace/src/commands.rs`. **No command implementation work remains for dispatch.**
 
 **So event dispatch was a wiring job, not an implementation job** — which is what the next section did. The script text was already extracted and validated (`crates/palace-room/tests/corpus_scripts.rs`, 2400/2400), the `ON`-block splitter and VM already existed, and every command was registered. What was missing was the mapping from the 24 event names above onto runtime events, and the host.
 

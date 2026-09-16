@@ -1,21 +1,75 @@
-# palace-client — walking skeleton
+# Palace Client
 
-A Rust workspace that speaks the Palace wire protocol: a protocol library
-(`palace-wire`) and a headless probe binary (`palace-probe`) that connects to a
-live pserver, handshakes, logs on, and prints the decoded room and user lists.
+A desktop client for **The Palace**, the graphical chat system that was popular
+in the 1990s.
 
-This is **milestone 0** of the Palace-compatible Tauri client
-(`$CORPUS/TAURI-CLIENT-SCOPE.md`). It deliberately contains **no GUI, no
-rendering and no IPTSCRAE**. Its job is to prove the protocol layer and to capture
-a replayable fixture corpus that every later milestone tests against without a
-server — that is what `palace-wire` and `palace-probe` do.
+## What The Palace is
 
-`crates/palace-prop/` is the first later milestone to land here: the prop (sprite)
-codec, which is independent of the protocol layer and has its own README, fixtures
-and differential harness. The protocol crates do not depend on it and it does not
-depend on them.
+The Palace was an online chat service where people met in illustrated rooms
+instead of plain text channels. Every room had a background picture, and each
+person in it appeared as a small character image called a **prop**. Rooms were
+programmable: the server ran short scripts that reacted to what visitors did
+(entering, clicking a hotspot, speaking) and to a timer. Those scripts were
+written in **IPTSCRAE**, a stack language that looks a lot like Forth.
 
-The only server in scope is `localhost:9998` (Balamb Garden).
+The original servers are long gone, but a small community still keeps the
+software alive. This project is a from-scratch reimplementation of the **client**
+side: the program you run to connect to a Palace server, see a room, and take
+part in it.
+
+## What this client can do
+
+- **Connect and log on** to a Palace server as a guest, speaking its protocol
+  directly. It works whatever byte order the server uses.
+- **Show a room** as one assembled picture: the background, the image overlays,
+  the loose props and the avatars of the people present, built from the server's
+  description of the room plus the room's own artwork.
+- **Fetch that artwork**, both the props passed around by the protocol and the
+  pictures hosted on the server's web endpoint.
+- **List and move between rooms**: see every room and every user on the server,
+  and walk to another room by clicking a door.
+- **Chat**: send and receive public messages and whispers, including the
+  encrypted forms some servers use.
+- **Run the room's own scripts.** Rooms are programmable, and this client reads
+  and runs their scripts. Events such as entering a room, clicking a hotspot,
+  speaking, or a timer firing drive them. The scripts run in a sandbox that
+  cannot reach the network, the filesystem or other processes.
+- **Run as an ordinary desktop application**, with a window showing the room, a
+  room list, a user list, chat and a status bar.
+
+There is also a **command-line probe** (`palace-probe`) that connects with no
+window at all and prints what the server said: the handshake, the room list and
+the user list. It is useful for checking a server, capturing replayable test
+files, and comparing results with the reference Python client.
+
+The server this project was developed and tested against is `localhost:9998`,
+known as Balamb Garden. It is only the development server, not a limitation:
+the client accepts any host and port, either from the command line
+(`--host`/`--port`, `PALACE_HOST` and friends) or from the connect box in the
+window, and the protocol is the same everywhere.
+
+## What this client does not do yet
+
+- **No sound or music playback.** A room script's `SOUND`, `MIDIPLAY`,
+  `MIDILOOP` and `MIDISTOP` calls are decoded and surfaced to the interface, but
+  nothing reaches an audio device.
+- **Draw commands, name tags and chat text are not rasterized** into the room
+  image. The room's stored draw commands are decoded and kept, but not painted.
+- **Avatar art for other users is untested live.** The compositor draws avatars,
+  but the development server had no other users online, so the asset transfer
+  that would supply their props was never exercised against a real peer.
+- **No live big-endian or HTTP-tunnel server was available.** Both paths exist
+  and are unit-tested, but no such server was reachable to prove them end to end.
+- **Guest logon only.** Authenticated (password) logon has not been attempted.
+
+## The repository
+
+This is a Rust workspace with eleven members: ten crates under `crates/` and the
+`src-tauri/` application. The wire protocol, the file formats, the room model,
+the renderer and the scripting engine are separate crates, and the desktop app is
+Tauri plus SvelteKit on top of them. Everything below is a working client rather
+than a skeleton: the GUI, the compositor and the IPTSCRAE engine are all present
+and covered by the test suite.
 
 ---
 
@@ -89,6 +143,9 @@ SUMMARY rooms=81 users=2
 | `crates/palace-asset/` | Asset layer: `qAst`/`sAst`/`rAst` transfer state machines, the paced 20-per-flush request scheduler, and the media HTTP fetch with its `.png→.jpg→original` fallback chain. |
 | `crates/palace-render/` | Compositor plus the room↔viewport coordinate mapping. Turns a `RoomDesc` and local assets into an RGBA frame; never panics on missing art. |
 | `crates/palace-client/` | Headless client runtime: connection FSM, session state, live asset intake, frame production. Owns the threads and emits `ClientEvent`s; knows nothing about Tauri. |
+| `crates/iptscrae/` | The IPTSCRAE language: lexer, parser, virtual machine, resource budgets and the capability trait. Palace-agnostic and dependency-free. See its README for the grammar. |
+| `crates/iptscrae-palace/` | The Palace command surface: the `PalaceHost` capability trait and the registry of Palace commands, plus a skeleton host used to run the harvested script corpus. |
+| `crates/palace-host/` | The live host: splits `ON <event> { ... }` blocks out of hotspot scripts, dispatches runtime events, keeps globals across handlers, runs alarms, records the effects and encodes them as protocol frames. |
 | `src-tauri/` | The Tauri v2 binary (`palace-app`): commands, the `palace://` frame protocol, and the event pump. |
 | `src/` | SvelteKit 5 frontend (Vite, adapter-static). Displays one composited frame and draws the chrome around it. |
 | `fixtures/logon-run1/` | A real captured session (raw bytes + decoded manifest). |
@@ -100,7 +157,10 @@ manifest). The protocol core is std-only. `palace-room` adds nothing but
 `palace-wire`; `palace-probe` adds nothing but `palace-wire`. `palace-prop`
 depends on `flate2` (zlib) and `png` (debug output only) and deliberately
 **not** on `palace-wire` — props are a self-contained binary format that has
-nothing to do with the wire protocol.
+nothing to do with the wire protocol. `iptscrae` is standard-library only
+(encoding, randomness and the clock are injectable through its `Host` trait);
+`iptscrae-palace` depends on `iptscrae` alone; `palace-host` depends on
+`iptscrae`, `iptscrae-palace`, `palace-room` and `palace-wire`.
 
 ---
 
@@ -488,7 +548,7 @@ These are recorded as raw bytes rather than guessed at:
 
 75 opcodes are named, taken from the 1999 protocol reference, Taj's
 `MessageTypes.cs` and QPalace's `message.hpp`. The `observed live` column marks
-the ones this server actually sent during a probe session (14).
+the ones this server actually sent during a probe session (12).
 
 | mnemonic | name | value | observed live |
 |---|---|---|---|
@@ -622,29 +682,45 @@ decoded form, and `load` treats a mismatch as corruption.
 ## Tests
 
 ```bash
-cargo test --workspace     # 96 tests
+cargo test --workspace     # 621 passed, 0 failed, 2 ignored
 ```
 
-- **Unit tests inside `palace-wire`** cover framing, opcode packing, every
-  message decoder, `Str31`/`PString` handling (including garbage padding) and the
-  fixture format — each integer path exercised in **both byte orders**.
-- **`tests/endianness.rs`** pins exact bytes for the banner, the framing header,
-  the logon body and the list messages in both orders, and decodes a whole
-  synthetic session in each.
-- **`tests/fixture_replay.rs`** is the offline corpus replay described above.
-- **`palace-room` unit tests** cover an empty room, a truncated header and a
-  negative `lenVars`.
-- **`crates/palace-room/tests/fixtures.rs`** builds a synthetic room with every
-  sub-structure (overlay, hotspot with points/states/name/script, two linked
+The suite spans every crate in the workspace, not just the protocol layer:
+
+- **`palace-wire`** unit tests cover framing, opcode packing, every message
+  decoder, `Str31`/`PString` handling (including garbage padding) and the fixture
+  format — each integer path exercised in **both byte orders**.
+- **`palace-wire/tests/endianness.rs`** pins exact bytes for the banner, the
+  framing header, the logon body and the list messages in both orders, and
+  decodes a whole synthetic session in each. **`fixture_replay.rs`** is the
+  offline corpus replay described above, and **`navr_encoding.rs`** pins the
+  two-byte `navR` room-goto frame.
+- **`palace-room` unit tests and `tests/fixtures.rs`** build a synthetic room with
+  every sub-structure (overlay, hotspot with points/states/name/script, two linked
   loose props, a path and a detonate draw command) in both byte orders, then
-  corrupts offsets one at a time (out-of-range array, absent offset, negative
+  corrupt offsets one at a time (out-of-range array, absent offset, negative
   offset, link cycle, packed-stride fallback, oversized draw operand,
-  unterminated script) and asserts a `RoomWarning` instead of a panic.
-- **`crates/palace-room/tests/corpus_replay.rs`** decodes all 799 live payloads
+  unterminated script) and assert a `RoomWarning` instead of a panic.
+- **`palace-room/tests/corpus_replay.rs`** decodes all 799 live payloads
   (804 records) with zero failures and zero warnings, and asserts the four
-  concatenated captures split correctly.
-- **`crates/palace-room/tests/logon_room_fixture.rs`** replays the Balamb Garden
-  `room` frame from `fixtures/logon-run1/` and pins its structure.
+  concatenated captures split correctly. **`corpus_scripts.rs`** extracts and
+  validates 2400/2400 hotspot scripts, and **`logon_room_fixture.rs`** pins the
+  Balamb Garden `room` frame from `fixtures/logon-run1/`.
+- **`palace-prop`** tests cover round-trips, malformed inputs and the 227,874-prop
+  corpus. **`palace-asset`** tests cover the `qAst`/`sAst`/`rAst` state machines,
+  the pacing scheduler, the media HTTP fallback chain and adversarial inputs.
+- **`palace-render`** tests cover the coordinate mapping round-trip and full
+  corpus renders. **`palace-client/tests/fixture_replay.rs`** replays every server
+  frame of `fixtures/logon-run1/` through the session state.
+- **`iptscrae`** tests run the language conformance and hostile-input suites;
+  **`iptscrae-palace`** runs the harvested script corpus and the Palace command
+  surface; **`palace-host`** tests script loading, event dispatch and wire effect
+  encoding.
+
+Two tests are ignored by default because they need resources this machine may not
+have: `palace-asset/tests/live_server.rs` needs a live pserver at
+`localhost:9998`, and `palace-prop/tests/corpus.rs` needs the local prop corpus.
+Run them with `cargo test -- --ignored` once those are available.
 
 Endianness is not skipped because "the server is little-endian anyway": the
 logon packet is asserted byte-for-byte against `palace_walker.py`, the
@@ -702,11 +778,27 @@ The walker has no user-list support, so the user count is validated against the
 - `AuxRegistrationRec.wizPassword` is decoded/encoded as an empty `Str31`; no
   authenticated (non-guest) logon has been attempted.
 
-**Not determined (explicitly out of scope for this milestone)**
+**Implemented but not yet proven live**
 
-- Hotspots, pictures, draw commands and loose props inside `room` (the buffer is
-  kept whole in `RoomDescription::var_data`).
-- Asset transfer (`qAst`/`sAst`/`rAst`), prop codecs, avatars, IPTSCRAE.
+- **Hotspots, pictures, draw commands and loose props inside `room`** are decoded
+  by `palace-room`; the raw buffer is still kept as `RoomDescription::var_data`.
+  What is missing is painting: draw commands, name tags and chat text are not
+  rasterized into the frame.
+- **Asset transfer (`qAst`/`sAst`/`rAst`)** is implemented in `palace-asset` and
+  drives live media fetching. Multi-block transfer is derived from the reference
+  implementations only; no real capture of a multi-block transfer exists.
+- **Prop codecs** are implemented in `palace-prop` and validated over the corpus.
+  The 16-bit decoder has zero real samples to test against, and `pserver_full.prp`
+  is systematically corrupt.
+- **Avatars** are composited by `palace-render`, but the development server had no
+  other users online, so receiving another user's prop art over the wire is
+  untested live.
+- **IPTSCRAE** runs live: `iptscrae` and `iptscrae-palace` implement the language
+  and command surface, and `palace-host` dispatches room events into it. Sound
+  and music effects are decoded and surfaced but not played.
+
+**Still genuinely undetermined**
+
 - `MSG_BLOWTHRU` (`blow`) payload semantics — the live logon burst contained one
   14-byte `blow` on an earlier connection; it is decoded only as a bounded
   payload, never interpreted.
