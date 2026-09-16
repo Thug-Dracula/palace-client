@@ -166,6 +166,7 @@ pub fn run() {
             commands::disconnect,
             commands::goto_room,
             commands::say,
+            commands::click,
             commands::set_viewport,
             commands::refresh,
         ])

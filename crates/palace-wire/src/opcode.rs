@@ -89,6 +89,13 @@ pub const USERPROP: Opcode = Opcode(0x7573_7250);
 pub const USERNAME: Opcode = Opcode(0x7573_724e);
 /// `0x6e707273` alias kept for symmetry with the other `*prs` names.
 pub const USERENTER: Opcode = Opcode(0x7770_7273);
+pub const DRAW: Opcode = Opcode(0x6472_6177);
+pub const DOORLOCK: Opcode = Opcode(0x6c6f_636b);
+pub const DOORUNLOCK: Opcode = Opcode(0x756e_6c6f);
+pub const PROPNEW: Opcode = Opcode(0x6e50_7270);
+pub const PROPDEL: Opcode = Opcode(0x6450_7270);
+pub const PROPMOVE: Opcode = Opcode(0x6d50_7270);
+pub const SPOTSTATE: Opcode = Opcode(0x7353_7461);
 
 /// Full opcode table: every message type we have a name for, taken from the
 /// official 1999 protocol reference, Taj's `MessageTypes.cs`, and QPalace's
