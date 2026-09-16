@@ -49,7 +49,7 @@ cargo run -p palace-app
 
 **Trap:** never `pkill -f "<pattern>"` where the pattern appears in your own command string — it kills the shell running it (documented in `~/AGENTS.md`; it killed a tmux server here). Use `pgrep -x`/`pkill -x` or kill by PID.
 
-**569 tests passing, clippy clean, `cargo check` clean, `svelte-check` clean.**
+**621 tests passing, clippy clean, `cargo check` clean.** The frontend's `svelte-check` was clean when last run in the `palace-client-ui` worktree; that worktree is gone, so run `bun install && bun run check` here to re-confirm it.
 
 ### The six original crates (unchanged contracts)
 
