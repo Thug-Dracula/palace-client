@@ -1559,6 +1559,8 @@ name = "iptscrae-palace"
 version = "0.1.0"
 dependencies = [
  "iptscrae",
+ "palace-room",
+ "palace-wire",
 ]
 
 [[package]]
