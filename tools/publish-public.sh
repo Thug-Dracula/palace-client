@@ -52,28 +52,30 @@ PY
 echo "==> rewriting history ($(git rev-list --count HEAD) commits) with a blob callback"
 git filter-repo --quiet --blob-callback "$BODY" --force
 
-echo "==> verifying the published tree"
+echo "==> verifying (the canonical repository URL is the one permitted exception)"
 PATTERNS='example-user|example-user|library\.lan|192\.168\.|$HOME'
-tree_hits=$(git grep -alE "$PATTERNS" HEAD -- . 2>/dev/null || true)
-if [ -n "$tree_hits" ]; then
+ALLOWED='repository = "https://github.com/Thug-Dracula/palace-client"'
+
+leaks=$(git grep -nE "$PATTERNS" HEAD -- . 2>/dev/null | grep -vF "$ALLOWED" || true)
+if [ -n "$leaks" ]; then
   echo "FAILED: tree still matches:" >&2
-  echo "$tree_hits" >&2
+  echo "$leaks" >&2
   exit 1
 fi
-echo "    tree clean"
+echo "    tree clean apart from the repository URL"
 
 echo "==> verifying every commit's blobs (binaries included)"
-survivors=""
+leaks=""
 for commit in $(git rev-list --all); do
-  hits=$(git grep -alE "$PATTERNS" "$commit" -- . 2>/dev/null || true)
+  hits=$(git grep -nE "$PATTERNS" "$commit" -- . 2>/dev/null | grep -vF "$ALLOWED" || true)
   if [ -n "$hits" ]; then
-    survivors="$commit:$hits"
+    leaks="$commit $hits"
     break
   fi
 done
-if [ -n "$survivors" ]; then
+if [ -n "$leaks" ]; then
   echo "FAILED: history still matches:" >&2
-  echo "$survivors" >&2
+  echo "$leaks" >&2
   exit 1
 fi
 echo "    history clean across $(git rev-list --count HEAD) commits"
