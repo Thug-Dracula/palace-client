@@ -86,6 +86,11 @@ SUMMARY rooms=81 users=2
 | `crates/palace-room/` | `MSG_ROOMDESC` offset walker: room header, overlays, hotspots, loose props, draw commands. Depends on `palace-wire`. |
 | `crates/palace-probe/` | The binary: TCP session, CLI, capture. |
 | `crates/palace-prop/` | Prop (sprite) codec: 8/16/20/S20/32-bit decoders, S20 encoder, M&M palette, asset CRC. Validated over 227,874 real props. See its README for the format spec. |
+| `crates/palace-asset/` | Asset layer: `qAst`/`sAst`/`rAst` transfer state machines, the paced 20-per-flush request scheduler, and the media HTTP fetch with its `.png→.jpg→original` fallback chain. |
+| `crates/palace-render/` | Compositor plus the room↔viewport coordinate mapping. Turns a `RoomDesc` and local assets into an RGBA frame; never panics on missing art. |
+| `crates/palace-client/` | Headless client runtime: connection FSM, session state, live asset intake, frame production. Owns the threads and emits `ClientEvent`s; knows nothing about Tauri. |
+| `src-tauri/` | The Tauri v2 binary (`palace-app`): commands, the `palace://` frame protocol, and the event pump. |
+| `src/` | SvelteKit 5 frontend (Vite, adapter-static). Displays one composited frame and draws the chrome around it. |
 | `fixtures/logon-run1/` | A real captured session (raw bytes + decoded manifest). |
 | `tools/diff_walker.py` | Differential check against `$CORPUS/tools/palace_walker.py`. |
 | `tools/oracle_prop.py`, `tools/diff_corpus.py`, `tools/gen_palette.py`, `tools/diff_prerendered.py` | The prop codec's independent oracles, differential runner and palette verifier. |
