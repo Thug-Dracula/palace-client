@@ -1,0 +1,6 @@
+media roots indexed 7746 names, prop store holds 180665 ids
+room 1672 "   + Ludo II" artist ""
+logical size 1024x640 (background 1024x640), dpr 2
+overlays 2 / 0 / 0 / 0 | loose props 2 | avatars 1
+report: prop 1179011725 missing; drew placeholder
+wrote $REPO-render/renders/1672-ludo-ii-dpr2.png (2048x1280 device px, dpr 2)

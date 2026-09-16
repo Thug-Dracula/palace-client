@@ -1,0 +1,5 @@
+media roots indexed 7746 names, prop store holds 180665 ids
+room 1021 "RPG Loading" artist ""
+logical size 512x384 (background 512x384), dpr 1
+overlays 0 / 0 / 0 / 0 | loose props 0 | avatars 0
+wrote $REPO-render/renders/1021-rpg-loading.png (512x384 device px, dpr 1)
