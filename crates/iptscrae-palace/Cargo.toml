@@ -9,3 +9,7 @@ repository.workspace = true
 
 [dependencies]
 iptscrae = { workspace = true }
+
+[dev-dependencies]
+palace-room = { workspace = true }
+palace-wire = { workspace = true }
