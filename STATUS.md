@@ -32,7 +32,7 @@ cargo run -p palace-app
 
 **Trap:** never `pkill -f "<pattern>"` where the pattern appears in your own command string — it kills the shell running it (documented in `~/AGENTS.md`; it killed a tmux server here). Use `pgrep -x`/`pkill -x` or kill by PID.
 
-**397 tests passing, clippy clean, `cargo check` clean, `svelte-check` clean.**
+**569 tests passing, clippy clean, `cargo check` clean, `svelte-check` clean.**
 
 ### The six original crates (unchanged contracts)
 
@@ -44,6 +44,8 @@ cargo run -p palace-app
 | `palace-prop` | ✅ done | 5 decoders + S20 encoder; 3,000-prop differential = 0 disagreements. |
 | `palace-asset` | ✅ done | `qAst`/`sAst`/`rAst`, paced scheduler, media HTTP. |
 | `palace-render` | ✅ done | composites rooms → PNG; coordinate mapping round-trip tested. |
+| `iptscrae` | ✅ done | lexer (718 lines), parser, VM, stack, budget enforcement, capability trait, regex engine; 143 tests. **Zero dependencies.** |
+| `iptscrae-palace` | ✅ done | 497-line host trait, 371 lines of Palace commands, CLI, corpus harness; 29 tests. Corpus: **2396/2400 files parse · 3791/3805 handlers clean · 0 tokenizer gaps.** |
 
 ### What this milestone added
 
@@ -127,7 +129,7 @@ tested. Outgoing chat still uses plaintext `talk` (the server relays it).
 
 ## What is verified, and how
 
-**Hermetic (no network), `cargo test --workspace` — 397 pass:**
+**Hermetic (no network), `cargo test --workspace` — 569 pass:**
 
 * `crates/palace-client/tests/fixture_replay.rs` replays every server frame of
   `fixtures/logon-run1/` through `SessionState` and asserts 81 rooms, Balamb
@@ -205,7 +207,7 @@ tested. Outgoing chat still uses plaintext `talk` (the server relays it).
 cd $REPO-ui
 bun install
 bun run check && bun run build          # frontend
-cargo test --workspace                  # 397 tests, no network
+cargo test --workspace                  # 569 tests, no network
 bun run tauri dev                       # window; auto-connects to localhost:9998
 
 # headless live checks
@@ -221,6 +223,16 @@ or `PALACE_HOST`/`PALACE_PORT`/`PALACE_USER`. `PALACE_SEED_MEDIA` /
 
 ## Operational rules that have been earning their keep
 
+* **NEVER run `--workspace` cargo commands in a fresh worktree.** A new worktree
+  has no `target/`, so `cargo test --workspace` / `cargo clippy --workspace
+  --all-targets` compiles the **entire Tauri/WebKit dependency tree from scratch —
+  5.6 GB, 20–40 minutes** — and it happens again for each cargo invocation
+  (clippy uses a different profile). From outside this is indistinguishable from
+  a hang, and it caused a *working* agent to be cancelled twice. Instead: scope
+  to the crate (`cargo test -p <crate>`), or set
+  `CARGO_TARGET_DIR=$REPO/target` to reuse the
+  warm 6 GB. A pure crate like `iptscrae` has zero dependencies and builds in
+  seconds — it never needed the Tauri stack at all.
 * **Delegate one milestone per agent, in its own git worktree.** Never blanket
   `git add -A` during a conflicted merge.
 * **ALWAYS re-run the agent's own verification command before merging.**
