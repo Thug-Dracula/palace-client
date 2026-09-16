@@ -1,0 +1,22 @@
+[package]
+name = "palace-asset"
+description = "Palace asset layer: qAst/sAst/rAst transfer state machines, the paced request scheduler, and the media HTTP fetch with its extension fallback chain."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+palace-wire = { workspace = true }
+# The asset CRC routine and the 12-byte prop header length live in the codec
+# crate. We reuse them rather than re-deriving the algorithm: a second
+# implementation of `ASSET_CRC_MAGIC` is a second thing that can be wrong.
+palace-prop = { workspace = true }
+# Blocking HTTP client for the media path. rustls + gzip by default, which is
+# what the live media server (HTTPS) needs. The transport is behind the
+# `HttpTransport` trait so tests can inject a local server or a stub.
+ureq = "3.4"
+
+[dev-dependencies]
+serde_json = { workspace = true }
