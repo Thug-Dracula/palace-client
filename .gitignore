@@ -17,6 +17,9 @@
 /scratch/
 *.tmp
 
+# Personal substitutions for the published copy — must never be pushed
+tools/public-scrub.map
+
 # Editor
 .vscode/
 .idea/
