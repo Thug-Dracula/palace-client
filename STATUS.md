@@ -221,6 +221,39 @@ tested. Outgoing chat still uses plaintext `talk` (the server relays it).
 * Draw commands / name tags / chat text are not rasterized.
 * Avatar anchor offset `x−22, y−22`; one reference uses −21 (1 px ambiguity).
 
+## Event dispatch readiness (measured 2026-09-16)
+
+Measured against the 2,400-script corpus, not assumed.
+
+**Events actually used** — 24 distinct, by frequency:
+
+| Event | n | Event | n |
+|---|---|---|---|
+| `ENTER` | 1956 | `LOCK` / `UNLOCK` | 6 / 6 |
+| `SELECT` | 909 | `HTTPRECEIVED` | 5 |
+| `LEAVE` | 457 | `MOUSEUP` / `MOUSEDRAG` | 3 / 3 |
+| `OUTCHAT` | 237 | `HTTPERROR` | 3 |
+| `ALARM` | 73 | `USERLEAVE` | 3 |
+| `INCHAT` | 64 | `STATECHANGE` | 3 |
+| `ROLLOVER` / `ROLLOUT` | 21 / 14 | `SIGNON` | 3 |
+| `ROOMREADY` | 10 | `HTTPRECIEVED` (sic) | 1 |
+| `NAMECHANGE` / `ROOMLOAD` | 9 / 9 | `MOUSEMOVE` | 1 |
+| `KEYDOWN` | 8 | | |
+| `SERVERMSG` | 7 | | |
+
+`ENTER` + `SELECT` + `LEAVE` + `OUTCHAT` + `ALARM` + `INCHAT` alone are ~92% of all handler invocations.
+
+**Command coverage: 100%.** All 102 distinct commands the corpus uses — 391,129 occurrences — are already implemented. The registry holds **191 names**: 72 core in `iptscrae/src/registry.rs` + 121 Palace bindings in `iptscrae-palace/src/commands.rs`. **No command implementation work remains for dispatch.**
+
+**So event dispatch is a wiring job, not an implementation job:** the script text is already extracted and validated (`crates/palace-room/tests/corpus_scripts.rs`, 2400/2400), the `ON`-block splitter and VM already exist, and every command is registered. What is missing is mapping the 24 event names above onto runtime events and supplying the host.
+
+### Measurement caution — two earlier attempts at this metric were wrong
+
+1. Counting every uppercase token as a command reported **43.3% coverage**. Wrong: it counted `CHATSTR` (a special *variable*), the `ON`-block *event names*, and user variables such as `DT`, `HP`, `X2`, `S1`, `SR`.
+2. Comparing only against `iptscrae-palace/src/commands.rs` reported **54.5% missing**. Wrong: it missed the entire 72-command core registry in `iptscrae/src/registry.rs` — `GLOBAL`, `IF`, `IFELSE`, `AND`, `NOT`, `EXEC`, `WHILE`, `DUP` — which is where most of the "missing" commands actually live.
+
+The correct method: use the reference registry (OpenPalace `IptDefaultCommands.as` + `PalaceIptscraeCommands.as`) as the command vocabulary, then compare against the **union** of both Rust registries. Any future coverage claim must do the same.
+
 ## Running it
 
 ```bash
