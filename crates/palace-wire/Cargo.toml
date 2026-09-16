@@ -1,0 +1,13 @@
+[package]
+name = "palace-wire"
+description = "Palace wire protocol: framing, endianness handling, opcode table, message codecs, fixture corpus format."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Only used by the fixture-corpus module. The protocol core itself is
+# dependency-free (std only).
+serde_json = { workspace = true }
