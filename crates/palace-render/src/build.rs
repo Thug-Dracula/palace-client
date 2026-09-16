@@ -137,6 +137,16 @@ impl SceneBuilder {
         &self.props
     }
 
+    /// The media store, for a live client that registers fetched files.
+    pub fn media_mut(&mut self) -> &mut MediaStore {
+        &mut self.media
+    }
+
+    /// The prop store, for a live client that inserts received blobs.
+    pub fn props_mut(&mut self) -> &mut PropStore {
+        &mut self.props
+    }
+
     /// Resolve a room and `avatars` into a drawable [`Scene`].
     ///
     /// Never fails: a missing asset becomes a [`AssetNote`] plus a placeholder or

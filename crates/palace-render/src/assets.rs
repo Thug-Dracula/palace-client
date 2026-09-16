@@ -136,6 +136,23 @@ impl MediaStore {
             detail,
         })
     }
+
+    /// Register a file fetched after the store was built, keyed like [`MediaStore::new`].
+    ///
+    /// Returns whether the name was already indexed.
+    pub fn insert_path(&mut self, name: &str, path: PathBuf) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        let base = Path::new(name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(name)
+            .to_ascii_lowercase();
+        let existed = self.by_name.contains_key(&base);
+        self.by_name.insert(base, path);
+        existed
+    }
 }
 
 fn index_dir(dir: &Path, out: &mut HashMap<String, PathBuf>) {
@@ -168,6 +185,8 @@ enum PropBackend {
     File(PathBuf),
     /// A record in a `.prp` roster, read on demand.
     Roster { path: PathBuf, offset: u64, len: u64 },
+    /// A blob handed over by a live client (asset transfer), held in memory.
+    Memory(std::sync::Arc<Vec<u8>>),
 }
 
 /// A store of prop blobs keyed by 32-bit asset id.
@@ -318,7 +337,18 @@ impl PropStore {
         match backend {
             PropBackend::File(path) => std::fs::read(path).ok(),
             PropBackend::Roster { path, offset, len } => read_roster_blob(path, *offset, *len),
+            PropBackend::Memory(bytes) => Some(bytes.as_ref().clone()),
         }
+    }
+
+    /// Insert a prop blob handed over live, replacing any existing entry for `id`.
+    ///
+    /// Returns whether an entry already existed. Used by clients that receive
+    /// props over the wire rather than from a directory or roster.
+    pub fn insert_blob(&mut self, id: u32, blob: Vec<u8>) -> bool {
+        let replaced = self.blobs.contains_key(&id);
+        self.insert(id, PropBackend::Memory(std::sync::Arc::new(blob)));
+        replaced
     }
 
     /// Decode `id` into RGBA plus the header facts the renderer needs, recording
