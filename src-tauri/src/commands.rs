@@ -76,6 +76,12 @@ pub fn say(state: State<'_, AppState>, text: String) -> Result<(), String> {
     with_client(&state, |client| client.say(text))
 }
 
+/// Click the room at a viewport pixel; the runtime hit-tests hotspots.
+#[tauri::command]
+pub fn click(state: State<'_, AppState>, x: f64, y: f64) -> Result<(), String> {
+    with_client(&state, |client| client.click(x, y))
+}
+
 /// Report the viewport size, device pixel ratio, zoom and scale mode.
 #[tauri::command]
 pub fn set_viewport(

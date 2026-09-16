@@ -244,6 +244,35 @@ fn main() {
         ));
     }
 
+    if let Ok(source) = std::env::var("PALACE_RUN_SCRIPT") {
+        let before_version = handle.frames().version();
+        let before = handle.frames().png();
+        println!("--> run_script {source:?} (frame version {before_version})");
+        handle.run_script(source);
+        runtime.block_on(pump_for(
+            &mut stream,
+            &handle,
+            Duration::from_secs(4),
+            target,
+            &mut switched,
+            None,
+            &mut clicked,
+        ));
+        let after = handle.frames().png();
+        println!(
+            "[script-frame] version {before_version} -> {}; {} -> {} bytes; frame changed: {}",
+            handle.frames().version(),
+            before.as_ref().map_or(0, Vec::len),
+            after.as_ref().map_or(0, Vec::len),
+            before != after
+        );
+        if let Some(png) = after {
+            let path = std::env::temp_dir().join("palace-after-script.png");
+            let _ = std::fs::write(&path, png);
+            println!("[script-frame] saved {}", path.display());
+        }
+    }
+
     handle.say("live-smoke ping");
     std::thread::sleep(Duration::from_millis(1500));
     runtime.block_on(pump_for(

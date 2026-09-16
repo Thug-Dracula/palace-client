@@ -61,6 +61,18 @@
   });
 
   const geometry = $derived(store.screen?.geometry ?? null);
+
+  // Hotspot clicks go to the runtime in viewport pixels; it maps them through
+  // the same transform that placed the frame, then hit-tests the room.
+  function onClick(event: MouseEvent) {
+    if (!element) {
+      return;
+    }
+    const rect = element.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    void api.click(x, y).catch(() => {});
+  }
 </script>
 
 <div class="viewport-wrap">
@@ -93,7 +105,14 @@
     {#if store.room}<span class="readout">{store.room.name}</span>{/if}
   </div>
 
-  <div class="viewport" bind:this={element}>
+  <div
+    class="viewport"
+    bind:this={element}
+    role="button"
+    tabindex="0"
+    onclick={onClick}
+    onkeydown={() => {}}
+  >
     {#if store.screen && geometry}
       <img
         class="frame"

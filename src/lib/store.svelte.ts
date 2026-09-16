@@ -103,6 +103,16 @@ class PalaceStore {
           this.zoom = event.screen.geometry.zoom;
         }
         break;
+      case "script": {
+        const summary = `ON ${event.event}: ${event.fired} handler(s)`;
+        this.notices = [
+          ...this.notices,
+          ...event.effects.slice(0, 3),
+          ...event.problems,
+          event.effects.length > 3 ? `${summary} (+${event.effects.length - 3} more)` : summary,
+        ].slice(-6);
+        break;
+      }
       case "note":
         this.notices = [...this.notices, event.text].slice(-6);
         break;
