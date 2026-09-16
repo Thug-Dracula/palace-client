@@ -43,6 +43,7 @@ class PalaceStore {
   chat = $state<LocalChatLine[]>([]);
   screen = $state<ScreenState | null>(null);
   notes = $state<string[]>([]);
+  notices = $state<string[]>([]);
   settings = $state<Settings>({ host: "localhost", port: 9998, username: "Guest" });
   roomFilter = $state("");
 
@@ -103,7 +104,7 @@ class PalaceStore {
         }
         break;
       case "note":
-        this.notes = [...this.notes.slice(-3), event.text];
+        this.notices = [...this.notices, event.text].slice(-6);
         break;
     }
   }

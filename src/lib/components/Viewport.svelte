@@ -118,9 +118,9 @@
       </div>
     {/if}
 
-    {#if store.notes.length}
+    {#if store.notes.length || store.notices.length}
       <div class="notes">
-        {#each store.notes.slice(-2) as note}<div>{note}</div>{/each}
+        {#each [...store.notes, ...store.notices].slice(-4) as note}<div>{note}</div>{/each}
       </div>
     {/if}
   </div>
