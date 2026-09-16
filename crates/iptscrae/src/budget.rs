@@ -62,6 +62,13 @@ pub struct Limits {
     /// Maximum bytes in one string value.
     pub string_bytes: usize,
     /// Maximum distinct variables auto-vivified by one activation.
+    ///
+    /// The guide caps variables at 64 *per handler*, but the corpus has handlers
+    /// that name up to 164 distinct non-command symbols (`5012_hs1.txt`), and the
+    /// guide separately calls the global store unbounded — so the two reconcile
+    /// as "64 locals plus unbounded globals", which this single counter cannot
+    /// express. The default is therefore the corpus-compatible bound rather than
+    /// the guide's per-handler number; see the README.
     pub variables: usize,
 }
 
