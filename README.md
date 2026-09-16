@@ -91,15 +91,11 @@ SUMMARY rooms=81 users=2
 | `tools/oracle_prop.py`, `tools/diff_corpus.py`, `tools/gen_palette.py`, `tools/diff_prerendered.py` | The prop codec's independent oracles, differential runner and palette verifier. |
 
 Dependency policy: `palace-wire` depends only on `serde_json` (for the fixture
-<<<<<<< HEAD
-manifest). The protocol core is std-only. `palace-probe` adds nothing but
-`palace-wire`. `palace-prop` depends on `flate2` (zlib) and `png` (debug output
-only) and deliberately **not** on `palace-wire` — props are a self-contained binary
-format that has nothing to do with the wire protocol.
-=======
 manifest). The protocol core is std-only. `palace-room` adds nothing but
-`palace-wire`; `palace-probe` adds nothing but `palace-wire`.
->>>>>>> feat/palace-room
+`palace-wire`; `palace-probe` adds nothing but `palace-wire`. `palace-prop`
+depends on `flate2` (zlib) and `png` (debug output only) and deliberately
+**not** on `palace-wire` — props are a self-contained binary format that has
+nothing to do with the wire protocol.
 
 ---
 
