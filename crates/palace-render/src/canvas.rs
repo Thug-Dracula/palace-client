@@ -229,6 +229,25 @@ impl Canvas {
         }
     }
 
+    /// Encode the buffer as an 8-bit RGBA PNG and return the bytes.
+    ///
+    /// In-memory twin of [`Canvas::write_png`], for clients that hand a frame to
+    /// a browser instead of a file.
+    pub fn to_png_bytes(&self) -> Result<Vec<u8>, RenderError> {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, self.width, self.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| RenderError::Png(e.to_string()))?;
+        writer
+            .write_image_data(&self.pixels)
+            .map_err(|e| RenderError::Png(e.to_string()))?;
+        drop(writer);
+        Ok(out)
+    }
+
     /// Encode the buffer as an 8-bit RGBA PNG.
     pub fn write_png(&self, path: impl AsRef<Path>) -> Result<(), RenderError> {
         let file = std::fs::File::create(path).map_err(RenderError::Io)?;
