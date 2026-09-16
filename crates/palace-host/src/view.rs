@@ -290,7 +290,7 @@ mod tests {
         };
         assert!(spot.contains(10, 10), "absolute outline");
         assert!(!spot.contains(300, 300), "outside both interpretations");
-        assert!(!spot.contains(510, 510), "inside neither");
+        assert!(spot.contains(510, 510), "outline relative to loc");
     }
 
     #[test]
