@@ -1,0 +1,45 @@
+{
+ "note": "Real sAst frames captured from chat.animanic.de:9977 (IP 45.90.4.156:9977), 2026-09-09. Raw pcaps were not retained; these are the prop blobs extracted from those frames by $CORPUS/tools/palace_walker.py::_store_asset (the known-good Python parser), together with the exact TCP payload length of the packet that carried each frame, recovered from $CORPUS/pcap_extract/animanic_pass2_dump.txt and animanic_pass3_dump.txt.",
+ "server": "chat.animanic.de:9977",
+ "byte_order": "little",
+ "capture_date": "2026-09-09",
+ "how_to_read": [
+  "Each sAst frame arrives as one block (blockNumber == 0, blockCount == 1).",
+  "Frame on the wire = 12-byte header (opcode,length,refNum) + payload.",
+  "payload = AssetSend header (24 B) + AssetDescriptor (40 B) + blockSize data + padding.",
+  "tcp_payload_len - 12 == 64 + asset_size, i.e. padding == 0, for every entry below.",
+  "The descriptor name arrived empty on this server, hence palace_walker's '_unnamed' file names."
+ ],
+ "props": [
+  {
+   "file": "1020559380_unnamed.bin",
+   "asset_size": 434,
+   "tcp_payload_len": 510,
+   "asset_id": 1020559380
+  },
+  {
+   "file": "1020559648_unnamed.bin",
+   "asset_size": 455,
+   "tcp_payload_len": 531,
+   "asset_id": 1020559648
+  },
+  {
+   "file": "1163612519_unnamed.bin",
+   "asset_size": 153,
+   "tcp_payload_len": 229,
+   "asset_id": 1163612519
+  },
+  {
+   "file": "1163676742_unnamed.bin",
+   "asset_size": 1489,
+   "tcp_payload_len": 1565,
+   "asset_id": 1163676742
+  },
+  {
+   "file": "985222876_unnamed.bin",
+   "asset_size": 158,
+   "tcp_payload_len": 234,
+   "asset_id": 985222876
+  }
+ ]
+}
