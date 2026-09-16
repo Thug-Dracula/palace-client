@@ -72,8 +72,8 @@ pub use compositor::{draw_into, render, sort_avatars, AnimationClock, RenderOpti
 pub use corpus::RoomSource;
 pub use error::{AssetNote, RenderError};
 pub use scene::{
-    layer_for_hotspot_flags, Avatar, AvatarPart, Layer, Scene, Sprite,
-    FLAG_PICTURES_ABOVE_ALL, FLAG_PICTURES_ABOVE_NAME_TAGS, FLAG_PICTURES_ABOVE_PROPS,
+    layer_for_hotspot_flags, Avatar, AvatarPart, Layer, Scene, Sprite, FLAG_PICTURES_ABOVE_ALL,
+    FLAG_PICTURES_ABOVE_NAME_TAGS, FLAG_PICTURES_ABOVE_PROPS,
 };
 pub use viewport::{
     clamp_dpr, clamp_zoom, room_size_from_background, PointF, RectF, ScaleMode, SizeF,

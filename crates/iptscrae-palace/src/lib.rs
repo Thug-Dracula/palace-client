@@ -53,9 +53,9 @@ pub mod harness;
 pub mod traits;
 
 pub use classify::{classify_parse, classify_run, FailureClass, SourceSpellings};
-pub use events::ScriptEvent;
 pub use commands::{
     command_spec, register_palace_commands, CommandSpec, PalaceCommands, Push, PALACE_COMMANDS,
 };
+pub use events::ScriptEvent;
 pub use harness::SkeletonHost;
 pub use traits::PalaceHost;

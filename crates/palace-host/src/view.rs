@@ -70,7 +70,13 @@ impl SpotView {
             state_pics: spot
                 .states
                 .iter()
-                .map(|s| (i32::from(s.pict_id), i32::from(s.pic_loc.h), i32::from(s.pic_loc.v)))
+                .map(|s| {
+                    (
+                        i32::from(s.pict_id),
+                        i32::from(s.pic_loc.h),
+                        i32::from(s.pic_loc.v),
+                    )
+                })
                 .collect(),
         }
     }
@@ -309,16 +315,16 @@ mod tests {
     fn spot_at_prefers_the_last_overlapping_spot() {
         let view = HostView {
             spots: vec![
-            SpotView {
-                id: 1,
-                loc: (0, 0),
-                ..SpotView::default()
-            },
-            SpotView {
-                id: 2,
-                loc: (0, 0),
-                ..SpotView::default()
-            },
+                SpotView {
+                    id: 1,
+                    loc: (0, 0),
+                    ..SpotView::default()
+                },
+                SpotView {
+                    id: 2,
+                    loc: (0, 0),
+                    ..SpotView::default()
+                },
             ],
             ..HostView::default()
         };

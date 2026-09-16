@@ -78,11 +78,7 @@ pub enum Effect {
         dy: i32,
     },
     /// `SETPICOPACITY` — fade a spot's picture.
-    SetPicOpacity {
-        spot: i32,
-        state: i32,
-        opacity: f64,
-    },
+    SetPicOpacity { spot: i32, state: i32, opacity: f64 },
     /// `LOCK` — lock a door.
     Lock { spot: i32 },
     /// `UNLOCK` — unlock a door.
@@ -112,12 +108,7 @@ pub enum Effect {
     /// `BEEP` — a system beep.
     Beep,
     /// `LINE` — a painted segment in absolute room coordinates.
-    DrawLine {
-        x1: i32,
-        y1: i32,
-        x2: i32,
-        y2: i32,
-    },
+    DrawLine { x1: i32, y1: i32, x2: i32, y2: i32 },
     /// `LINETO` — a painted segment, resolved to absolute room coordinates by
     /// the host (which owns the pen).
     DrawLineRel { x1: i32, y1: i32, x2: i32, y2: i32 },
@@ -293,10 +284,7 @@ impl fmt::Display for Effect {
                 state,
                 dx,
                 dy,
-            } => write!(
-                f,
-                "SETPICLOCLOCAL spot={spot} state={state} d=({dx},{dy})"
-            ),
+            } => write!(f, "SETPICLOCLOCAL spot={spot} state={state} d=({dx},{dy})"),
             Effect::SetPicOpacity {
                 spot,
                 state,

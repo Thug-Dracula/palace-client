@@ -117,7 +117,8 @@ fn rust_extraction_matches_the_harvested_corpus() {
                             .position(|(a, b)| a != b)
                             .unwrap_or_else(|| rust_chars.min(harvested_chars));
                         let window_start = first_diff.saturating_sub(12);
-                        let rust_window: String = text.chars().skip(window_start).take(24).collect();
+                        let rust_window: String =
+                            text.chars().skip(window_start).take(24).collect();
                         let harvested_window: String =
                             harvested_text.chars().skip(window_start).take(24).collect();
                         mismatches.push(format!(

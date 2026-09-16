@@ -184,7 +184,11 @@ enum PropBackend {
     /// A file whose name begins with the decimal asset id.
     File(PathBuf),
     /// A record in a `.prp` roster, read on demand.
-    Roster { path: PathBuf, offset: u64, len: u64 },
+    Roster {
+        path: PathBuf,
+        offset: u64,
+        len: u64,
+    },
     /// A blob handed over by a live client (asset transfer), held in memory.
     Memory(std::sync::Arc<Vec<u8>>),
 }
@@ -445,8 +449,7 @@ pub fn placeholder() -> PropImage {
             });
         }
     }
-    PropImage::from_rgba(SIZE, SIZE, bytes)
-        .unwrap_or_else(|_| PropImage::transparent(SIZE, SIZE))
+    PropImage::from_rgba(SIZE, SIZE, bytes).unwrap_or_else(|_| PropImage::transparent(SIZE, SIZE))
 }
 
 #[cfg(test)]
@@ -455,10 +458,8 @@ mod tests {
     use std::io::Write;
 
     fn tempdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "palace-render-assets-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("palace-render-assets-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
@@ -579,7 +580,10 @@ mod tests {
         let store = MediaStore::new(std::slice::from_ref(&dir));
         assert!(store.resolve("Backdrop.png").is_some());
         assert!(store.resolve("backdrop.PNG").is_some(), "case-insensitive");
-        assert!(store.resolve("Backdrop.gif").is_some(), "gif falls back to png");
+        assert!(
+            store.resolve("Backdrop.gif").is_some(),
+            "gif falls back to png"
+        );
         assert!(store.resolve("nope.gif").is_none());
         assert!(store.resolve("").is_none());
         let _ = std::fs::remove_dir_all(&dir);

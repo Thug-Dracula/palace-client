@@ -88,7 +88,10 @@ fn hotspot_scripts_dispatch_by_event_name_over_the_corpus() {
     for path in files {
         let bytes = std::fs::read(&path).expect("payload must be readable");
         let mut touched = false;
-        for record in decode_stream(&bytes, ByteOrder::Little).into_iter().flatten() {
+        for record in decode_stream(&bytes, ByteOrder::Little)
+            .into_iter()
+            .flatten()
+        {
             for spot in &record.hotspots {
                 let Some(text) = spot.script.as_deref() else {
                     continue;
@@ -125,7 +128,10 @@ fn hotspot_scripts_dispatch_by_event_name_over_the_corpus() {
         println!("  {event:14} {n}");
     }
 
-    assert!(payloads_with_scripts > 0, "no payload carried a hotspot script");
+    assert!(
+        payloads_with_scripts > 0,
+        "no payload carried a hotspot script"
+    );
     assert!(
         unparsed <= 4,
         "{unparsed} scripts failed to re-parse; the corpus has 4 known-malformed sources"

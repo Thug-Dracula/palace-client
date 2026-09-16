@@ -114,7 +114,11 @@ fn lookups_clamp_bad_indices_instead_of_panicking() {
     assert_eq!(pushed("LOOSEPROPPOS", &ints(&[0])), ints(&[10, 20]));
     assert_eq!(pushed("LOOSEPROPPOS", &ints(&[9])), ints(&[0, 0]));
     // Hit testing and door lock state.
-    assert_eq!(pushed("INSPOT", &ints(&[3])), ints(&[1]), "self stands in spot 3");
+    assert_eq!(
+        pushed("INSPOT", &ints(&[3])),
+        ints(&[1]),
+        "self stands in spot 3"
+    );
     assert_eq!(pushed("INSPOT", &ints(&[2])), ints(&[0]));
     assert_eq!(pushed("INSPOT", &ints(&[99])), ints(&[0]));
     assert_eq!(pushed("ISLOCKED", &ints(&[5])), ints(&[0]));
@@ -129,7 +133,10 @@ fn prop_dimensions_and_offsets_are_stubbed_with_two_numbers() {
 #[test]
 fn str_converts_numbers_strings_and_everything_else() {
     assert_eq!(pushed("STR", &ints(&[42])), vec![Value::str("42")]);
-    assert_eq!(pushed("STR", &strs(&["already"])), vec![Value::str("already")]);
+    assert_eq!(
+        pushed("STR", &strs(&["already"])),
+        vec![Value::str("already")]
+    );
     assert_eq!(
         pushed("STR", &[Value::Chunk(Chunk::empty())]),
         vec![Value::str("")]
@@ -154,10 +161,7 @@ fn messaging_commands_record_their_effects() {
         }
     );
     assert_eq!(
-        effect_of(
-            "SAYAT",
-            &[Value::str("hi"), Value::Int(10), Value::Int(20)]
-        ),
+        effect_of("SAYAT", &[Value::str("hi"), Value::Int(10), Value::Int(20)]),
         Effect::SayAt {
             text: "hi".to_owned(),
             x: 10,
@@ -270,7 +274,10 @@ fn spot_mutation_commands_record_their_effects() {
     );
     assert_eq!(effect_of("LOCK", &ints(&[5])), Effect::Lock { spot: 5 });
     assert_eq!(effect_of("UNLOCK", &ints(&[5])), Effect::Unlock { spot: 5 });
-    assert_eq!(effect_of("SELECT", &ints(&[5])), Effect::SelectSpot { spot: 5 });
+    assert_eq!(
+        effect_of("SELECT", &ints(&[5])),
+        Effect::SelectSpot { spot: 5 }
+    );
 }
 
 // --------------------------------------------------------------------- props
@@ -290,13 +297,19 @@ fn prop_commands_record_their_effects() {
     assert_eq!(effect_of("CLEARPROPS", &[]), Effect::Naked);
     // LOADPROPS is a cache warm-up: it records nothing.
     let mut host = populated_host();
-    assert_eq!(host.command("LOADPROPS", &ints(&[7, 9])).unwrap(), Vec::new());
+    assert_eq!(
+        host.command("LOADPROPS", &ints(&[7, 9])).unwrap(),
+        Vec::new()
+    );
     assert!(host.effects.is_empty());
 }
 
 #[test]
 fn prop_ids_accept_numbers_and_quoted_numbers() {
-    assert_eq!(effect_of("DONPROP", &ints(&[7])), Effect::DonProp { prop: 7 });
+    assert_eq!(
+        effect_of("DONPROP", &ints(&[7])),
+        Effect::DonProp { prop: 7 }
+    );
     assert_eq!(
         effect_of("DONPROP", &strs(&[" 7 "])),
         Effect::DonProp { prop: 7 }
@@ -345,7 +358,8 @@ fn set_props_on_a_borrowed_array_falls_back_to_empty() {
     };
     let held = cell.borrow_mut();
     let mut host = populated_host();
-    host.command("SETPROPS", &[array.clone()]).unwrap();
+    host.command("SETPROPS", std::slice::from_ref(&array))
+        .unwrap();
     drop(held);
     assert_eq!(
         host.take_effects(),
@@ -391,10 +405,19 @@ fn movement_commands_record_their_effects() {
             name: "bob".to_owned()
         }
     );
-    assert_eq!(effect_of("SETCOLOR", &ints(&[3])), Effect::SetColor { color: 3 });
-    assert_eq!(effect_of("SETFACE", &ints(&[4])), Effect::SetFace { face: 4 });
+    assert_eq!(
+        effect_of("SETCOLOR", &ints(&[3])),
+        Effect::SetColor { color: 3 }
+    );
+    assert_eq!(
+        effect_of("SETFACE", &ints(&[4])),
+        Effect::SetFace { face: 4 }
+    );
     assert_eq!(effect_of("MACRO", &ints(&[1])), Effect::Macro { index: 1 });
-    assert_eq!(effect_of("DIMROOM", &ints(&[50])), Effect::DimRoom { percent: 50 });
+    assert_eq!(
+        effect_of("DIMROOM", &ints(&[50])),
+        Effect::DimRoom { percent: 50 }
+    );
     assert_eq!(
         effect_of("LAUNCHAPP", &strs(&["app"])),
         Effect::LaunchApp {

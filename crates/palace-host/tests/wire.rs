@@ -90,14 +90,7 @@ fn relative_move_uses_our_position() {
 
 #[test]
 fn spot_state_carries_room_spot_and_state() {
-    let frame = effect_frame(
-        &Effect::SetSpotState {
-            spot: 2,
-            state: 1,
-        },
-        &ctx(),
-    )
-    .expect("sSta");
+    let frame = effect_frame(&Effect::SetSpotState { spot: 2, state: 1 }, &ctx()).expect("sSta");
     assert_eq!(frame.opcode, opcode::SPOTSTATE);
     assert_eq!(frame.ref_num, 0);
     assert_eq!(frame.payload, [0x85, 0x03, 2, 0, 1, 0]);
@@ -115,13 +108,7 @@ fn door_lock_and_unlock_carry_room_and_spot() {
 
 #[test]
 fn set_props_writes_count_then_id_crc_pairs() {
-    let frame = effect_frame(
-        &Effect::SetProps {
-            props: vec![7, 9],
-        },
-        &ctx(),
-    )
-    .expect("usrP");
+    let frame = effect_frame(&Effect::SetProps { props: vec![7, 9] }, &ctx()).expect("usrP");
     assert_eq!(frame.opcode, opcode::USERPROP);
     assert_eq!(frame.ref_num, 13);
     let mut want = Vec::new();
@@ -219,7 +206,10 @@ fn penfront_sets_the_front_layer_flag() {
         &context,
     )
     .expect("draw");
-    assert_eq!(u16::from_le_bytes([frame.payload[4], frame.payload[5]]), 0x8000);
+    assert_eq!(
+        u16::from_le_bytes([frame.payload[4], frame.payload[5]]),
+        0x8000
+    );
 }
 
 #[test]
@@ -257,13 +247,6 @@ fn local_only_effects_have_no_frame() {
 fn encoders_follow_the_session_byte_order() {
     let mut context = ctx();
     context.byte_order = ByteOrder::Big;
-    let frame = effect_frame(
-        &Effect::SetSpotState {
-            spot: 2,
-            state: 1,
-        },
-        &context,
-    )
-    .expect("sSta");
+    let frame = effect_frame(&Effect::SetSpotState { spot: 2, state: 1 }, &context).expect("sSta");
     assert_eq!(frame.payload, [0x03, 0x85, 0, 2, 0, 1]);
 }

@@ -76,7 +76,11 @@ pub enum AssetNote {
     /// A hotspot-state image overlay referenced a picture id with no file name.
     OverlayWithoutFile { pic_id: i16 },
     /// A hotspot-state image overlay named a file that could not be decoded.
-    BadOverlay { pic_id: i16, file: String, detail: String },
+    BadOverlay {
+        pic_id: i16,
+        file: String,
+        detail: String,
+    },
     /// The room description itself carried recoverable parse warnings.
     RoomWarning(String),
 }
@@ -85,7 +89,10 @@ impl fmt::Display for AssetNote {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AssetNote::MissingBackground { name, detail } => {
-                write!(f, "background {name:?} not found ({detail}); used flat backdrop")
+                write!(
+                    f,
+                    "background {name:?} not found ({detail}); used flat backdrop"
+                )
             }
             AssetNote::MissingProp { id } => write!(f, "prop {id} missing; drew placeholder"),
             AssetNote::BadProp { id, detail } => {

@@ -70,7 +70,11 @@ fn entering_the_room_fires_its_on_enter_script() {
             },
         ]
     );
-    assert_eq!(engine.pending_alarms(), 1, "the script armed a 1600-tick alarm");
+    assert_eq!(
+        engine.pending_alarms(),
+        1,
+        "the script armed a 1600-tick alarm"
+    );
 }
 
 #[test]

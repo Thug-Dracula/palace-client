@@ -152,7 +152,13 @@ impl FrameStore {
 mod tests {
     use super::*;
 
-    fn geometry(room: (f64, f64), viewport: (f64, f64), zoom: f64, native: bool, dpr: f64) -> ViewGeometry {
+    fn geometry(
+        room: (f64, f64),
+        viewport: (f64, f64),
+        zoom: f64,
+        native: bool,
+        dpr: f64,
+    ) -> ViewGeometry {
         ViewGeometry::compute(
             SizeF::new(room.0, room.1),
             SizeF::new(viewport.0, viewport.1),

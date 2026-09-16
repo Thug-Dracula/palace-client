@@ -97,7 +97,9 @@ fn seed_media() -> Vec<PathBuf> {
     if let Some(explicit) = std::env::var_os("PALACE_SEED_MEDIA") {
         return split_paths(Some(explicit.to_string_lossy().into_owned()));
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     [
         home.join("colosseum/http_harvest"),
         home.join("Sync/Colosseum-BGs/all"),
@@ -218,7 +220,14 @@ mod tests {
             port: 9998,
             username: "Guest".to_string(),
         };
-        let parsed = base.with_args(args(&["--host", "example.org", "--port", "1234", "--user", "Tester"]));
+        let parsed = base.with_args(args(&[
+            "--host",
+            "example.org",
+            "--port",
+            "1234",
+            "--user",
+            "Tester",
+        ]));
         assert_eq!(parsed.host, "example.org");
         assert_eq!(parsed.port, 1234);
         assert_eq!(parsed.username, "Tester");
@@ -249,4 +258,3 @@ mod tests {
         assert_eq!(cfg.username, "Someone");
     }
 }
-

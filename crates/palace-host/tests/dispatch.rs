@@ -156,7 +156,10 @@ fn a_faulting_handler_is_reported_not_swallowed() {
     let mut engine = engine_for(&[(1, "ON SELECT { 1 0 / POP }")]);
     let report = engine.fire(ScriptEvent::Select);
     assert!(report.fired());
-    assert!(report.runs[0].error.is_none(), "division by zero is defined");
+    assert!(
+        report.runs[0].error.is_none(),
+        "division by zero is defined"
+    );
 
     let mut engine = engine_for(&[(1, "ON SELECT { 1 \"x\" & }")]);
     let report = engine.fire(ScriptEvent::Select);

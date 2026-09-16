@@ -18,7 +18,9 @@ use palace_prop::{decode, Prop, PropFormat};
 const BIN: &str = env!("CARGO_BIN_EXE_prop-tool");
 
 fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures").join(name)
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join(name)
 }
 
 fn run(args: &[&str]) -> Output {
@@ -47,10 +49,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new(tag: &str) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "prop-tool-{tag}-{}-{n}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("prop-tool-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir(path)
@@ -173,7 +172,10 @@ fn inventory_of_a_single_file_reports_it_without_a_total() {
     let text = stdout(&out);
     assert!(text.contains("8-bit=1"), "{text}");
     assert!(text.contains("failed=0"), "{text}");
-    assert!(!text.contains("TOTAL"), "single path needs no total:\n{text}");
+    assert!(
+        !text.contains("TOTAL"),
+        "single path needs no total:\n{text}"
+    );
 }
 
 #[test]
@@ -434,13 +436,13 @@ fn extract_splits_a_roster_into_per_prop_blobs() {
     let dir = TempDir::new("extract");
     let (prp, blob) = roster_file(&dir);
     let outdir = dir.path("props");
-    let out = run(&[
-        "extract",
-        prp.to_str().unwrap(),
-        outdir.to_str().unwrap(),
-    ]);
+    let out = run(&["extract", prp.to_str().unwrap(), outdir.to_str().unwrap()]);
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
-    assert!(stdout(&out).contains("extracted 1 props"), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("extracted 1 props"),
+        "{}",
+        stdout(&out)
+    );
 
     // The name embeds the format name, the record id and the record index.
     let written = outdir.join("8-bit_0000abcd_0.bin");
@@ -687,7 +689,11 @@ fn inventory_tolerates_a_missing_or_garbage_roster() {
 
     let missing = run(&["inventory", "/nonexistent/nope.prp"]);
     assert_eq!(code(&missing), 0);
-    assert!(stdout(&missing).contains("failed=0"), "{}", stdout(&missing));
+    assert!(
+        stdout(&missing).contains("failed=0"),
+        "{}",
+        stdout(&missing)
+    );
 
     let bad = run(&["inventory", garbage.to_str().unwrap()]);
     assert_eq!(code(&bad), 0);

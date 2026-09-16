@@ -52,7 +52,11 @@ fn load_cyborg_adds_a_spotless_script_or_a_problem() {
     let mut engine = ScriptEngine::with_palace_limits();
     engine.load_cyborg("ON ENTER { 1 NOPE }");
     assert_eq!(engine.scripts().len(), 1);
-    assert_eq!(engine.scripts()[0].spot, 0, "a cyborg script has no hotspot");
+    assert_eq!(
+        engine.scripts()[0].spot,
+        0,
+        "a cyborg script has no hotspot"
+    );
     assert!(engine.problems.is_empty());
 
     engine.load_cyborg("1 2 +");

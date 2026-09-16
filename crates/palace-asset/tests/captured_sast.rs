@@ -25,8 +25,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use palace_asset::{
-    media, prop_payload_crc, AssetAssembler, AssetKey, AssetPipeline, AssetSpec, AssetTransfer,
-    AssetType, AssemblyOutcome, MediaCache, MediaFetcher, PipelineEvent, UreqTransport,
+    media, prop_payload_crc, AssemblyOutcome, AssetAssembler, AssetKey, AssetPipeline, AssetSpec,
+    AssetTransfer, AssetType, MediaCache, MediaFetcher, PipelineEvent, UreqTransport,
 };
 use palace_wire::byteorder::ByteOrder;
 use palace_wire::opcode::ASSETSEND;
@@ -129,7 +129,10 @@ fn decoding_a_reconstructed_capture_agrees_with_the_observed_packet_length() {
         assert_eq!(decoded.header.block_count, 1);
         assert_eq!(decoded.header.block_size as usize, prop.asset_size);
         assert_eq!(decoded.header.block_offset, 0);
-        let descriptor = decoded.descriptor.as_ref().expect("block 0 has a descriptor");
+        let descriptor = decoded
+            .descriptor
+            .as_ref()
+            .expect("block 0 has a descriptor");
         assert_eq!(descriptor.size as usize, prop.asset_size);
         assert_eq!(decoded.data, blob);
     }
@@ -155,7 +158,10 @@ fn assembling_a_captured_asset_verifies_its_crc() {
                 assert_eq!(asset.computed_crc(), Some(crc));
                 assert_eq!(asset.id(), prop.asset_id);
             }
-            other => panic!("expected Complete for {}, got {other:?}", prop.file.display()),
+            other => panic!(
+                "expected Complete for {}, got {other:?}",
+                prop.file.display()
+            ),
         }
     }
     assert!(assembler.is_idle(), "nothing should be left half-assembled");
@@ -272,7 +278,10 @@ fn the_media_fixtures_are_usable_by_the_fetcher() {
     assert!(media_dir.join("avatar-editor/photopea.png").is_file());
 
     // The chain a `.gif` background is chased through.
-    assert_eq!(media::fallback_chain("bg.gif"), vec!["bg.png", "bg.jpg", "bg.gif"]);
+    assert_eq!(
+        media::fallback_chain("bg.gif"),
+        vec!["bg.png", "bg.jpg", "bg.gif"]
+    );
     assert_eq!(
         media::media_url("https://media.example/palace/media", "bg.png"),
         "https://media.example/palace/media/bg.png"

@@ -17,8 +17,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use palace_asset::{
-    AssetAssembler, AssetKey, AssetPipeline, AssetSpec, AssetTransfer, AssetType, AssemblerConfig,
-    AssetScheduler, AssemblyOutcome, MediaCache,
+    AssemblerConfig, AssemblyOutcome, AssetAssembler, AssetKey, AssetPipeline, AssetScheduler,
+    AssetSpec, AssetTransfer, AssetType, MediaCache,
 };
 use palace_wire::byteorder::ByteOrder;
 use palace_wire::frame::Frame;
@@ -253,10 +253,7 @@ fn random_block_sequences_never_panic_the_assembler() {
             let transfer = AssetTransfer {
                 header: palace_asset::BlockHeader {
                     asset_type: AssetType::PROP,
-                    spec: AssetSpec::with_crc(
-                        rng.below(4) as i32,
-                        rng.next_u64() as u32,
-                    ),
+                    spec: AssetSpec::with_crc(rng.below(4) as i32, rng.next_u64() as u32),
                     block_size: data_len as i32,
                     block_offset: rng.below(4096) as i32,
                     block_number: rng.below(6) as i16,
@@ -343,9 +340,12 @@ fn media_names_are_never_escaped_out_of_the_cache_root() {
             accepted += 1;
             assert!(relative.is_relative(), "{name:?} produced an absolute path");
             assert!(
-                !relative
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_))),
+                !relative.components().any(|c| matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )),
                 "{name:?} escaped: {relative:?}"
             );
             let full = cache.path_for("http://x/media", &name).unwrap();
@@ -379,14 +379,10 @@ fn the_cache_lookup_by_id_never_confuses_two_assets() {
     let (blob_a, crc_a) = prop_blob(&[1, 2, 3]);
     let (blob_b, crc_b) = prop_blob(&[9, 9, 9]);
     for (blob, crc, id) in [(&blob_a, crc_a, 1), (&blob_b, crc_b, 2)] {
-        let frame = AssetTransfer::single_block(
-            AssetType::PROP,
-            AssetSpec::with_crc(id, crc),
-            "",
-            blob,
-        )
-        .encode_frame(ASSETSEND, 0, ORDER)
-        .unwrap();
+        let frame =
+            AssetTransfer::single_block(AssetType::PROP, AssetSpec::with_crc(id, crc), "", blob)
+                .encode_frame(ASSETSEND, 0, ORDER)
+                .unwrap();
         let _ = pipeline.on_frame(&frame, ORDER, id as u64);
     }
     let a = pipeline

@@ -158,7 +158,10 @@ fn rust_extraction_matches_the_python_harvest() {
     for sample in &samples {
         eprintln!("  {sample}");
     }
-    assert_eq!(differing, 0, "different script text than the Python extractor");
+    assert_eq!(
+        differing, 0,
+        "different script text than the Python extractor"
+    );
     assert_eq!(missing_room, 0, "rooms the Rust decoder did not find");
     assert_eq!(missing_hotspot, 0, "hotspots the Rust decoder did not find");
     assert_eq!(unreadable, 0, "payload or script file could not be read");

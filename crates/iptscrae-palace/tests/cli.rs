@@ -141,11 +141,19 @@ fn eval_prints_the_final_stack() {
 
     let output = run(&["eval", "1 2"]);
     assert!(output.status.success());
-    assert_eq!(stdout(&output).trim(), "1 2", "multiple values render in order");
+    assert_eq!(
+        stdout(&output).trim(),
+        "1 2",
+        "multiple values render in order"
+    );
 
     let output = run(&["eval", "\"hello\""]);
     assert!(output.status.success());
-    assert_eq!(stdout(&output).trim(), "\"hello\"", "strings render debug-style");
+    assert_eq!(
+        stdout(&output).trim(),
+        "\"hello\"",
+        "strings render debug-style"
+    );
 }
 
 #[test]
@@ -161,7 +169,10 @@ fn eval_reports_a_runtime_fault_and_fails() {
     assert!(!output.status.success(), "a stack fault must fail");
     assert_contains(&stderr(&output), "eval: [stack]", "category in the message");
     assert_contains(&stderr(&output), "Add", "the faulting command is named");
-    assert!(stdout(&output).trim().is_empty(), "nothing is printed on the stack");
+    assert!(
+        stdout(&output).trim().is_empty(),
+        "nothing is printed on the stack"
+    );
 }
 
 #[test]
@@ -221,7 +232,11 @@ fn run_reports_a_missing_handler_and_fails() {
     let path = script_file(&dir);
     let output = run(&["run", path.to_str().unwrap(), "--handler", "NOPE"]);
     assert!(!output.status.success(), "a missing handler must fail");
-    assert_contains(&stderr(&output), "run: no handler named NOPE", "named error");
+    assert_contains(
+        &stderr(&output),
+        "run: no handler named NOPE",
+        "named error",
+    );
 }
 
 #[test]
@@ -241,7 +256,10 @@ fn run_reports_a_handler_runtime_fault_and_fails() {
     let dir = TempDir::new();
     let path = dir.write("bad.txt", "ON ENTER { 1 + }\n");
     let output = run(&["run", path.to_str().unwrap()]);
-    assert!(!output.status.success(), "a runtime fault must fail the run");
+    assert!(
+        !output.status.success(),
+        "a runtime fault must fail the run"
+    );
     let text = stdout(&output);
     assert_contains(&text, "ON ENTER: FAILED [stack]", "failure line");
     assert_contains(&text, "stack underflow", "underlying fault");
@@ -357,7 +375,11 @@ fn corpus_summarises_every_file_and_recurses_into_subdirectories() {
     assert_contains(&text, "files          : 4", "nested file is counted");
     assert_contains(&text, "parsed         : 3 (75.0%)", "parse rate");
     assert_contains(&text, "parse failures : 1 (25.0%)", "parse failure rate");
-    assert_contains(&text, "handlers       : 3 in 3 parsed files", "handler count");
+    assert_contains(
+        &text,
+        "handlers       : 3 in 3 parsed files",
+        "handler count",
+    );
     assert_contains(
         &text,
         "ran clean      : 2 (66.7% of handlers)",
@@ -371,12 +393,20 @@ fn corpus_summarises_every_file_and_recurses_into_subdirectories() {
     assert_contains(&text, "Parse failure classification:", "parse classes");
     assert_contains(&text, "Run failure classification:", "run classes");
     assert_eq!(
-        class_count(&text, "Parse failure classification:", "(d) malformed source"),
+        class_count(
+            &text,
+            "Parse failure classification:",
+            "(d) malformed source"
+        ),
         1,
         "parse class (d)"
     );
     assert_eq!(
-        class_count(&text, "Run failure classification:", "(c) semantics / environment"),
+        class_count(
+            &text,
+            "Run failure classification:",
+            "(c) semantics / environment"
+        ),
         1,
         "run class (c)"
     );
@@ -384,7 +414,11 @@ fn corpus_summarises_every_file_and_recurses_into_subdirectories() {
     assert_contains(&text, "Run failures by message:", "run messages");
     assert_contains(&text, "Example parse failures:", "parse examples");
     assert_contains(&text, "Example failures:", "run examples");
-    assert_contains(&text, "Palace commands exercised (1 distinct):", "usage header");
+    assert_contains(
+        &text,
+        "Palace commands exercised (1 distinct):",
+        "usage header",
+    );
     assert_contains(&text, "SAY", "the exercised command is listed");
 }
 
@@ -396,7 +430,11 @@ fn corpus_reports_unregistered_command_spellings() {
     assert!(output.status.success());
     let text = stdout(&output);
     assert_eq!(
-        class_count(&text, "Run failure classification:", "(b) unimplemented command"),
+        class_count(
+            &text,
+            "Run failure classification:",
+            "(b) unimplemented command"
+        ),
         1,
         "the failure is classified as a missing command"
     );
@@ -406,7 +444,11 @@ fn corpus_reports_unregistered_command_spellings() {
         "the report lists the spelling seen",
     );
     assert_contains(&text, "HTTPGET", "the source spelling is recovered");
-    assert_contains(&text, "Concat: expected string, found number", "fault message");
+    assert_contains(
+        &text,
+        "Concat: expected string, found number",
+        "fault message",
+    );
 }
 
 #[test]
@@ -416,7 +458,11 @@ fn corpus_handles_a_directory_with_no_parsable_handlers() {
     let output = run(&["corpus", dir.path().to_str().unwrap()]);
     assert!(output.status.success());
     let text = stdout(&output);
-    assert_contains(&text, "handlers       : 0 in 0 parsed files", "zero handlers");
+    assert_contains(
+        &text,
+        "handlers       : 0 in 0 parsed files",
+        "zero handlers",
+    );
     assert_contains(
         &text,
         "ran clean      : 0 (0.0% of handlers)",
@@ -511,7 +557,11 @@ fn corpus_counts_an_unreadable_file_as_malformed_source() {
     assert_contains(&text, "files          : 2", "the broken link is collected");
     assert_contains(&text, "unreadable:", "the read error is recorded");
     assert_eq!(
-        class_count(&text, "Parse failure classification:", "(d) malformed source"),
+        class_count(
+            &text,
+            "Parse failure classification:",
+            "(d) malformed source"
+        ),
         1,
         "an unreadable file is malformed source"
     );

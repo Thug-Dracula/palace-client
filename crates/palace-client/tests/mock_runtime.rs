@@ -96,7 +96,9 @@ impl MockServer {
     fn start_with(frames: Vec<Vec<u8>>, half_close: bool) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
-        listener.set_nonblocking(true).expect("nonblocking listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
 
         let stop = Arc::new(AtomicBool::new(false));
         let received = Arc::new(Mutex::new(Vec::new()));
@@ -462,7 +464,9 @@ fn the_runtime_replays_the_recorded_logon_burst() {
         &mut rx,
         |collected| {
             room_lists(collected).iter().any(|rooms| rooms.len() == 81)
-                && screens(collected).iter().any(|screen| screen.room_id == 901)
+                && screens(collected)
+                    .iter()
+                    .any(|screen| screen.room_id == 901)
                 && !entered_rooms(collected).is_empty()
         },
         Duration::from_secs(20),
@@ -500,7 +504,9 @@ fn the_runtime_replays_the_recorded_logon_burst() {
     let users = user_lists(&events);
     let users = users.last().expect("a user list was emitted");
     assert!(
-        users.iter().any(|user| user.id == 13 && user.name == "RustProbe"),
+        users
+            .iter()
+            .any(|user| user.id == 13 && user.name == "RustProbe"),
         "our own user is in the list: {users:?}"
     );
 
@@ -516,7 +522,9 @@ fn the_runtime_replays_the_recorded_logon_burst() {
     assert!(handle.frames().version() >= 1);
 
     // The runtime's own sign-on line.
-    assert!(chats(&events).iter().any(|text| text.contains("signed on as \"RustProbe\"")));
+    assert!(chats(&events)
+        .iter()
+        .any(|text| text.contains("signed on as \"RustProbe\"")));
 
     // The room descriptor's `ON ENTER` script actually dispatched, with the
     // effects the recorded room asks for.
@@ -532,7 +540,9 @@ fn the_runtime_replays_the_recorded_logon_burst() {
         enter.effects
     );
     assert!(
-        notes(&events).iter().any(|text| text.contains("SOUND garden")),
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("SOUND garden")),
         "the effect was applied and reported: {:?}",
         notes(&events)
     );
@@ -541,7 +551,10 @@ fn the_runtime_replays_the_recorded_logon_burst() {
     // the runtime built for the configured user matches the reference record
     // byte for byte, and matches the captured client frame.
     assert!(
-        wait_for(|| !server.received_bytes().is_empty(), Duration::from_secs(5)),
+        wait_for(
+            || !server.received_bytes().is_empty(),
+            Duration::from_secs(5)
+        ),
         "the client sent data"
     );
     let sent = server.received_frames(order);
@@ -551,7 +564,10 @@ fn the_runtime_replays_the_recorded_logon_burst() {
         .expect("the runtime sent a logon");
     assert_eq!(logon.ref_num, 0);
     let expected = reference_logon_record("RustProbe", 0).logon_frame(order);
-    assert_eq!(logon.payload, expected.payload, "the configured user's logon");
+    assert_eq!(
+        logon.payload, expected.payload,
+        "the configured user's logon"
+    );
     let captured_logon = fixture
         .client_frames()
         .find(|captured| captured.frame.opcode == opcode::LOGON)
@@ -561,11 +577,13 @@ fn the_runtime_replays_the_recorded_logon_burst() {
         "the runtime sent the same logon the real client did"
     );
     assert!(
-        sent.iter().any(|frame| frame.opcode == opcode::LISTOFALLROOMS),
+        sent.iter()
+            .any(|frame| frame.opcode == opcode::LISTOFALLROOMS),
         "the runtime asked for the room list"
     );
     assert!(
-        sent.iter().any(|frame| frame.opcode == opcode::LISTOFALLUSERS),
+        sent.iter()
+            .any(|frame| frame.opcode == opcode::LISTOFALLUSERS),
         "the runtime asked for the user list"
     );
 
@@ -626,7 +644,8 @@ fn an_empty_capture_is_sent_by_the_runtime_as_empty_list_requests() {
             .find(|frame| frame.opcode == opcode_wanted)
             .expect("the runtime sent this frame");
         assert_eq!(
-            ours, &captured.frame,
+            ours,
+            &captured.frame,
             "{} matches the recorded client frame",
             opcode_wanted.describe()
         );
@@ -659,7 +678,11 @@ fn commands_drive_the_live_session() {
     // Wait for the first composed frame; the click needs its transform.
     let events = collect_events(
         &mut rx,
-        |collected| screens(collected).iter().any(|screen| screen.room_id == 901),
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
         Duration::from_secs(20),
     );
     let screen = screens(&events)
@@ -695,7 +718,9 @@ fn commands_drive_the_live_session() {
             notes(collected)
                 .iter()
                 .any(|text| text.contains("script: click at room"))
-                && script_runs(collected).iter().any(|run| run.event == "SELECT")
+                && script_runs(collected)
+                    .iter()
+                    .any(|run| run.event == "SELECT")
         },
         Duration::from_secs(10),
     );
@@ -709,7 +734,9 @@ fn commands_drive_the_live_session() {
     );
     let select = script_runs(&events);
     assert!(
-        select.iter().any(|run| run.event == "SELECT" && run.fired >= 1),
+        select
+            .iter()
+            .any(|run| run.event == "SELECT" && run.fired >= 1),
         "the room's ON SELECT handler fired: {select:?}"
     );
 
@@ -771,17 +798,19 @@ fn commands_drive_the_live_session() {
             notes(collected)
                 .iter()
                 .any(|text| text.contains("from the input box"))
-                && chats(collected).iter().any(|text| *text == "from the box")
+                && chats(collected).contains(&"from the box")
         },
         Duration::from_secs(5),
     );
     assert!(
-        notes(&events).iter().any(|text| text.contains("from the input box")),
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("from the input box")),
         "the script box ran: {:?}",
         notes(&events)
     );
     assert!(
-        chats(&events).iter().any(|text| *text == "from the box"),
+        chats(&events).contains(&"from the box"),
         "the SAY effect produced a chat line: {:?}",
         chats(&events)
     );
@@ -809,7 +838,11 @@ fn commands_drive_the_live_session() {
     handle.run_script("\"unterminated");
     let events = collect_events(
         &mut rx,
-        |collected| error_chats(collected).iter().any(|text| text.contains("script error")),
+        |collected| {
+            error_chats(collected)
+                .iter()
+                .any(|text| text.contains("script error"))
+        },
         Duration::from_secs(5),
     );
     assert!(
@@ -949,9 +982,10 @@ fn a_ping_from_the_server_is_answered_with_a_matching_pong() {
     assert!(
         wait_for(
             || {
-                server.received_frames(order).iter().any(|frame| {
-                    frame.opcode == opcode::PONG && frame.ref_num == 42
-                })
+                server
+                    .received_frames(order)
+                    .iter()
+                    .any(|frame| frame.opcode == opcode::PONG && frame.ref_num == 42)
             },
             Duration::from_secs(5)
         ),
@@ -1021,12 +1055,18 @@ fn leaving_a_room_dispatches_the_leave_handler() {
     handle.goto_room(777);
     let events = collect_events(
         &mut rx,
-        |collected| script_runs(collected).iter().any(|run| run.event == "LEAVE"),
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "LEAVE")
+        },
         Duration::from_secs(5),
     );
     let leave = script_runs(&events);
     assert!(
-        leave.iter().any(|run| run.event == "LEAVE" && run.fired >= 1),
+        leave
+            .iter()
+            .any(|run| run.event == "LEAVE" && run.fired >= 1),
         "the room's ON LEAVE handler fired: {leave:?}"
     );
 
@@ -1065,7 +1105,7 @@ fn a_server_that_closes_mid_session_is_reported_and_retried() {
     );
 
     assert!(
-        statuses(&events, ConnectionStatus::Connected).len() >= 1,
+        !statuses(&events, ConnectionStatus::Connected).is_empty(),
         "the session came up before the server left"
     );
     assert!(
@@ -1077,7 +1117,9 @@ fn a_server_that_closes_mid_session_is_reported_and_retried() {
     );
     let reconnecting = statuses(&events, ConnectionStatus::Connecting);
     assert!(
-        reconnecting.iter().any(|message| message.as_deref() == Some("reconnecting")),
+        reconnecting
+            .iter()
+            .any(|message| message.as_deref() == Some("reconnecting")),
         "the supervisor moved into reconnect backoff: {reconnecting:?}"
     );
     assert!(handle.is_running(), "it is retrying, not stopped");
@@ -1101,7 +1143,7 @@ fn a_malformed_frame_header_is_reported_as_a_wire_error() {
     let fixture = logon_fixture();
     let mut frames = server_bytes(&fixture);
     frames.truncate(1); // the TIYID handshake only
-    // A header that claims a 2 GiB payload: the transport must refuse it.
+                        // A header that claims a 2 GiB payload: the transport must refuse it.
     let mut bad = vec![0u8; 12];
     bad[..4].copy_from_slice(b"junk");
     bad[4..8].copy_from_slice(&0x7fff_ffffu32.to_le_bytes());

@@ -181,9 +181,8 @@ impl ScriptEngine {
     /// Used by the client's script box: the effects are returned in
     /// [`HandlerRun::effects`] for the caller to apply.
     pub fn run_source(&mut self, source: &str) -> Result<HandlerRun, String> {
-        let chunk =
-            iptscrae::lexer::parse_body(source, &self.engine.commands, &self.engine.limits)
-                .map_err(|error| error.to_string())?;
+        let chunk = iptscrae::lexer::parse_body(source, &self.engine.commands, &self.engine.limits)
+            .map_err(|error| error.to_string())?;
         self.engine.host.current_spot = 0;
         let run = self.run_handler(0, &chunk, false);
         match &run.error {
@@ -251,11 +250,7 @@ impl ScriptEngine {
         self.set_tick(tick);
         let mut out = Vec::new();
         for _ in 0..MAX_ALARMS_PER_ADVANCE {
-            let Some(index) = self
-                .alarms
-                .iter()
-                .position(|alarm| alarm.due <= tick)
-            else {
+            let Some(index) = self.alarms.iter().position(|alarm| alarm.due <= tick) else {
                 break;
             };
             let alarm = self.alarms.remove(index);
@@ -284,8 +279,14 @@ impl ScriptEngine {
 
     fn run_handler(&mut self, spot: i32, chunk: &Chunk, capture_chat: bool) -> HandlerRun {
         self.engine.host.effects.clear();
-        let capture = if capture_chat { vec!["CHATSTR"] } else { Vec::new() };
-        let outcome = self.engine.run_handler_capture(chunk, i64::from(spot), &capture);
+        let capture = if capture_chat {
+            vec!["CHATSTR"]
+        } else {
+            Vec::new()
+        };
+        let outcome = self
+            .engine
+            .run_handler_capture(chunk, i64::from(spot), &capture);
         match outcome {
             Ok(captured) => {
                 if let Some(Some(Value::Str(text))) = captured.captured.first() {

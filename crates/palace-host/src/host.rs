@@ -223,7 +223,11 @@ impl Host for ScriptHost {
     }
 
     fn schedule_alarm(&mut self, ticks: i64, body: Chunk, spot: i64) -> Result<()> {
-        let spot = if spot == 0 { self.current_spot } else { spot as i32 };
+        let spot = if spot == 0 {
+            self.current_spot
+        } else {
+            spot as i32
+        };
         self.alarms.push(PendingAlarm {
             ticks: ticks.max(0),
             kind: AlarmKind::Body(body),
@@ -263,15 +267,11 @@ impl Host for ScriptHost {
             "ROOMMSG" => self
                 .send_room_message(&text_arg(args, 0)?)
                 .map(|_| Vec::new()),
-            "LOCALMSG" => self
-                .send_local_msg(&text_arg(args, 0)?)
-                .map(|_| Vec::new()),
+            "LOCALMSG" => self.send_local_msg(&text_arg(args, 0)?).map(|_| Vec::new()),
             "SUSRMSG" => self
                 .send_susr_message(&text_arg(args, 0)?)
                 .map(|_| Vec::new()),
-            "STATUSMSG" => self
-                .status_message(&text_arg(args, 0)?)
-                .map(|_| Vec::new()),
+            "STATUSMSG" => self.status_message(&text_arg(args, 0)?).map(|_| Vec::new()),
             "LOGMSG" => self.log_message(&text_arg(args, 0)?).map(|_| Vec::new()),
 
             // ------------------------------------------------------ identity
@@ -301,10 +301,10 @@ impl Host for ScriptHost {
             "WHOCHAT" => Ok(vec![Value::Int(self.get_who_chat() as i32)]),
             "WHOTARGET" => Ok(vec![Value::Int(self.get_who_target() as i32)]),
             "DEST" => Ok(vec![Value::Int(
-                self.get_spot_dest(i64::from(self.current_spot)) as i32
+                self.get_spot_dest(i64::from(self.current_spot)) as i32,
             )]),
             "NBRDOORS" => Ok(vec![Value::Int(
-                self.view.spots.iter().filter(|s| s.kind == 1).count() as i32
+                self.view.spots.iter().filter(|s| s.kind == 1).count() as i32,
             )]),
             "NBRSPOTS" => Ok(vec![Value::Int(self.view.spots.len() as i32)]),
             "NBRROOMUSERS" => Ok(vec![Value::Int(self.get_num_room_users() as i32)]),
@@ -317,7 +317,9 @@ impl Host for ScriptHost {
                 let (x, y) = self.get_spot_location(int_arg(args, 0)?);
                 Ok(vec![Value::Int(x as i32), Value::Int(y as i32)])
             }
-            "GETSPOTSTATE" => Ok(vec![Value::Int(self.get_spot_state(int_arg(args, 0)?) as i32)]),
+            "GETSPOTSTATE" => Ok(vec![Value::Int(
+                self.get_spot_state(int_arg(args, 0)?) as i32
+            )]),
             "GETPICLOC" => {
                 let (x, y) = self.get_pic_offset(int_arg(args, 0)?, int_arg(args, 1)?);
                 Ok(vec![Value::Int(x as i32), Value::Int(y as i32)])
@@ -326,13 +328,19 @@ impl Host for ScriptHost {
                 let (w, h) = self.get_pic_dimensions(int_arg(args, 0)?, int_arg(args, 1)?);
                 Ok(vec![Value::Int(w as i32), Value::Int(h as i32)])
             }
-            "SPOTDEST" => Ok(vec![Value::Int(self.get_spot_dest(int_arg(args, 0)?) as i32)]),
-            "SPOTIDX" => Ok(vec![Value::Int(self.get_spot_id_by_index(int_arg(args, 0)?) as i32)]),
+            "SPOTDEST" => Ok(vec![Value::Int(
+                self.get_spot_dest(int_arg(args, 0)?) as i32
+            )]),
+            "SPOTIDX" => Ok(vec![Value::Int(
+                self.get_spot_id_by_index(int_arg(args, 0)?) as i32,
+            )]),
             "SPOTNAME" => Ok(vec![Value::str(self.get_spot_name(int_arg(args, 0)?))]),
-            "ISLOCKED" => Ok(vec![Value::Int(i32::from(self.is_locked(int_arg(args, 0)?)))]),
+            "ISLOCKED" => Ok(vec![Value::Int(i32::from(
+                self.is_locked(int_arg(args, 0)?),
+            ))]),
             "INSPOT" => Ok(vec![Value::Int(i32::from(self.in_spot(int_arg(args, 0)?)))]),
             "ROOMUSER" => Ok(vec![Value::Int(
-                self.get_room_user_id_by_index(int_arg(args, 0)?) as i32
+                self.get_room_user_id_by_index(int_arg(args, 0)?) as i32,
             )]),
             "WHONAME" => Ok(vec![Value::str(self.get_user_name(int_arg(args, 0)?))]),
             "WHOPOS" => {
@@ -342,15 +350,17 @@ impl Host for ScriptHost {
                     Value::Int(self.get_pos_y(user) as i32),
                 ])
             }
-            "USERPROP" => Ok(vec![Value::Int(self.get_user_prop(int_arg(args, 0)?) as i32)]),
+            "USERPROP" => Ok(vec![Value::Int(
+                self.get_user_prop(int_arg(args, 0)?) as i32
+            )]),
             "HASPROP" => Ok(vec![Value::Int(i32::from(
                 self.has_prop_by_id(int_arg(args, 0)?),
             ))]),
             "LOOSEPROP" => Ok(vec![Value::Int(
-                self.get_loose_prop_id_by_index(int_arg(args, 0)?) as i32
+                self.get_loose_prop_id_by_index(int_arg(args, 0)?) as i32,
             )]),
             "LOOSEPROPIDX" => Ok(vec![Value::Int(
-                self.get_loose_prop_index_by_id(int_arg(args, 0)?) as i32
+                self.get_loose_prop_index_by_id(int_arg(args, 0)?) as i32,
             )]),
             "LOOSEPROPPOS" => {
                 let (x, y) = self.get_loose_prop_pos(int_arg(args, 0)?);
@@ -362,7 +372,7 @@ impl Host for ScriptHost {
             "PROPDIMENSIONS" | "PROPOFFSETS" => Ok(stub_values(pushes.max(2), Push::Int)),
             "HTTPRECEIVED" => Ok(vec![Value::Int(0)]),
             "DOORIDX" => Ok(vec![Value::Int(
-                self.get_door_id_by_index(int_arg(args, 0)?) as i32
+                self.get_door_id_by_index(int_arg(args, 0)?) as i32,
             )]),
 
             // ------------------------------------------------------ spot state
@@ -656,10 +666,7 @@ impl Host for ScriptHost {
             }
             "LINETO" => {
                 let (x1, y1) = self.pen.pos;
-                let (x2, y2) = (
-                    x1 + int_arg(args, 0)? as i32,
-                    y1 + int_arg(args, 1)? as i32,
-                );
+                let (x2, y2) = (x1 + int_arg(args, 0)? as i32, y1 + int_arg(args, 1)? as i32);
                 self.pen.pos = (x2, y2);
                 self.effects.push(Effect::DrawLineRel { x1, y1, x2, y2 });
                 Ok(Vec::new())
@@ -670,9 +677,7 @@ impl Host for ScriptHost {
             "PENTO" => self
                 .move_pen_rel(int_arg(args, 0)?, int_arg(args, 1)?)
                 .map(|_| Vec::new()),
-            "PENSIZE" => self
-                .set_pen_size(int_arg(args, 0)?)
-                .map(|_| Vec::new()),
+            "PENSIZE" => self.set_pen_size(int_arg(args, 0)?).map(|_| Vec::new()),
             "PENCOLOR" => self
                 .set_pen_color(int_arg(args, 0)?, int_arg(args, 1)?, int_arg(args, 2)?)
                 .map(|_| Vec::new()),
@@ -682,22 +687,20 @@ impl Host for ScriptHost {
             "PAINTUNDO" => self.paint_undo().map(|_| Vec::new()),
 
             // ------------------------------------------------------ misc
-            "STR" => Ok(vec![Value::str(
-                match args.first() {
-                    Some(Value::Int(n)) => n.to_string(),
-                    Some(Value::Str(s)) => s.to_string(),
-                    _ => String::new(),
-                },
-            )]),
-            "HIDESMILEYS" | "LOCKUSERPROPS" | "AUTOUSERLAYER" | "SETTOOLTIP"
-            | "CLEARTOOLTIP" | "SETSPOTOPTIONS" | "ADDPIC" | "REMOVEPIC" | "DELPIC"
-            | "ADDSPOT" | "SETSPOTSCRIPT" | "LOADSCRIPT" | "HTTPGET" | "ROOMZOOM"
-            | "ROOMUNZOOM" | "CIRCLE" | "FILL" | "PAINT" | "TEXT" | "PING"
-            | "CLRPROPS" | "SHOWALLPROPS" | "HIDEPROPS" | "SHOWPROPS"
-            | "SETPROPSLOCAL" | "ADDPROP" | "PURGE" | "ROOMDESC" | "OFFLINE"
-            | "ONLINE" | "NBRUSERS" | "GETWHOTALKING" | "MSGTO" | "FLUSH"
-            | "SETSPOTSTATEALL" | "AWAY" | "TOGGLECTRL" | "SETDESC" | "BAN"
-            | "KICK" => self.unimplemented(name, pushes, push),
+            "STR" => Ok(vec![Value::str(match args.first() {
+                Some(Value::Int(n)) => n.to_string(),
+                Some(Value::Str(s)) => s.to_string(),
+                _ => String::new(),
+            })]),
+            "HIDESMILEYS" | "LOCKUSERPROPS" | "AUTOUSERLAYER" | "SETTOOLTIP" | "CLEARTOOLTIP"
+            | "SETSPOTOPTIONS" | "ADDPIC" | "REMOVEPIC" | "DELPIC" | "ADDSPOT"
+            | "SETSPOTSCRIPT" | "LOADSCRIPT" | "HTTPGET" | "ROOMZOOM" | "ROOMUNZOOM" | "CIRCLE"
+            | "FILL" | "PAINT" | "TEXT" | "PING" | "CLRPROPS" | "SHOWALLPROPS" | "HIDEPROPS"
+            | "SHOWPROPS" | "SETPROPSLOCAL" | "ADDPROP" | "PURGE" | "ROOMDESC" | "OFFLINE"
+            | "ONLINE" | "NBRUSERS" | "GETWHOTALKING" | "MSGTO" | "FLUSH" | "SETSPOTSTATEALL"
+            | "AWAY" | "TOGGLECTRL" | "SETDESC" | "BAN" | "KICK" => {
+                self.unimplemented(name, pushes, push)
+            }
 
             _ => self.unimplemented(name, pushes, push),
         }
@@ -792,9 +795,7 @@ impl PalaceHost for ScriptHost {
     }
 
     fn goto_room(&mut self, room: i64) -> Result<()> {
-        self.effects.push(Effect::GotoRoom {
-            room: room as i32,
-        });
+        self.effects.push(Effect::GotoRoom { room: room as i32 });
         Ok(())
     }
 
@@ -866,9 +867,7 @@ impl PalaceHost for ScriptHost {
     }
 
     fn get_spot_dest(&self, spot: i64) -> i64 {
-        self.view
-            .spot(spot as i32)
-            .map_or(0, |s| i64::from(s.dest))
+        self.view.spot(spot as i32).map_or(0, |s| i64::from(s.dest))
     }
 
     fn get_spot_name(&self, spot: i64) -> String {
@@ -983,14 +982,16 @@ impl PalaceHost for ScriptHost {
     }
 
     fn select_hot_spot(&mut self, spot: i64) -> Result<()> {
-        self.effects.push(Effect::SelectSpot {
-            spot: spot as i32,
-        });
+        self.effects.push(Effect::SelectSpot { spot: spot as i32 });
         Ok(())
     }
 
     fn set_spot_alarm(&mut self, spot: i64, future_ticks: i64) -> Result<()> {
-        let spot = if spot == 0 { self.current_spot } else { spot as i32 };
+        let spot = if spot == 0 {
+            self.current_spot
+        } else {
+            spot as i32
+        };
         self.alarms.push(PendingAlarm {
             ticks: future_ticks.max(0),
             kind: AlarmKind::Spot,
@@ -1216,9 +1217,7 @@ impl PalaceHost for ScriptHost {
     }
 
     fn set_face(&mut self, face: i64) -> Result<()> {
-        self.effects.push(Effect::SetFace {
-            face: face as i32,
-        });
+        self.effects.push(Effect::SetFace { face: face as i32 });
         Ok(())
     }
 
@@ -1289,12 +1288,7 @@ impl PalaceHost for ScriptHost {
         let (x1, y1) = self.pen.pos;
         let (x2, y2) = (x1 + dx as i32, y1 + dy as i32);
         self.pen.pos = (x2, y2);
-        self.effects.push(Effect::DrawLineRel {
-            x1,
-            y1,
-            x2,
-            y2,
-        });
+        self.effects.push(Effect::DrawLineRel { x1, y1, x2, y2 });
         Ok(())
     }
 

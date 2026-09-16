@@ -393,8 +393,14 @@ mod tests {
             SizeF::new(512.0, 384.0)
         );
         // Smaller background pads up to the floor.
-        assert_eq!(room_size_from_background(320, 240), SizeF::new(512.0, 384.0));
-        assert_eq!(room_size_from_background(100, 100), SizeF::new(512.0, 384.0));
+        assert_eq!(
+            room_size_from_background(320, 240),
+            SizeF::new(512.0, 384.0)
+        );
+        assert_eq!(
+            room_size_from_background(100, 100),
+            SizeF::new(512.0, 384.0)
+        );
         // Larger background wins, per axis independently.
         assert_eq!(
             room_size_from_background(1200, 400),
@@ -498,14 +504,14 @@ mod tests {
     fn round_trip_room_buffer_room_is_identity() {
         for room in rooms() {
             for dpr in dprs() {
-                let t = ViewTransform::new(
-                    room,
-                    SizeF::new(800.0, 600.0),
-                    1.0,
-                    ScaleMode::Fit,
-                    dpr,
-                );
-                for (rx, ry) in [(0.0, 0.0), (1.0, 2.0), (room.width, room.height), (13.5, 9.25)] {
+                let t =
+                    ViewTransform::new(room, SizeF::new(800.0, 600.0), 1.0, ScaleMode::Fit, dpr);
+                for (rx, ry) in [
+                    (0.0, 0.0),
+                    (1.0, 2.0),
+                    (room.width, room.height),
+                    (13.5, 9.25),
+                ] {
                     let room_pt = PointF::new(rx, ry);
                     let buf = t.room_to_buffer(room_pt);
                     let back = t.buffer_to_room(buf);
@@ -555,10 +561,8 @@ mod tests {
         assert_close(top_left.x, 0.0, "room origin x");
         assert_close(top_left.y, 0.0, "room origin y");
 
-        let bottom_right = t.viewport_to_room(PointF::new(
-            rect.x + rect.width,
-            rect.y + rect.height,
-        ));
+        let bottom_right =
+            t.viewport_to_room(PointF::new(rect.x + rect.width, rect.y + rect.height));
         assert_close(bottom_right.x, 512.0, "room width x");
         assert_close(bottom_right.y, 384.0, "room height y");
 

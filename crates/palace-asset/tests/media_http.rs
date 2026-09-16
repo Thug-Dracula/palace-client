@@ -128,11 +128,7 @@ fn serve(
         }
     }
     let request = String::from_utf8_lossy(&buf[..read]).to_string();
-    let path = request
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("/")
-        .to_string();
+    let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
     hits.lock().expect("hits lock").push(path.clone());
 
     let reply = table.get(&path).cloned().unwrap_or(Reply::Status(404));
@@ -335,11 +331,7 @@ fn a_nested_background_path_is_cached_under_its_subdirectory() {
         fast_config(),
     );
     let got = fetcher
-        .fetch(
-            &server.base_url(),
-            "animated-backgrounds/rainy-day.gif",
-            0,
-        )
+        .fetch(&server.base_url(), "animated-backgrounds/rainy-day.gif", 0)
         .unwrap();
     assert_eq!(got.bytes, body);
     let path = fetcher
@@ -449,10 +441,7 @@ fn a_hotspot_image_is_fetched_by_its_exact_name() {
     // Hotspot images get no extension chain in either reference client, so
     // exactly one URL is requested even for a `.gif` name.
     let body = std::fs::read(fixtures().join("bg.gif")).unwrap();
-    let server = TestServer::start(vec![(
-        "/media/notebar.gif",
-        Reply::Body(body.clone()),
-    )]);
+    let server = TestServer::start(vec![("/media/notebar.gif", Reply::Body(body.clone()))]);
     let mut fetcher = MediaFetcher::new(
         UreqTransport::from_config(&fast_config()),
         MediaCache::new(cache_root("single")),

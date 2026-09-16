@@ -80,7 +80,7 @@ pub mod query;
 pub mod scheduler;
 
 pub use assembler::{
-    prop_payload_crc, raw_asset_crc, Asset, AssetAssembler, AssemblerConfig, AssemblyOutcome,
+    prop_payload_crc, raw_asset_crc, AssemblerConfig, AssemblyOutcome, Asset, AssetAssembler,
     CrcPolicy,
 };
 pub use asset::{
@@ -92,7 +92,7 @@ pub use error::{
     MAX_BLOCK_SIZE, NAME_FIELD_LEN,
 };
 pub use media::{
-    fallback_chain, media_url, HttpTransport, HttpResponse, MediaConfig, MediaFetch, MediaFetcher,
+    fallback_chain, media_url, HttpResponse, HttpTransport, MediaConfig, MediaFetch, MediaFetcher,
     UreqTransport,
 };
 pub use pipeline::{

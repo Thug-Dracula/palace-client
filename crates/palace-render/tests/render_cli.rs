@@ -26,10 +26,8 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new(tag: &str) -> Self {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "palace-render-{tag}-{}-{n}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("palace-render-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir(path)
@@ -147,7 +145,10 @@ fn a_missing_out_exits_one() {
 #[test]
 fn no_room_source_exits_one() {
     let dir = TempDir::new("no-source");
-    let out = run(&dir, &owned(&["--out", dir.path("x.png").to_str().unwrap()]));
+    let out = run(
+        &dir,
+        &owned(&["--out", dir.path("x.png").to_str().unwrap()]),
+    );
     assert_eq!(code(&out), 1);
     let text = stderr(&out);
     assert!(text.contains("no room source"), "{text}");
@@ -157,7 +158,11 @@ fn no_room_source_exits_one() {
 fn a_flag_missing_its_value_exits_one() {
     let out = run_bare(&TempDir::new("no-value"), &owned(&["--room"]));
     assert_eq!(code(&out), 1);
-    assert!(stderr(&out).contains("--room needs a value"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--room needs a value"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]
@@ -179,7 +184,11 @@ fn a_malformed_avatar_exits_one() {
         ]),
     );
     assert_eq!(code(&out), 1);
-    assert!(stderr(&out).contains("--avatar needs X,Y"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("--avatar needs X,Y"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]
@@ -224,7 +233,10 @@ fn rendering_a_captured_frame_writes_a_plausible_png() {
     assert!(err.contains("room 901"), "{err}");
     assert!(err.contains("Balamb Garden"), "{err}");
     assert!(err.contains("logical size"), "{err}");
-    assert!(err.contains(&format!("wrote {}", out_file.display())), "{err}");
+    assert!(
+        err.contains(&format!("wrote {}", out_file.display())),
+        "{err}"
+    );
     assert!(err.contains("dpr 1"), "{err}");
 
     let bytes = std::fs::read(&out_file).expect("render output");
@@ -247,7 +259,10 @@ fn dpr_scales_the_device_pixel_buffer() {
     let frame = frame_fixture();
     let frame = frame.to_str().unwrap();
 
-    let base = run(&dir, &owned(&["--frame-file", frame, "--out", one.to_str().unwrap()]));
+    let base = run(
+        &dir,
+        &owned(&["--frame-file", frame, "--out", one.to_str().unwrap()]),
+    );
     assert_eq!(code(&base), 0, "stderr: {}", stderr(&base));
     let (w1, h1) = png_size(&std::fs::read(&one).unwrap()).expect("base PNG");
 
@@ -317,7 +332,10 @@ fn viewport_preview_prints_the_mapping_without_writing_a_file() {
     assert!(err.contains("Native:"), "{err}");
     assert!(err.contains("-> viewport"), "{err}");
     assert!(err.contains("room (0.0,0.0)"), "{err}");
-    assert!(!err.contains("wrote "), "preview must not write a PNG:\n{err}");
+    assert!(
+        !err.contains("wrote "),
+        "preview must not write a PNG:\n{err}"
+    );
 }
 
 #[test]
@@ -363,7 +381,11 @@ fn asserting_an_unknown_room_id_exits_one() {
         ]),
     );
     assert_eq!(code(&out), 1);
-    assert!(stderr(&out).contains("room 999999 not found"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("room 999999 not found"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]

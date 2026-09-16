@@ -228,7 +228,9 @@ impl MediaCache {
 
     /// Where `name` fetched from `base_url` would be stored, if the name is safe.
     pub fn path_for(&self, base_url: &str, name: &str) -> Result<PathBuf> {
-        Ok(self.namespace_dir(base_url).join(sanitise_media_name(name)?))
+        Ok(self
+            .namespace_dir(base_url)
+            .join(sanitise_media_name(name)?))
     }
 
     /// Read a cached file, if present.
@@ -396,7 +398,10 @@ mod tests {
         assert!(c.contains(&AssetKey::new(AssetType::PROP, 1, 2)));
         assert!(!c.contains(&AssetKey::new(AssetType::PROP, 1, 3)));
         assert!(c.get(&AssetKey::new(AssetType::PROP, 1, 3)).is_none());
-        assert_eq!(c.get(&AssetKey::new(AssetType::PROP, 1, 2)).unwrap().data, b"a");
+        assert_eq!(
+            c.get(&AssetKey::new(AssetType::PROP, 1, 2)).unwrap().data,
+            b"a"
+        );
     }
 
     #[test]
@@ -427,7 +432,10 @@ mod tests {
         let mut c = AssetCache::new(1);
         c.insert(asset(1, 0, b"old"));
         assert!(c.insert(asset(1, 0, b"new")).is_none());
-        assert_eq!(c.get(&AssetKey::new(AssetType::PROP, 1, 0)).unwrap().data, b"new");
+        assert_eq!(
+            c.get(&AssetKey::new(AssetType::PROP, 1, 0)).unwrap().data,
+            b"new"
+        );
     }
 
     #[test]
@@ -467,17 +475,20 @@ mod tests {
             "   ",
             "a\0b",
         ] {
-            assert!(
-                sanitise_media_name(bad).is_err(),
-                "{bad:?} must be refused"
-            );
+            assert!(sanitise_media_name(bad).is_err(), "{bad:?} must be refused");
         }
     }
 
     #[test]
     fn exotic_characters_are_escaped_not_dropped() {
-        assert_eq!(sanitise_media_name("a b:c.png").unwrap(), PathBuf::from("a%20b%3Ac.png"));
-        assert_eq!(sanitise_media_name("é.png").unwrap(), PathBuf::from("%C3%A9.png"));
+        assert_eq!(
+            sanitise_media_name("a b:c.png").unwrap(),
+            PathBuf::from("a%20b%3Ac.png")
+        );
+        assert_eq!(
+            sanitise_media_name("é.png").unwrap(),
+            PathBuf::from("%C3%A9.png")
+        );
     }
 
     #[test]

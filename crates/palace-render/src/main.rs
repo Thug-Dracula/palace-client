@@ -206,7 +206,10 @@ fn print_mapping(args: &Args, viewport_w: f64, viewport_h: f64) -> Result<(), St
     let scene = SceneBuilder::new(media, props).build(&room, &[]);
     let (w, h) = scene.logical_size();
     let viewport = palace_render::SizeF::new(viewport_w, viewport_h);
-    for mode in [palace_render::ScaleMode::Fit, palace_render::ScaleMode::Native] {
+    for mode in [
+        palace_render::ScaleMode::Fit,
+        palace_render::ScaleMode::Native,
+    ] {
         let t = ViewTransform::new(
             palace_render::SizeF::new(w, h),
             viewport,
@@ -320,8 +323,12 @@ fn parse_placed_prop(spec: &str) -> Result<PlacedProp, String> {
         .ok_or_else(|| "--loose-prop needs PROP_ID@X,Y".to_string())?;
     Ok(PlacedProp {
         id,
-        x: x.trim().parse().map_err(|e| format!("--loose-prop x: {e}"))?,
-        y: y.trim().parse().map_err(|e| format!("--loose-prop y: {e}"))?,
+        x: x.trim()
+            .parse()
+            .map_err(|e| format!("--loose-prop x: {e}"))?,
+        y: y.trim()
+            .parse()
+            .map_err(|e| format!("--loose-prop y: {e}"))?,
     })
 }
 
@@ -329,8 +336,14 @@ fn parse_viewport(spec: &str) -> Result<(f64, f64), String> {
     let (w, h) = spec
         .split_once(['x', 'X'])
         .ok_or_else(|| "--viewport needs WxH".to_string())?;
-    let w = w.trim().parse().map_err(|e| format!("--viewport width: {e}"))?;
-    let h = h.trim().parse().map_err(|e| format!("--viewport height: {e}"))?;
+    let w = w
+        .trim()
+        .parse()
+        .map_err(|e| format!("--viewport width: {e}"))?;
+    let h = h
+        .trim()
+        .parse()
+        .map_err(|e| format!("--viewport height: {e}"))?;
     Ok((w, h))
 }
 
