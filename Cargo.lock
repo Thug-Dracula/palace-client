@@ -2204,6 +2204,7 @@ name = "palace-client"
 version = "0.1.0"
 dependencies = [
  "palace-asset",
+ "palace-host",
  "palace-prop",
  "palace-render",
  "palace-room",
@@ -2257,6 +2258,7 @@ name = "palace-room"
 version = "0.1.0"
 dependencies = [
  "palace-wire",
+ "serde_json",
 ]
 
 [[package]]

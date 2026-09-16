@@ -30,6 +30,27 @@ pub struct ViewGeometry {
 }
 
 impl ViewGeometry {
+    /// Rebuild the verified transform these numbers came from.
+    ///
+    /// The runtime needs it to turn a viewport click back into room
+    /// coordinates; rebuilding from the reported geometry guarantees the
+    /// inverse uses exactly the transform the frame was composited with.
+    #[must_use]
+    pub fn transform(&self) -> ViewTransform {
+        let mode = if self.native {
+            ScaleMode::Native
+        } else {
+            ScaleMode::Fit
+        };
+        ViewTransform::new(
+            SizeF::new(self.room_w, self.room_h),
+            SizeF::new(self.viewport_w, self.viewport_h),
+            self.zoom,
+            mode,
+            self.dpr,
+        )
+    }
+
     /// Project a room size into a viewport using the shared transform.
     #[must_use]
     pub fn compute(room: SizeF, viewport: SizeF, zoom: f64, native: bool, dpr: f64) -> Self {

@@ -70,6 +70,20 @@ fn report(event: &ClientEvent) -> bool {
                 println!("        note: {note}");
             }
         }
+        ClientEvent::Script {
+            event,
+            fired,
+            effects,
+            problems,
+        } => {
+            println!("[script] ON {event}: {fired} handler(s) fired");
+            for effect in effects {
+                println!("        effect: {effect}");
+            }
+            if !problems.is_empty() {
+                println!("        problems: {problems:?}");
+            }
+        }
         ClientEvent::Note { text } => println!("[note] {text}"),
     }
     matches!(event, ClientEvent::Screen { .. })
@@ -81,6 +95,8 @@ async fn pump_for(
     limit: Duration,
     target: i32,
     switched: &mut bool,
+    click_room: Option<(f64, f64)>,
+    clicked: &mut bool,
 ) {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
@@ -96,6 +112,20 @@ async fn pump_for(
                         println!("[goto] -> #{target}");
                         handle.goto_room(target);
                         *switched = true;
+                    }
+                }
+                if let ClientEvent::Screen { screen } = &event {
+                    if let (Some((rx, ry)), false) = (click_room, *clicked) {
+                        let g = &screen.geometry;
+                        let vx = g.content_x + rx * g.scale;
+                        let vy = g.content_y + ry * g.scale;
+                        println!(
+                            "--> click room ({rx},{ry}) = viewport ({vx:.1},{vy:.1}) \
+                             (content {:.1},{:.1} scale {:.3})",
+                            g.content_x, g.content_y, g.scale
+                        );
+                        handle.click(vx, vy);
+                        *clicked = true;
                     }
                 }
             }
@@ -162,6 +192,9 @@ fn main() {
 
     let seconds: u64 = env_or("PALACE_SMOKE_SECS", "15").parse().unwrap_or(15);
     let target: i32 = env_or("PALACE_SMOKE_ROOM", "0").parse().unwrap_or(0);
+    let click_room: Option<(f64, f64)> = env_or("PALACE_CLICK_ROOM", "")
+        .split_once(',')
+        .and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)));
 
     println!(
         "live-smoke: {}:{} as {:?}, {seconds}s, goto {}",
@@ -175,12 +208,15 @@ fn main() {
         .expect("tokio runtime");
 
     let mut switched = false;
+    let mut clicked = false;
     runtime.block_on(pump_for(
         &mut stream,
         &handle,
         Duration::from_secs(seconds),
         target,
         &mut switched,
+        click_room,
+        &mut clicked,
     ));
     runtime.block_on(pump_for(
         &mut stream,
@@ -188,6 +224,8 @@ fn main() {
         Duration::from_secs(12),
         target,
         &mut switched,
+        click_room,
+        &mut clicked,
     ));
 
     if env_or("PALACE_SMOKE_VIEWPORTS", "0") == "1" {
@@ -214,6 +252,8 @@ fn main() {
         Duration::from_secs(2),
         target,
         &mut switched,
+        None,
+        &mut clicked,
     ));
 
     let version = handle.frames().version();

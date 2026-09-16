@@ -167,6 +167,31 @@ impl ScriptEngine {
         self.engine.host.alarms.clear();
     }
 
+    /// Whether any loaded script declares the handler for `event`.
+    #[must_use]
+    pub fn has_handler(&self, event: ScriptEvent) -> bool {
+        let name = event.handler_name();
+        self.scripts
+            .iter()
+            .any(|script| script.script.handler(&name).is_some())
+    }
+
+    /// Parse and run a bare instruction sequence (no `ON` handler).
+    ///
+    /// Used by the client's script box: the effects are returned in
+    /// [`HandlerRun::effects`] for the caller to apply.
+    pub fn run_source(&mut self, source: &str) -> Result<HandlerRun, String> {
+        let chunk =
+            iptscrae::lexer::parse_body(source, &self.engine.commands, &self.engine.limits)
+                .map_err(|error| error.to_string())?;
+        self.engine.host.current_spot = 0;
+        let run = self.run_handler(0, &chunk, false);
+        match &run.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(run),
+        }
+    }
+
     /// Fire an event at every script that handles it.
     ///
     /// For `ON INCHAT` / `ON OUTCHAT` the incoming text is planted in

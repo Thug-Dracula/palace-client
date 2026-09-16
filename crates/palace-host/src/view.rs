@@ -79,9 +79,9 @@ impl SpotView {
     ///
     /// A hotspot with an outline is tested against its polygon, in absolute
     /// room coordinates first and then relative to [`SpotView::loc`] (the corpus
-    /// contains both conventions). A hotspot without an outline falls back to a
-    /// 44×44 box centred on `loc` — the avatar-sized rectangle the classic
-    /// clients use when they have no picture to measure.
+    /// contains both conventions). A 44×44 box centred on `loc` is kept as a
+    /// floor for both cases — the avatar-sized rectangle the classic clients use
+    /// when they have no picture to measure.
     #[must_use]
     pub fn contains(&self, x: i32, y: i32) -> bool {
         if self.points.len() >= 3 {
