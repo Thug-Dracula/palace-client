@@ -1,0 +1,17 @@
+[package]
+name = "palace-host"
+description = "The live Palace host: IPTSCRAE event dispatch and a capability implementation over the client's session state."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+iptscrae = { workspace = true }
+iptscrae-palace = { workspace = true }
+palace-room = { workspace = true }
+palace-wire = { workspace = true }
+
+[dev-dependencies]
+palace-render = { workspace = true }

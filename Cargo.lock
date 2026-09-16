@@ -2215,6 +2215,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "palace-host"
+version = "0.1.0"
+dependencies = [
+ "iptscrae",
+ "iptscrae-palace",
+ "palace-render",
+ "palace-room",
+ "palace-wire",
+]
+
+[[package]]
 name = "palace-probe"
 version = "0.1.0"
 dependencies = [

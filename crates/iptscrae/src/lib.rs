@@ -85,4 +85,4 @@ pub use registry::{Builtin, CommandKind, CommandSet};
 pub use script::Script;
 pub use stack::Stack;
 pub use value::{decode_source, Chunk, Op, Value};
-pub use vm::{Engine, Execution, Vm};
+pub use vm::{Captured, Engine, Execution, Vm};
