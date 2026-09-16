@@ -218,7 +218,6 @@ fn a_hostile_script_cannot_hang_dispatch() {
 
 #[test]
 fn spot_hit_testing_uses_the_decoded_room() {
-    let mut engine = ScriptEngine::with_palace_limits();
     let mut room = room_with(&[(7, "ON SELECT { \"hit\" SAY }")]);
     room.hotspots[0].loc = palace_wire::messages::Point::new(100, 200);
     room.hotspots[0].points = vec![

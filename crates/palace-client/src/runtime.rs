@@ -13,9 +13,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use palace_asset::{AssetPipeline, AssetType, PipelineEvent};
+use palace_host::{
+    effect_frame, Effect, HostView, PenState, ScriptEngine, ScriptEvent, UserView, WireContext,
+};
 use palace_render::{
-    clamp_dpr, render, AnimationClock, AvatarSpec, MediaStore, PropStore, RenderOptions,
-    SceneBuilder, SizeF,
+    clamp_dpr, render, AnimationClock, AvatarSpec, MediaStore, PointF, PropStore, RenderOptions,
+    SceneBuilder, SizeF, ViewTransform,
 };
 use palace_wire::byteorder::Writer;
 use palace_wire::frame::Frame;
@@ -73,6 +76,8 @@ impl Default for ClientConfig {
 pub enum ClientCommand {
     GotoRoom(i32),
     Say(String),
+    Click { x: f64, y: f64 },
+    RunScript(String),
     SetViewport {
         width: f64,
         height: f64,
@@ -111,6 +116,12 @@ pub enum ClientEvent {
     Screen {
         screen: ScreenState,
     },
+    Script {
+        event: String,
+        fired: usize,
+        effects: Vec<String>,
+        problems: Vec<String>,
+    },
     Note {
         text: String,
     },
@@ -146,6 +157,9 @@ struct Shared {
     chat_seq: AtomicU64,
     debug_frames: bool,
     last_room: Mutex<Option<i32>>,
+    transform: Mutex<Option<ViewTransform>>,
+    mouse: Mutex<(i32, i32)>,
+    room_size: Mutex<(f64, f64)>,
 }
 
 impl Shared {
@@ -175,6 +189,49 @@ impl Shared {
             Ok(guard) => *guard,
             Err(poisoned) => *poisoned.into_inner(),
         }
+    }
+
+    fn set_transform(&self, transform: ViewTransform) {
+        match self.transform.lock() {
+            Ok(mut guard) => *guard = Some(transform),
+            Err(poisoned) => *poisoned.into_inner() = Some(transform),
+        }
+    }
+
+    fn transform(&self) -> Option<ViewTransform> {
+        match self.transform.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn set_mouse(&self, x: i32, y: i32) {
+        match self.mouse.lock() {
+            Ok(mut guard) => *guard = (x, y),
+            Err(poisoned) => *poisoned.into_inner() = (x, y),
+        }
+    }
+
+    fn mouse(&self) -> (i32, i32) {
+        match self.mouse.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn set_room_size(&self, width: f64, height: f64) {
+        match self.room_size.lock() {
+            Ok(mut guard) => *guard = (width, height),
+            Err(poisoned) => *poisoned.into_inner() = (width, height),
+        }
+    }
+
+    fn room_size(&self) -> (i32, i32) {
+        let (width, height) = match self.room_size.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        (width.round() as i32, height.round() as i32)
     }
 }
 
@@ -206,6 +263,22 @@ impl ClientHandle {
     /// Send a chat line.
     pub fn say(&self, text: impl Into<String>) {
         self.send(ClientCommand::Say(text.into()));
+    }
+
+    /// Click the room at a viewport pixel; hotspots are hit-tested in room
+    /// coordinates through the same transform the compositor reports.
+    pub fn click(&self, x: f64, y: f64) {
+        self.send(ClientCommand::Click { x, y });
+    }
+
+    /// Run a bare IPTSCRAE instruction sequence against the live host.
+    pub fn run_script(&self, source: impl Into<String>) {
+        self.send(ClientCommand::RunScript(source.into()));
+    }
+
+    /// Report the pointer position, in viewport pixels.
+    pub fn set_mouse(&self, x: i32, y: i32) {
+        self.shared.set_mouse(x, y);
     }
 
     /// Tell the runtime the viewport changed.
@@ -289,6 +362,9 @@ impl ClientRuntime {
             chat_seq: AtomicU64::new(0),
             debug_frames: std::env::var_os("PALACE_DEBUG_FRAMES").is_some(),
             last_room: Mutex::new(None),
+            transform: Mutex::new(None),
+            mouse: Mutex::new((0, 0)),
+            room_size: Mutex::new((512.0, 384.0)),
         });
 
         let handle = ClientHandle {
@@ -419,6 +495,12 @@ fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientComman
     let mut pipeline = AssetPipeline::new();
     pipeline.set_byte_order(order);
 
+    let mut scripts = ScriptEngine::with_palace_limits();
+    let mut signon_pending = true;
+    let mut click_pending: Option<(f64, f64)> = None;
+    let mut run_source_pending: Option<String> = None;
+    let mut occupied_room = false;
+
     let mut state = SessionState::new(&cfg.host, cfg.port);
     state.banner.byte_order = order.label().to_string();
     state.banner.user_id = user_id;
@@ -466,6 +548,8 @@ fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientComman
                     goto = Some(id);
                 }
                 ClientCommand::Say(text) => say = Some(text),
+                ClientCommand::Click { x, y } => click_pending = Some((x, y)),
+                ClientCommand::RunScript(source) => run_source_pending = Some(source),
                 ClientCommand::SetViewport {
                     width,
                     height,
@@ -547,14 +631,101 @@ fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientComman
         }
 
         if let Some(room_id) = goto {
+            if occupied_room {
+                for event in run_dispatch(
+                    &mut scripts,
+                    ScriptEvent::Leave,
+                    &mut state,
+                    shared,
+                    &mut conn,
+                    &mut dirty_render,
+                ) {
+                    shared.emit(event);
+                }
+                occupied_room = false;
+            }
             state.begin_room_change();
             conn.send(&state.navigate_frame(room_id))?;
             dirty_render = true;
         }
         if let Some(text) = say {
-            let mut writer = Writer::new(order);
-            Talk { user_id, text }.encode(&mut writer);
-            conn.send(&Frame::new(opcode::TALK, user_id, writer.into_vec()))?;
+            let (events, rewritten) = run_chat_dispatch(
+                &mut scripts,
+                ScriptEvent::OutChat,
+                &mut state,
+                shared,
+                &mut conn,
+                &mut dirty_render,
+                &text,
+            );
+            for event in events {
+                shared.emit(event);
+            }
+            if !rewritten.is_empty() {
+                let mut writer = Writer::new(order);
+                Talk {
+                    user_id,
+                    text: rewritten,
+                }
+                .encode(&mut writer);
+                conn.send(&Frame::new(opcode::TALK, user_id, writer.into_vec()))?;
+            } else {
+                shared.note("an ON OUTCHAT script suppressed the outgoing line");
+            }
+        }
+        if let Some((x, y)) = click_pending.take() {
+            match click_room_point(shared, x, y) {
+                Some((rx, ry)) => {
+                    let view = host_view(&state, shared);
+                    match view.spot_at(rx, ry).map(|spot| spot.id) {
+                        Some(id) => {
+                            shared.note(format!(
+                                "script: click at room ({rx},{ry}) hit hotspot {id}"
+                            ));
+                            for event in run_dispatch(
+                                &mut scripts,
+                                ScriptEvent::Select,
+                                &mut state,
+                                shared,
+                                &mut conn,
+                                &mut dirty_render,
+                            ) {
+                                shared.emit(event);
+                            }
+                        }
+                        None => shared.note(format!(
+                            "script: click at room ({rx},{ry}) hit no hotspot"
+                        )),
+                    }
+                }
+                None => shared.note("script: click ignored, the room view is not ready"),
+            }
+        }
+        if let Some(source) = run_source_pending.take() {
+            match scripts.run_source(&source) {
+                Ok(run) => {
+                    shared.note(format!(
+                        "script: ran {} instruction(s) from the input box",
+                        run.steps
+                    ));
+                    let context = wire_context(&state, shared, scripts.host().pen);
+                    let mut follow = Vec::new();
+                    for effect in &run.effects {
+                        for event in apply_effect(
+                            effect,
+                            &context,
+                            &mut state,
+                            shared,
+                            &mut conn,
+                            &mut dirty_render,
+                            &mut follow,
+                        ) {
+                            shared.emit(event);
+                        }
+                    }
+                }
+                Err(error) => shared.chat(ChatKind::Error, format!("script error: {error}")),
+            }
         }
 
         let now = start.elapsed().as_millis() as u64;
@@ -613,6 +784,39 @@ fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientComman
                 if applied.room_entered {
                     if let Some(room) = state.current_room.clone() {
                         shared.emit(ClientEvent::RoomEntered { room: room.clone() });
+                        if let Some(desc) = state.room_desc.clone() {
+                            scripts.load_room(&desc);
+                            for problem in &scripts.problems {
+                                shared.note(format!(
+                                    "script: hotspot {} did not parse: {}",
+                                    problem.spot, problem.error
+                                ));
+                            }
+                            occupied_room = true;
+                            if signon_pending {
+                                signon_pending = false;
+                                for event in run_dispatch(
+                                    &mut scripts,
+                                    ScriptEvent::SignOn,
+                                    &mut state,
+                                    shared,
+                                    &mut conn,
+                                    &mut dirty_render,
+                                ) {
+                                    shared.emit(event);
+                                }
+                            }
+                            for event in run_dispatch(
+                                &mut scripts,
+                                ScriptEvent::Enter,
+                                &mut state,
+                                shared,
+                                &mut conn,
+                                &mut dirty_render,
+                            ) {
+                                shared.emit(event);
+                            }
+                        }
                         let wanted = shared.last_room.lock().ok().and_then(|guard| *guard);
                         if !restored_room {
                             restored_room = true;
@@ -626,7 +830,27 @@ fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientComman
                         }
                     }
                 }
-                for line in applied.chat {
+                for mut line in applied.chat {
+                    if matches!(line.kind, ChatKind::Talk | ChatKind::Whisper)
+                        && scripts.has_handler(ScriptEvent::InChat)
+                    {
+                        let (events, rewritten) = run_chat_dispatch(
+                            &mut scripts,
+                            ScriptEvent::InChat,
+                            &mut state,
+                            shared,
+                            &mut conn,
+                            &mut dirty_render,
+                            &line.text,
+                        );
+                        for event in events {
+                            shared.emit(event);
+                        }
+                        if rewritten != line.text {
+                            state.rewrite_chat_line(line.seq, rewritten.clone());
+                            line.text = rewritten;
+                        }
+                    }
                     shared.emit(ClientEvent::Chat { line });
                 }
                 if applied.render {
@@ -677,6 +901,29 @@ fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientComman
             }
         }
 
+        let ticks = (now * 60 / 1000) as i64;
+        let alarm_effects = scripts.advance(ticks);
+        if !alarm_effects.is_empty() {
+            let context = wire_context(&state, shared, scripts.host().pen);
+            let mut follow = Vec::new();
+            for effect in &alarm_effects {
+                for event in apply_effect(
+                    effect,
+                    &context,
+                    &mut state,
+                    shared,
+                    &mut conn,
+                    &mut dirty_render,
+                    &mut follow,
+                ) {
+                    shared.emit(event);
+                }
+            }
+            if !follow.is_empty() {
+                shared.note("script: an alarm asked to re-dispatch; it will not compound");
+            }
+        }
+
         if last_asset_request.elapsed() >= MEDIA_REQUEST_INTERVAL {
             last_asset_request = Instant::now();
             request_assets(
@@ -711,6 +958,7 @@ fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientComman
                     viewport.native,
                     clamp_dpr(viewport.dpr),
                 );
+                shared.set_transform(updated.geometry.transform());
                 shared.emit(ClientEvent::Screen {
                     screen: updated.clone(),
                 });
@@ -897,6 +1145,8 @@ fn compose(
         viewport.native,
         dpr,
     );
+    shared.set_transform(geometry.transform());
+    shared.set_room_size(logical_w, logical_h);
 
     Some(ScreenState {
         version,
@@ -908,4 +1158,392 @@ fn compose(
         notes,
         geometry,
     })
+}
+
+/// Build the snapshot a running script observes.
+fn host_view(state: &SessionState, shared: &Arc<Shared>) -> HostView {
+    let (mouse_x, mouse_y) = shared.mouse();
+    let (room_w, room_h) = shared.room_size();
+    let self_user = state.users.get(&state.banner.user_id);
+    let mut view = HostView {
+        self_id: state.banner.user_id,
+        self_name: self_user.map(|u| u.name.clone()).unwrap_or_default(),
+        self_x: self_user.map_or(0, |u| i32::from(u.x)),
+        self_y: self_user.map_or(0, |u| i32::from(u.y)),
+        self_props: self_user
+            .map(|u| u.props.iter().map(|p| i64::from(*p)).collect())
+            .unwrap_or_default(),
+        room_width: room_w,
+        room_height: room_h,
+        server_name: state.banner.name.clone().unwrap_or_default(),
+        mouse: (mouse_x, mouse_y),
+        ..HostView::default()
+    };
+    if let Some(room) = &state.room_desc {
+        view.apply_room(room);
+    }
+    view.users = state
+        .users_in_room()
+        .iter()
+        .map(|user| UserView {
+            id: user.id,
+            name: user.name.clone(),
+            x: i32::from(user.x),
+            y: i32::from(user.y),
+            props: user.props.iter().map(|p| i64::from(*p)).collect(),
+        })
+        .collect();
+    view
+}
+
+/// The session facts an effect needs to become a wire frame.
+fn wire_context(state: &SessionState, shared: &Arc<Shared>, pen: PenState) -> WireContext {
+    let (room_w, room_h) = shared.room_size();
+    let self_user = state.users.get(&state.banner.user_id);
+    WireContext {
+        byte_order: state.byte_order(),
+        user_id: state.banner.user_id,
+        room_id: state.current_room.as_ref().map_or(0, |room| room.id),
+        room_width: room_w,
+        room_height: room_h,
+        self_pos: (
+            self_user.map_or(0, |u| i32::from(u.x)),
+            self_user.map_or(0, |u| i32::from(u.y)),
+        ),
+        pen,
+    }
+}
+
+/// Turn a viewport click into room coordinates, through the compositor's own
+/// transform. `None` until a frame has been composited.
+fn click_room_point(shared: &Arc<Shared>, x: f64, y: f64) -> Option<(i32, i32)> {
+    let transform = shared.transform()?;
+    let point = transform.viewport_to_room(PointF::new(x, y));
+    Some((point.x.round() as i32, point.y.round() as i32))
+}
+
+fn report_event(report: &palace_host::DispatchReport) -> ClientEvent {
+    ClientEvent::Script {
+        event: report.handler.clone(),
+        fired: report.runs.len(),
+        effects: report.effects.iter().map(|effect| effect.to_string()).collect(),
+        problems: report
+            .runs
+            .iter()
+            .filter_map(|run| run.error.clone())
+            .collect(),
+    }
+}
+
+/// Dispatch one event and apply everything it asked for.
+fn run_dispatch(
+    scripts: &mut ScriptEngine,
+    event: ScriptEvent,
+    state: &mut SessionState,
+    shared: &Arc<Shared>,
+    conn: &mut Connection,
+    dirty_render: &mut bool,
+) -> Vec<ClientEvent> {
+    run_event(scripts, event, state, shared, conn, dirty_render, 0)
+}
+
+fn run_event(
+    scripts: &mut ScriptEngine,
+    event: ScriptEvent,
+    state: &mut SessionState,
+    shared: &Arc<Shared>,
+    conn: &mut Connection,
+    dirty_render: &mut bool,
+    depth: u32,
+) -> Vec<ClientEvent> {
+    scripts.set_view(host_view(state, shared));
+    let report = scripts.fire(event);
+    let mut out = Vec::new();
+    for run in &report.runs {
+        if let Some(error) = &run.error {
+            out.push(ClientEvent::Note {
+                text: format!("script ON {} (hotspot {}) failed: {error}", report.handler, run.spot),
+            });
+        }
+    }
+    let context = wire_context(state, shared, scripts.host().pen);
+    let mut follow = Vec::new();
+    for effect in &report.effects {
+        out.extend(apply_effect(
+            effect,
+            &context,
+            state,
+            shared,
+            conn,
+            dirty_render,
+            &mut follow,
+        ));
+    }
+    if !report.runs.is_empty() {
+        out.push(report_event(&report));
+    }
+    if depth >= MAX_SCRIPT_FOLLOW_DEPTH {
+        if !follow.is_empty() {
+            out.push(ClientEvent::Note {
+                text: "script: nested dispatch capped".to_string(),
+            });
+        }
+        return out;
+    }
+    for next in follow {
+        out.extend(run_event(
+            scripts,
+            next,
+            state,
+            shared,
+            conn,
+            dirty_render,
+            depth + 1,
+        ));
+    }
+    out
+}
+
+/// Run an `ON INCHAT` / `ON OUTCHAT` handler and return what `CHATSTR` became.
+#[allow(clippy::too_many_arguments)]
+fn run_chat_dispatch(
+    scripts: &mut ScriptEngine,
+    event: ScriptEvent,
+    state: &mut SessionState,
+    shared: &Arc<Shared>,
+    conn: &mut Connection,
+    dirty_render: &mut bool,
+    text: &str,
+) -> (Vec<ClientEvent>, String) {
+    let mut view = host_view(state, shared);
+    view.chat_string = text.to_string();
+    scripts.set_view(view);
+    let report = scripts.fire(event);
+    let mut out = Vec::new();
+    let context = wire_context(state, shared, scripts.host().pen);
+    let mut follow = Vec::new();
+    for effect in &report.effects {
+        out.extend(apply_effect(
+            effect,
+            &context,
+            state,
+            shared,
+            conn,
+            dirty_render,
+            &mut follow,
+        ));
+    }
+    if !report.runs.is_empty() {
+        out.push(report_event(&report));
+    }
+    (out, report.chat_string.unwrap_or_else(|| text.to_string()))
+}
+
+const MAX_SCRIPT_FOLLOW_DEPTH: u32 = 4;
+
+#[allow(clippy::too_many_arguments)]
+fn apply_effect(
+    effect: &Effect,
+    context: &WireContext,
+    state: &mut SessionState,
+    shared: &Arc<Shared>,
+    conn: &mut Connection,
+    dirty_render: &mut bool,
+    follow: &mut Vec<ScriptEvent>,
+) -> Vec<ClientEvent> {
+    if let Some(frame) = effect_frame(effect, context) {
+        let _ = conn.send(&frame);
+    }
+    match effect {
+        Effect::Say { text } | Effect::GlobalMessage { text } => {
+            shared.chat(ChatKind::Talk, text.clone());
+            Vec::new()
+        }
+        Effect::SayAt { text, x, y } => {
+            shared.chat(ChatKind::Talk, format!("@{x},{y} {text}"));
+            Vec::new()
+        }
+        Effect::PrivateMessage { user, text } => {
+            shared.chat(ChatKind::Whisper, format!("-> {user}: {text}"));
+            Vec::new()
+        }
+        Effect::RoomMessage { text } | Effect::LocalMessage { text } => {
+            shared.chat(ChatKind::System, text.clone());
+            Vec::new()
+        }
+        Effect::SuperUserMessage { text } => {
+            shared.chat(ChatKind::System, format!("susr: {text}"));
+            Vec::new()
+        }
+        Effect::StatusMessage { text } | Effect::LogMessage { text } => vec![ClientEvent::Note {
+            text: format!("script: {text}"),
+        }],
+        Effect::ErrorMessage { text } => {
+            shared.chat(ChatKind::Error, text.clone());
+            Vec::new()
+        }
+        Effect::GotoUrl { url } => vec![ClientEvent::Note {
+            text: format!("script: GOTOURL {url} (reported, not opened)"),
+        }],
+        Effect::LaunchApp { app } => vec![ClientEvent::Note {
+            text: format!("script: LAUNCHAPP {app} (reported, not launched)"),
+        }],
+        Effect::PlaySound { name } => vec![ClientEvent::Note {
+            text: format!("script: SOUND {name}"),
+        }],
+        Effect::MidiPlay { name } => vec![ClientEvent::Note {
+            text: format!("script: MIDIPLAY {name}"),
+        }],
+        Effect::MidiLoop { name, loops } => vec![ClientEvent::Note {
+            text: format!("script: MIDILOOP {name} x{loops}"),
+        }],
+        Effect::MidiStop => vec![ClientEvent::Note {
+            text: "script: MIDISTOP".to_string(),
+        }],
+        Effect::Beep => vec![ClientEvent::Note {
+            text: "script: BEEP".to_string(),
+        }],
+        Effect::DimRoom { percent } => vec![ClientEvent::Note {
+            text: format!("script: DIMROOM {percent}%"),
+        }],
+        Effect::SetSpotState { spot, state: value }
+        | Effect::SetSpotStateLocal { spot, state: value } => {
+            let applied = set_local_spot_state(state, *spot, *value);
+            if applied {
+                *dirty_render = true;
+            }
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: spot {spot} -> state {value}{}",
+                    if applied { "" } else { " (spot not in this room)" }
+                ),
+            }]
+        }
+        Effect::MoveSpot { spot, dx, dy } | Effect::MoveSpotLocal { spot, dx, dy } => {
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: format!("script: spot {spot} moved by ({dx},{dy})"),
+            }]
+        }
+        Effect::SetPicOffset { spot, dx, dy } => {
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: format!("script: spot {spot} picture offset ({dx},{dy})"),
+            }]
+        }
+        Effect::SetPicOffsetLocal {
+            spot,
+            state: value,
+            dx,
+            dy,
+        } => {
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: format!("script: spot {spot} state {value} picture offset ({dx},{dy})"),
+            }]
+        }
+        Effect::SetPicOpacity {
+            spot,
+            state: value,
+            opacity,
+        } => vec![ClientEvent::Note {
+            text: format!("script: spot {spot} state {value} opacity {opacity:.2}"),
+        }],
+        Effect::MoveUserAbs { x, y } | Effect::MoveUserRel { dx: x, dy: y } => {
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: format!("script: moved to ({x},{y})"),
+            }]
+        }
+        Effect::GotoRoom { room } => {
+            if let Ok(mut guard) = shared.last_room.lock() {
+                *guard = Some(*room);
+            }
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: format!("script: GOTOROOM {room}"),
+            }]
+        }
+        Effect::SelectSpot { .. } => {
+            follow.push(ScriptEvent::Select);
+            Vec::new()
+        }
+        Effect::Macro { index } => {
+            follow.push(ScriptEvent::Macro((*index).clamp(0, 9) as u8));
+            Vec::new()
+        }
+        Effect::HideAvatars => {
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: "script: HIDEAVATARS".to_string(),
+            }]
+        }
+        Effect::ShowAvatars => {
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: "script: SHOWAVATARS".to_string(),
+            }]
+        }
+        Effect::ClearLooseProps => {
+            if let Some(room) = state.room_desc.as_mut() {
+                room.loose_props.clear();
+            }
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: "script: CLEARLOOSEPROPS".to_string(),
+            }]
+        }
+        Effect::PaintClear | Effect::PaintUndo => {
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: format!("script: {}", effect.command()),
+            }]
+        }
+        Effect::DrawLine { .. } | Effect::DrawLineRel { .. } => Vec::new(),
+        Effect::SetProps { props } => {
+            if let Some(user) = state.users.get_mut(&state.banner.user_id) {
+                user.props = props.iter().map(|p| *p as u32).collect();
+            }
+            *dirty_render = true;
+            Vec::new()
+        }
+        Effect::Naked => {
+            if let Some(user) = state.users.get_mut(&state.banner.user_id) {
+                user.props.clear();
+            }
+            *dirty_render = true;
+            Vec::new()
+        }
+        Effect::SetUserName { name } => {
+            if let Some(user) = state.users.get_mut(&state.banner.user_id) {
+                user.name = name.clone();
+            }
+            vec![ClientEvent::Note {
+                text: format!("script: SETUSERNAME {name:?} (local only)"),
+            }]
+        }
+        Effect::SetChatString { .. } => Vec::new(),
+        Effect::Unsupported { command } => vec![ClientEvent::Note {
+            text: format!("script: {command} is not implemented"),
+        }],
+        other => vec![ClientEvent::Note {
+            text: format!("script: {other}"),
+        }],
+    }
+}
+
+/// Change a hotspot's state in the locally rendered room.
+fn set_local_spot_state(state: &mut SessionState, spot: i32, value: i32) -> bool {
+    let Some(room) = state.room_desc.as_mut() else {
+        return false;
+    };
+    let Some(hotspot) = room
+        .hotspots
+        .iter_mut()
+        .find(|hotspot| i32::from(hotspot.id) == spot)
+    else {
+        return false;
+    };
+    hotspot.state = value.clamp(0, i32::from(i16::MAX)) as i16;
+    true
 }
