@@ -1,0 +1,13 @@
+[package]
+name = "iptscrae"
+description = "IPTSCRAE: the Forth-like stack language of The Palace — lexer, parser, VM and capability trait."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The VM core is dependency-free on purpose: `std` only. Encoding, RNG and the
+# clock are injectable through the `Host` capability trait, so nothing here
+# reaches for ambient authority.
