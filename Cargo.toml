@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/palace-wire", "crates/palace-probe"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+repository = "https://example.invalid/palace-client"
+
+[workspace.dependencies]
+palace-wire = { path = "crates/palace-wire" }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
