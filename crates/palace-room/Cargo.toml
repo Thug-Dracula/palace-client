@@ -11,3 +11,4 @@ repository.workspace = true
 palace-wire = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }

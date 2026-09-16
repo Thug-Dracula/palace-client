@@ -2208,6 +2208,7 @@ dependencies = [
  "iptscrae",
  "iptscrae-palace",
  "palace-asset",
+ "palace-host",
  "palace-prop",
  "palace-render",
  "palace-room",
@@ -2216,6 +2217,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "palace-host"
+version = "0.1.0"
+dependencies = [
+ "iptscrae",
+ "iptscrae-palace",
+ "palace-render",
+ "palace-room",
+ "palace-wire",
 ]
 
 [[package]]
@@ -2250,6 +2262,7 @@ name = "palace-room"
 version = "0.1.0"
 dependencies = [
  "palace-wire",
+ "serde_json",
 ]
 
 [[package]]

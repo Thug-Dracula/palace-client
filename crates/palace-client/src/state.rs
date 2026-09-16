@@ -170,6 +170,16 @@ impl SessionState {
         line
     }
 
+    /// Replace one transcript line's text, returning the updated line.
+    ///
+    /// `ON INCHAT` handlers rewrite incoming chat, so the stored transcript has
+    /// to follow the text the user actually sees.
+    pub fn rewrite_chat_line(&mut self, seq: u64, text: String) -> Option<ChatLine> {
+        let line = self.chat.iter_mut().find(|line| line.seq == seq)?;
+        line.text = text;
+        Some(line.clone())
+    }
+
     fn name_of(&self, user_id: i32) -> String {
         self.users
             .get(&user_id)
@@ -194,7 +204,9 @@ impl SessionState {
         )
     }
 
-    fn byte_order(&self) -> ByteOrder {
+    /// The session's byte order, as the handshake negotiated it.
+    #[must_use]
+    pub fn byte_order(&self) -> ByteOrder {
         match self.banner.byte_order.as_str() {
             "big" => ByteOrder::Big,
             _ => ByteOrder::Little,

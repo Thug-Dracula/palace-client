@@ -80,6 +80,13 @@ export interface ScreenState {
   geometry: ViewGeometry;
 }
 
+export interface ScriptReport {
+  event: string;
+  fired: number;
+  effects: string[];
+  problems: string[];
+}
+
 export type ClientEvent =
   | { type: "status"; status: ConnectionStatus; message: string | null }
   | { type: "banner"; banner: ServerBanner }
@@ -88,6 +95,13 @@ export type ClientEvent =
   | { type: "room_entered"; room: RoomInfo }
   | { type: "chat"; line: ChatLine }
   | { type: "screen"; screen: ScreenState }
+  | {
+      type: "script";
+      event: string;
+      fired: number;
+      effects: string[];
+      problems: string[];
+    }
   | { type: "note"; text: string };
 
 export const frameUrl = (version: number): string => `palace://localhost/frame?v=${version}`;
@@ -116,6 +130,8 @@ export const setViewport = (
 ): Promise<void> => invoke("set_viewport", { width, height, dpr, zoom, native });
 
 export const refresh = (): Promise<void> => invoke("refresh");
+
+export const click = (x: number, y: number): Promise<void> => invoke("click", { x, y });
 
 export const onEvent = (handler: (event: ClientEvent) => void): Promise<UnlistenFn> =>
   listen<ClientEvent>(EVENT_NAME, (message) => handler(message.payload));

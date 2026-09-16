@@ -10,6 +10,7 @@ members = [
     "crates/palace-client",
     "crates/iptscrae",
     "crates/iptscrae-palace",
+    "crates/palace-host",
     "src-tauri",
 ]
 
@@ -30,6 +31,7 @@ palace-render = { path = "crates/palace-render" }
 palace-client = { path = "crates/palace-client" }
 iptscrae = { path = "crates/iptscrae" }
 iptscrae-palace = { path = "crates/iptscrae-palace" }
+palace-host = { path = "crates/palace-host" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
