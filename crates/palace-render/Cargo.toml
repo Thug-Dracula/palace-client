@@ -1,0 +1,25 @@
+[package]
+name = "palace-render"
+description = "Palace room compositor: layered frame rendering, DPR buffer transform and the room<->viewport input mapping."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "palace_render"
+path = "src/lib.rs"
+
+[[bin]]
+name = "palace-render"
+path = "src/main.rs"
+
+[dependencies]
+palace-wire = { workspace = true }
+palace-room = { workspace = true }
+palace-prop = { workspace = true }
+# Decoding only: backgrounds are true-colour PNG/JPEG/GIF, not props.
+image = { workspace = true }
+# Frame output. The compositor only ever encodes RGBA8.
+png = { workspace = true }
