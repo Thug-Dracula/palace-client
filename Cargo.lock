@@ -23,6 +23,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "palace-room"
+version = "0.1.0"
+dependencies = [
+ "palace-wire",
+]
+
+[[package]]
 name = "palace-wire"
 version = "0.1.0"
 dependencies = [

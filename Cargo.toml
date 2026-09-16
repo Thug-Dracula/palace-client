@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/palace-wire", "crates/palace-probe"]
+members = ["crates/palace-wire", "crates/palace-room", "crates/palace-probe"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ repository = "https://example.invalid/palace-client"
 
 [workspace.dependencies]
 palace-wire = { path = "crates/palace-wire" }
+palace-room = { path = "crates/palace-room" }
 serde_json = "1"
 
 [profile.release]
