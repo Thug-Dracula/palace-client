@@ -1,0 +1,13 @@
+[package]
+name = "palace-room"
+description = "Palace MSG_ROOMDESC decoder: the offset walker for a room's geometry, overlays, hotspots, loose props and draw commands."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+palace-wire = { workspace = true }
+
+[dev-dependencies]
