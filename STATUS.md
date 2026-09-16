@@ -245,14 +245,29 @@ Measured against the 2,400-script corpus, not assumed.
 
 **Command coverage: 100%.** All 102 distinct commands the corpus uses — 391,129 occurrences — are already implemented. The registry holds **191 names**: 72 core in `iptscrae/src/registry.rs` + 121 Palace bindings in `iptscrae-palace/src/commands.rs`. **No command implementation work remains for dispatch.**
 
-**So event dispatch is a wiring job, not an implementation job:** the script text is already extracted and validated (`crates/palace-room/tests/corpus_scripts.rs`, 2400/2400), the `ON`-block splitter and VM already exist, and every command is registered. What is missing is mapping the 24 event names above onto runtime events and supplying the host.
+**So event dispatch was a wiring job, not an implementation job** — which is what the next section did. The script text was already extracted and validated (`crates/palace-room/tests/corpus_scripts.rs`, 2400/2400), the `ON`-block splitter and VM already existed, and every command was registered. What was missing was the mapping from the 24 event names above onto runtime events, and the host.
 
-## Event dispatch bridge (implemented 2026-09-16)
+## Event dispatch (merged from `feat/events`)
 
-`crates/palace-client/src/dispatch.rs` holds the bridge. `script_event()` maps a
-`ClientEvent` onto the script event a hotspot answers; `Dispatcher::dispatch_scripts()`
-runs that handler for every hotspot in the room, keeping globals between dispatches
-the way the reference client does.
+`crates/palace-host/` is the dispatch layer:
+
+| Module | Role |
+|---|---|
+| `load` | splits the `ON <NAME> { … }` blocks out of each hotspot's script text and reports the ones that fail |
+| `engine::ScriptEngine` | fires `ScriptEvent`s, keeps globals across handlers, runs `SETALARM` / `ALARMEXEC` timers |
+| `host::ScriptHost` | implements `PalaceHost` over a `view::HostView` snapshot, recording every effect; it never touches the socket |
+| `wire` | encodes recorded effects as protocol frames |
+
+`fire()` returns a `DispatchReport` carrying `fired`, per-run `runs` (each with its
+error), `effects`, and `chat_string` — the `CHATSTR` value after the run, which is how
+a script rewrites or clears an `ON INCHAT` / `ON OUTCHAT` line. Dispatch is wired into
+the live runtime, and `ClientEvent::Script` reports what fired to the UI.
+
+**Untrusted scripts have no ambient authority:** the host cannot open a socket, read a
+file or spawn a process, and every effect is a value the runtime may refuse. The VM
+budgets still apply.
+
+The runtime-event mapping the layer answers:
 
 | Runtime event | Script event |
 |---|---|
@@ -261,20 +276,16 @@ the way the reference client does.
 | `Chat` otherwise (`Talk` / `Whisper`) | `INCHAT` |
 | `Chat` of kind `System` / `Error` | `SERVERMSG` |
 | `Status::Connected` | `SIGNON` |
-| `Banner`, `Rooms`, `Users`, `Screen`, `Note` | none |
-
-**Evidence**, from tests that run with no server and no window: **781 rooms answer
-`ON ENTER`, 1951 handlers matched**, and `matched == ran + errors` holds — no
-matched handler is skipped silently. The earlier claim in this file that
-"demonstrating dispatch needs the GUI running" was **wrong**; the bridge is fully
-testable headless.
 
 ### Correction: "100% command coverage" ≠ "the host implements it"
 
 Coverage above means every command *lexes and is registered*. `PalaceHost` **refuses**
-a command it does not implement rather than ignoring it, so re-running the same corpus
-against a two-command host (`chat`, `goto_room`) turns **1264 of the 1951** handlers
-into refusals. That refusal tally is the real remaining work, ranked from live scripts:
+a command it does not implement rather than ignoring it. Running the corpus against a
+two-command host (`chat`, `goto_room`) turned **1264 of 1951** `ON ENTER` handlers into
+refusals — which is how the host's remaining debt got measured. **That debt is now
+closed**: `ScriptHost` implements the surface, including every command in the list
+below. It was measured from `ON ENTER` only, so treat it as a lower bound and as a
+record of the method rather than an open to-do.
 
 | Command | refusals | | Command | refusals |
 |---|---|---|---|---|
@@ -289,9 +300,23 @@ into refusals. That refusal tally is the real remaining work, ranked from live s
 | `ROOMID` | 23 | | | |
 | `MIDISTOP` | 20 | | | |
 
-Two caveats. It is measured from `ON ENTER` only — the other 23 events will add more.
-And `ALARMEXEC` is the timer callback (`SETALARM` schedules it), not a user command,
-so it is really engine work rather than host work.
+### Process lesson: inspect an aborted agent's worktree before writing its work off
+
+This layer was built on `feat/events` and then **stranded** when the agent producing it
+was aborted and its result was recorded as "aborted, no task_id, do not resume". It sat
+unmerged in the `palace-client-ipt` worktree while a smaller duplicate was written by
+hand on master — and that worktree was nearly deleted as "leftover cleanup".
+
+Three commands would have caught it immediately:
+
+```bash
+git worktree list                  # which branch each worktree is actually on
+git branch --merged master         # what is NOT in master
+git log --oneline master..<branch> # the stranded commits
+```
+
+An aborted agent may have committed real work before dying. "No task_id" means the
+*session* cannot be resumed — it does **not** mean nothing was produced.
 
 ### Measurement caution — two earlier attempts at this metric were wrong
 
