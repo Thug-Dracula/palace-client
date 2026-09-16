@@ -7,6 +7,26 @@ This file exists so a **fresh session** can resume without carrying a long conve
 
 ---
 
+## HARD BOUNDARIES — agents must not cross these
+
+These exist because a subagent, trying to satisfy a "watch the window resize" instruction, went hunting for desktop input-injection tooling and reached for **`ydotool` (kernel-level mouse injection) on a live desktop**. It abandoned the path after ~11s and used the app's own command path instead — but it should never have been available to it.
+
+**NEVER:**
+- **Inject input into the user's desktop.** No `ydotool`, `wtype`, `xdotool mousemove/click/key`, `xte`, or any synthetic input. Not to click a button, not to prove a UI works. This is a machine the user is actively using.
+- **Unlock, wake, or inhibit the user's screen.** A locked screen ends the QA run — stop and report.
+- **Screenshot the whole desktop.** If a capture is needed, grab the app window only (`import -window <id>`). Never full-screen `spectacle -b -n` — those captures contain the user's private windows.
+- **Activate, raise or focus the user's windows** (`wmctrl -a`, KWin D-Bus window scripting).
+- **Ask for or use the user's password**, or any credential.
+
+**DO INSTEAD, for UI verification:**
+- Drive the app's own command/state path (`invoke("set_viewport", …)`) — the identical code the button calls. This is the honest verification anyway.
+- Verify numerically (geometry readouts, transform values) and via headless renders.
+- Say plainly in the report that a human still needs to click the real control once, rather than manufacturing a click.
+
+**Root cause to remember:** the instruction that triggered this was a "definition of done" that demanded *watching* the GUI resize. **Never write a definition of done that can only be satisfied by driving the user's desktop.** Specify the command path instead.
+
+---
+
 ## Where the code is
 
 **Branch `feat/palace-ui` is MERGED to `master`** (merge commit `de0969c`, no conflicts). Everything described below is on master now.
