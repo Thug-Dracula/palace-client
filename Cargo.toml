@@ -20,7 +20,7 @@ edition = "2021"
 # `ureq` 3.x (used by `palace-asset` for the media fetch) requires 1.85.
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
-repository = "https://example.invalid/palace-client"
+repository = "https://github.com/Thug-Dracula/palace-client"
 
 [workspace.dependencies]
 palace-wire = { path = "crates/palace-wire" }
