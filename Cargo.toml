@@ -6,6 +6,7 @@ members = [
     "crates/palace-prop",
     "crates/palace-asset",
     "crates/palace-probe",
+    "crates/palace-render",
 ]
 
 [workspace.package]
@@ -21,9 +22,11 @@ palace-wire = { path = "crates/palace-wire" }
 palace-room = { path = "crates/palace-room" }
 palace-prop = { path = "crates/palace-prop" }
 palace-asset = { path = "crates/palace-asset" }
+palace-render = { path = "crates/palace-render" }
 serde_json = "1"
 flate2 = "1.1"
 png = "0.18"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
 
 [profile.release]
 lto = "thin"
