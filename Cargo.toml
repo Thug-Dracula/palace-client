@@ -8,6 +8,7 @@ members = [
     "crates/palace-probe",
     "crates/palace-render",
     "crates/palace-client",
+    "src-tauri",
 ]
 
 [workspace.package]
