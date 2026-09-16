@@ -41,7 +41,10 @@ fn host_primitives_are_seeded_bounded_and_deterministic() {
         Some(vec!["a".to_owned()])
     );
     assert_eq!(host.grep_match("zzz", "abc").unwrap(), None);
-    assert_eq!(host.grep_match("", "abc").unwrap(), Some(vec![String::new()]));
+    assert_eq!(
+        host.grep_match("", "abc").unwrap(),
+        Some(vec![String::new()])
+    );
 
     assert_eq!(
         host.initial_variables(),

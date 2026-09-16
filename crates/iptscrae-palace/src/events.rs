@@ -191,10 +191,34 @@ mod tests {
             .map(|e| e.handler_name())
             .collect();
         for expected in [
-            "ENTER", "SELECT", "LEAVE", "OUTCHAT", "ALARM", "INCHAT", "ROLLOVER", "ROLLOUT",
-            "ROOMREADY", "ROOMLOAD", "NAMECHANGE", "KEYDOWN", "SERVERMSG", "UNLOCK", "LOCK",
-            "HTTPRECEIVED", "SIGNON", "USERLEAVE", "STATECHANGE", "MOUSEUP", "MOUSEDRAG",
-            "HTTPERROR", "MOUSEMOVE", "0", "1", "2", "MACRO0", "MACRO9",
+            "ENTER",
+            "SELECT",
+            "LEAVE",
+            "OUTCHAT",
+            "ALARM",
+            "INCHAT",
+            "ROLLOVER",
+            "ROLLOUT",
+            "ROOMREADY",
+            "ROOMLOAD",
+            "NAMECHANGE",
+            "KEYDOWN",
+            "SERVERMSG",
+            "UNLOCK",
+            "LOCK",
+            "HTTPRECEIVED",
+            "SIGNON",
+            "USERLEAVE",
+            "STATECHANGE",
+            "MOUSEUP",
+            "MOUSEDRAG",
+            "HTTPERROR",
+            "MOUSEMOVE",
+            "0",
+            "1",
+            "2",
+            "MACRO0",
+            "MACRO9",
         ] {
             assert!(names.iter().any(|n| n == expected), "missing {expected}");
         }

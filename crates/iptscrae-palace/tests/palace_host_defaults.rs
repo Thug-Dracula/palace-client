@@ -57,10 +57,18 @@ fn room_and_geometry_getters_default_to_neutral_values() {
     assert_eq!(host.get_room_name(), "", "ROOMNAME");
     assert_eq!(host.get_server_name(), "", "SERVERNAME");
     assert_eq!(host.get_room_width(), 512, "ROOMWIDTH is the viewing area");
-    assert_eq!(host.get_room_height(), 384, "ROOMHEIGHT is the viewing area");
+    assert_eq!(
+        host.get_room_height(),
+        384,
+        "ROOMHEIGHT is the viewing area"
+    );
     assert_eq!(host.get_num_room_users(), 0, "NBRROOMUSERS");
     assert_eq!(host.get_room_user_id_by_index(0), 0, "ROOMUSER");
-    assert_eq!(host.get_room_user_id_by_index(99), 0, "ROOMUSER out of range");
+    assert_eq!(
+        host.get_room_user_id_by_index(99),
+        0,
+        "ROOMUSER out of range"
+    );
     assert_eq!(host.get_num_spots(), 0, "NBRSPOTS/NBRDOORS");
     assert_eq!(host.get_spot_id_by_index(3), 0, "SPOTIDX");
     assert_eq!(host.get_door_id_by_index(3), 0, "DOORIDX");

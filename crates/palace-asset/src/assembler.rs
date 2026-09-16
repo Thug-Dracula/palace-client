@@ -367,8 +367,7 @@ impl AssetAssembler {
             }
         }
 
-        let grown = self.pending_bytes.saturating_sub(p.bytes)
-            + transfer.data.len() as u64;
+        let grown = self.pending_bytes.saturating_sub(p.bytes) + transfer.data.len() as u64;
         if grown > self.cfg.max_pending_bytes {
             let error = AssetError::Capacity {
                 what: "incomplete-asset byte budget",
@@ -382,7 +381,10 @@ impl AssetAssembler {
         p.offsets
             .insert(transfer.header.block_number, transfer.header.block_offset);
         let old = replaced.map_or(0, |v| v.len() as u64);
-        let new = p.blocks.get(&transfer.header.block_number).map_or(0, |v| v.len() as u64);
+        let new = p
+            .blocks
+            .get(&transfer.header.block_number)
+            .map_or(0, |v| v.len() as u64);
         p.bytes = p.bytes.saturating_sub(old).saturating_add(new);
         self.pending_bytes = self.pending_bytes.saturating_sub(old).saturating_add(new);
 
@@ -523,7 +525,13 @@ mod tests {
         }
     }
 
-    fn later_block(spec: AssetSpec, number: i16, count: i16, offset: i32, data: &[u8]) -> AssetTransfer {
+    fn later_block(
+        spec: AssetSpec,
+        number: i16,
+        count: i16,
+        offset: i32,
+        data: &[u8],
+    ) -> AssetTransfer {
         AssetTransfer {
             header: BlockHeader {
                 asset_type: AssetType::PROP,

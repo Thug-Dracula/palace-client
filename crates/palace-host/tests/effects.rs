@@ -98,7 +98,12 @@ fn every_effect() -> Vec<(Effect, &'static str, bool, &'static str)> {
             false,
             "ERRORMSG \"hi\"",
         ),
-        (Effect::GotoRoom { room: 817 }, "GOTOROOM", true, "GOTOROOM 817"),
+        (
+            Effect::GotoRoom { room: 817 },
+            "GOTOROOM",
+            true,
+            "GOTOROOM 817",
+        ),
         (
             Effect::GotoUrl {
                 url: "http://x".to_owned(),
@@ -127,7 +132,12 @@ fn every_effect() -> Vec<(Effect, &'static str, bool, &'static str)> {
             true,
             "MOVE (1,2)",
         ),
-        (Effect::SetColor { color: 3 }, "SETCOLOR", true, "SETCOLOR 3"),
+        (
+            Effect::SetColor { color: 3 },
+            "SETCOLOR",
+            true,
+            "SETCOLOR 3",
+        ),
         (Effect::SetFace { face: 4 }, "SETFACE", true, "SETFACE 4"),
         (
             Effect::SetUserName {
@@ -256,7 +266,12 @@ fn every_effect() -> Vec<(Effect, &'static str, bool, &'static str)> {
             false,
             "DROPPROP (10,20)",
         ),
-        (Effect::DimRoom { percent: 50 }, "DIMROOM", false, "DIMROOM 50"),
+        (
+            Effect::DimRoom { percent: 50 },
+            "DIMROOM",
+            false,
+            "DIMROOM 50",
+        ),
         (
             Effect::PlaySound {
                 name: "garden".to_owned(),
@@ -306,7 +321,12 @@ fn every_effect() -> Vec<(Effect, &'static str, bool, &'static str)> {
             true,
             "LINETO (1,2)-(3,4)",
         ),
-        (Effect::MovePen { x: 1, y: 2 }, "PENPOS", false, "PENPOS (1,2)"),
+        (
+            Effect::MovePen { x: 1, y: 2 },
+            "PENPOS",
+            false,
+            "PENPOS (1,2)",
+        ),
         (
             Effect::SetPenColor { r: 1, g: 2, b: 3 },
             "PENCOLOR",

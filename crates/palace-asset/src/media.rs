@@ -310,7 +310,12 @@ impl<T: HttpTransport> MediaFetcher<T> {
     /// Hotspot and overlay images are referenced by their real name and get no
     /// chain in either reference client.
     pub fn fetch_single(&mut self, base_url: &str, name: &str, now_ms: u64) -> Result<MediaFetch> {
-        self.fetch_candidates(base_url, name, std::slice::from_ref(&name.to_string()), now_ms)
+        self.fetch_candidates(
+            base_url,
+            name,
+            std::slice::from_ref(&name.to_string()),
+            now_ms,
+        )
     }
 
     fn fetch_candidates(
@@ -379,8 +384,10 @@ impl<T: HttpTransport> MediaFetcher<T> {
         if self.negative.len() >= self.cfg.max_negative_entries {
             self.negative.clear();
         }
-        self.negative
-            .insert(name.to_string(), now_ms.saturating_add(self.cfg.negative_ttl_ms));
+        self.negative.insert(
+            name.to_string(),
+            now_ms.saturating_add(self.cfg.negative_ttl_ms),
+        );
     }
 
     /// How many media names are currently being skipped.
@@ -494,13 +501,13 @@ mod tests {
 
     #[test]
     fn the_chain_only_fires_for_a_gif_name() {
-        assert_eq!(
-            fallback_chain("bg.gif"),
-            vec!["bg.png", "bg.jpg", "bg.gif"]
-        );
+        assert_eq!(fallback_chain("bg.gif"), vec!["bg.png", "bg.jpg", "bg.gif"]);
         assert_eq!(fallback_chain("BG.GIF"), vec!["BG.png", "BG.jpg", "BG.GIF"]);
         assert_eq!(fallback_chain("bg.png"), vec!["bg.png"]);
-        assert_eq!(fallback_chain("dir/bg.gif"), vec!["dir/bg.png", "dir/bg.jpg", "dir/bg.gif"]);
+        assert_eq!(
+            fallback_chain("dir/bg.gif"),
+            vec!["dir/bg.png", "dir/bg.jpg", "dir/bg.gif"]
+        );
         assert_eq!(fallback_chain("gif"), vec!["gif"]);
         assert_eq!(fallback_chain(".gif"), vec![".gif"]);
     }
@@ -508,9 +515,18 @@ mod tests {
     #[test]
     fn url_joining_never_double_slashes_or_drops_the_separator() {
         assert_eq!(media_url("http://a/media", "x.gif"), "http://a/media/x.gif");
-        assert_eq!(media_url("http://a/media/", "x.gif"), "http://a/media/x.gif");
-        assert_eq!(media_url("http://a/media", "/x.gif"), "http://a/media/x.gif");
-        assert_eq!(media_url("http://a/media///", "x.gif"), "http://a/media/x.gif");
+        assert_eq!(
+            media_url("http://a/media/", "x.gif"),
+            "http://a/media/x.gif"
+        );
+        assert_eq!(
+            media_url("http://a/media", "/x.gif"),
+            "http://a/media/x.gif"
+        );
+        assert_eq!(
+            media_url("http://a/media///", "x.gif"),
+            "http://a/media/x.gif"
+        );
     }
 
     #[test]
@@ -593,9 +609,18 @@ mod tests {
         let b = media_url("http://two/media", "bg.png");
         let stub = StubTransport::new(vec![(&a, ok(b"A")), (&b, ok(b"B"))]);
         let mut f = MediaFetcher::new(stub, temp_cache("ns"), MediaConfig::default());
-        assert_eq!(f.fetch("http://one/media", "bg.gif", 0).unwrap().bytes, b"A");
-        assert_eq!(f.fetch("http://two/media", "bg.gif", 0).unwrap().bytes, b"B");
-        assert_eq!(f.fetch("http://one/media", "bg.gif", 0).unwrap().bytes, b"A");
+        assert_eq!(
+            f.fetch("http://one/media", "bg.gif", 0).unwrap().bytes,
+            b"A"
+        );
+        assert_eq!(
+            f.fetch("http://two/media", "bg.gif", 0).unwrap().bytes,
+            b"B"
+        );
+        assert_eq!(
+            f.fetch("http://one/media", "bg.gif", 0).unwrap().bytes,
+            b"A"
+        );
     }
 
     #[test]
@@ -634,10 +659,7 @@ mod tests {
     fn an_empty_base_url_is_refused_before_any_request() {
         let stub = StubTransport::new(vec![]);
         let mut f = MediaFetcher::new(stub, temp_cache("blank"), MediaConfig::default());
-        assert!(matches!(
-            f.fetch("", "bg.gif", 0),
-            Err(AssetError::Url(_))
-        ));
+        assert!(matches!(f.fetch("", "bg.gif", 0), Err(AssetError::Url(_))));
     }
 
     #[test]
@@ -656,7 +678,9 @@ mod tests {
         let url = media_url(BASE, "animated-backgrounds/rainy-day.png");
         let stub = StubTransport::new(vec![(&url, ok(b"RAIN"))]);
         let mut f = MediaFetcher::new(stub, temp_cache("nested"), MediaConfig::default());
-        let got = f.fetch(BASE, "animated-backgrounds/rainy-day.gif", 0).unwrap();
+        let got = f
+            .fetch(BASE, "animated-backgrounds/rainy-day.gif", 0)
+            .unwrap();
         assert_eq!(got.bytes, b"RAIN");
         assert!(f
             .cache()
@@ -669,8 +693,7 @@ mod tests {
     #[test]
     fn boxed_transports_are_transports_too() {
         let url = media_url(BASE, "bg.png");
-        let boxed: Box<dyn HttpTransport> =
-            Box::new(StubTransport::new(vec![(&url, ok(b"P"))]));
+        let boxed: Box<dyn HttpTransport> = Box::new(StubTransport::new(vec![(&url, ok(b"P"))]));
         let mut f = MediaFetcher::new(boxed, temp_cache("boxed"), MediaConfig::default());
         assert_eq!(f.fetch(BASE, "bg.gif", 0).unwrap().bytes, b"P");
     }

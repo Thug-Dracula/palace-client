@@ -41,7 +41,7 @@ use palace_wire::messages::HttpServer;
 use palace_wire::opcode::{ASSETQUERY, ASSETSEND, HTTPSERVER};
 use palace_wire::{Opcode, Reader};
 
-use crate::assembler::{Asset, AssetAssembler, AssemblerConfig, AssemblyOutcome};
+use crate::assembler::{AssemblerConfig, AssemblyOutcome, Asset, AssetAssembler};
 use crate::asset::{AssetKey, AssetSpec, AssetTransfer, AssetType, OP_REGI};
 use crate::cache::{AssetCache, DEFAULT_ASSET_CACHE_CAPACITY};
 use crate::error::{AssetError, Result};
@@ -303,9 +303,9 @@ impl AssetPipeline {
                     }
                 }
                 SchedulerEvent::Retry { .. } => {}
-                SchedulerEvent::Failed {
-                    key, attempts, ..
-                } => out.push(PipelineEvent::RequestFailed { key, attempts }),
+                SchedulerEvent::Failed { key, attempts, .. } => {
+                    out.push(PipelineEvent::RequestFailed { key, attempts })
+                }
                 SchedulerEvent::Dropped { key, reason } => {
                     out.push(PipelineEvent::RequestDropped { key, reason });
                 }
@@ -581,7 +581,10 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, PipelineEvent::AssetReady { .. })));
-        assert!(p.scheduler().is_idle(), "the queued request must be satisfied");
+        assert!(
+            p.scheduler().is_idle(),
+            "the queued request must be satisfied"
+        );
         assert!(p.cache().contains_id(AssetType::PROP, 99));
     }
 
@@ -775,6 +778,10 @@ mod tests {
         assert!(owns(ASSETSEND));
         assert!(owns(HTTPSERVER));
         assert!(!owns(TIYID));
-        assert!(decode_query(&AssetQuery::prop(1, 0).encode_frame(0, ORDER).payload, ORDER).is_ok());
+        assert!(decode_query(
+            &AssetQuery::prop(1, 0).encode_frame(0, ORDER).payload,
+            ORDER
+        )
+        .is_ok());
     }
 }

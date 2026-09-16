@@ -378,10 +378,9 @@ fn out_of_range_picture_array_warns_and_degrades() {
     payload[24..26].copy_from_slice(&30000i16.to_le_bytes());
     let desc = decode_payload(&payload, ByteOrder::Little).unwrap();
     assert!(desc.pictures.is_empty());
-    assert!(desc
-        .warnings
-        .iter()
-        .any(|w| matches!(w, RoomWarning::ArrayTruncated { field, .. } if *field == "pictureOfst")));
+    assert!(desc.warnings.iter().any(
+        |w| matches!(w, RoomWarning::ArrayTruncated { field, .. } if *field == "pictureOfst")
+    ));
 }
 
 #[test]
@@ -402,10 +401,9 @@ fn negative_artist_offset_warns() {
     payload[14..16].copy_from_slice(&(-1i16).to_le_bytes());
     let desc = decode_payload(&payload, ByteOrder::Little).unwrap();
     assert_eq!(desc.artist, "");
-    assert!(desc
-        .warnings
-        .iter()
-        .any(|w| matches!(w, RoomWarning::NegativeOffset { field, .. } if *field == "artistNameOfst")));
+    assert!(desc.warnings.iter().any(
+        |w| matches!(w, RoomWarning::NegativeOffset { field, .. } if *field == "artistNameOfst")
+    ));
 }
 
 #[test]
@@ -417,10 +415,9 @@ fn hotspot_point_array_out_of_range_warns() {
     let desc = decode_payload(&payload, ByteOrder::Little).unwrap();
     assert_eq!(desc.hotspots.len(), 1);
     assert!(desc.hotspots[0].points.is_empty());
-    assert!(desc
-        .warnings
-        .iter()
-        .any(|w| matches!(w, RoomWarning::ArrayTruncated { field, .. } if *field == "Hotspot.ptsOfst")));
+    assert!(desc.warnings.iter().any(
+        |w| matches!(w, RoomWarning::ArrayTruncated { field, .. } if *field == "Hotspot.ptsOfst")
+    ));
 }
 
 #[test]

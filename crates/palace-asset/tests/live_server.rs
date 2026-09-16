@@ -126,7 +126,8 @@ fn a_live_logon_yields_the_media_server_and_can_request_an_asset() {
     let mut conn = Conn::connect().expect("connect to the live server");
     let banner = conn.handshake().expect("handshake");
     assert_eq!(
-        banner.opcode, TIYID,
+        banner.opcode,
+        TIYID,
         "the server must open with MSG_TIYID, got {}",
         banner.opcode.describe()
     );
@@ -200,9 +201,7 @@ fn a_live_logon_yields_the_media_server_and_can_request_an_asset() {
             break;
         }
     }
-    println!(
-        "live sAst assets assembled: {assembled} (the server only serves what it holds)"
-    );
+    println!("live sAst assets assembled: {assembled} (the server only serves what it holds)");
 
     let _ = conn.send(Frame::empty(LOGOFF, 0));
 }

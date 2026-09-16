@@ -76,7 +76,11 @@ fn sole_door_is_only_reported_when_there_is_exactly_one() {
         }],
         ..HostView::default()
     };
-    assert_eq!(shuttable.sole_door(), None, "a shuttable door is not a door");
+    assert_eq!(
+        shuttable.sole_door(),
+        None,
+        "a shuttable door is not a door"
+    );
 
     let two_doors = HostView {
         spots: vec![
@@ -236,9 +240,9 @@ fn scripts_from_room_keeps_parsed_scripts_and_reports_the_rest() {
     let limits = Limits::default();
     let room = room_with_scripts(&[
         (1, Some("ON SELECT { \"hi\" SAY }")),
-        (2, None),               // no script text at all: skipped, not a problem
-        (3, Some("   ")),        // blank script: skipped
-        (4, Some("1 2 +")),      // non-empty text with no handlers: a problem
+        (2, None),                     // no script text at all: skipped, not a problem
+        (3, Some("   ")),              // blank script: skipped
+        (4, Some("1 2 +")),            // non-empty text with no handlers: a problem
         (5, Some("ON SELECT { $1 }")), // a real syntax error
     ]);
     let (loaded, problems) = scripts_from_room(&room, &commands, &limits);

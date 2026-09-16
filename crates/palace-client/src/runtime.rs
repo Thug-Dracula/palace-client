@@ -76,7 +76,10 @@ impl Default for ClientConfig {
 pub enum ClientCommand {
     GotoRoom(i32),
     Say(String),
-    Click { x: f64, y: f64 },
+    Click {
+        x: f64,
+        y: f64,
+    },
     RunScript(String),
     SetViewport {
         width: f64,
@@ -465,7 +468,10 @@ fn sleep_interruptible(
     true
 }
 
-fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientCommand>) -> Result<bool> {
+fn run_session(
+    shared: &Arc<Shared>,
+    cmd_rx: &mut UnboundedReceiver<ClientCommand>,
+) -> Result<bool> {
     let cfg = &shared.cfg;
     let session_root = cfg.cache_root.join(format!("{}:{}", cfg.host, cfg.port));
     let mut workspace = AssetWorkspace::new(&session_root)?;
@@ -693,9 +699,9 @@ fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientComman
                                 shared.emit(event);
                             }
                         }
-                        None => shared.note(format!(
-                            "script: click at room ({rx},{ry}) hit no hotspot"
-                        )),
+                        None => {
+                            shared.note(format!("script: click at room ({rx},{ry}) hit no hotspot"))
+                        }
                     }
                 }
                 None => shared.note("script: click ignored, the room view is not ready"),
@@ -739,7 +745,11 @@ fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientComman
                         frame.opcode.describe(),
                         frame.ref_num,
                         frame.payload.len(),
-                        frame.printable_payload().chars().take(60).collect::<String>()
+                        frame
+                            .printable_payload()
+                            .chars()
+                            .take(60)
+                            .collect::<String>()
                     ));
                 }
                 if palace_asset::owns(frame.opcode) {
@@ -948,7 +958,8 @@ fn run_session(shared: &Arc<Shared>, cmd_rx: &mut UnboundedReceiver<ClientComman
             dirty_render = false;
             dirty_geom = false;
         } else if dirty_geom {
-            if let (Some(previous), Some((room_w, room_h))) = (last_screen.clone(), last_room_size) {
+            if let (Some(previous), Some((room_w, room_h))) = (last_screen.clone(), last_room_size)
+            {
                 let viewport = shared.viewport();
                 let mut updated = previous;
                 updated.geometry = ViewGeometry::compute(
@@ -1226,7 +1237,11 @@ fn report_event(report: &palace_host::DispatchReport) -> ClientEvent {
     ClientEvent::Script {
         event: report.handler.clone(),
         fired: report.runs.len(),
-        effects: report.effects.iter().map(|effect| effect.to_string()).collect(),
+        effects: report
+            .effects
+            .iter()
+            .map(|effect| effect.to_string())
+            .collect(),
         problems: report
             .runs
             .iter()
@@ -1262,7 +1277,10 @@ fn run_event(
     for run in &report.runs {
         if let Some(error) = &run.error {
             out.push(ClientEvent::Note {
-                text: format!("script ON {} (hotspot {}) failed: {error}", report.handler, run.spot),
+                text: format!(
+                    "script ON {} (hotspot {}) failed: {error}",
+                    report.handler, run.spot
+                ),
             });
         }
     }
@@ -1415,7 +1433,11 @@ fn apply_effect(
             vec![ClientEvent::Note {
                 text: format!(
                     "script: spot {spot} -> state {value}{}",
-                    if applied { "" } else { " (spot not in this room)" }
+                    if applied {
+                        ""
+                    } else {
+                        " (spot not in this room)"
+                    }
                 ),
             }]
         }

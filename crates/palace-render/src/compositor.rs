@@ -165,7 +165,12 @@ fn blit_layer(canvas: &mut Canvas, sprites: &[Sprite]) {
     let mut order: Vec<&Sprite> = sprites.iter().collect();
     order.sort_by_key(|s| s.z);
     for sprite in order {
-        canvas.blit(&sprite.image, f64::from(sprite.x), f64::from(sprite.y), sprite.alpha);
+        canvas.blit(
+            &sprite.image,
+            f64::from(sprite.x),
+            f64::from(sprite.y),
+            sprite.alpha,
+        );
     }
 }
 

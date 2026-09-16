@@ -128,9 +128,10 @@ fn is_plausible_header(payload: &[u8], at: usize, order: ByteOrder) -> bool {
     }
     // Declared arrays must fit.
     let fits = |count_ofst: usize, arr_ofst: usize, stride: usize| -> bool {
-        let (Some(count), Some(base)) =
-            (read_i16(slice, order, count_ofst), read_i16(slice, order, arr_ofst))
-        else {
+        let (Some(count), Some(base)) = (
+            read_i16(slice, order, count_ofst),
+            read_i16(slice, order, arr_ofst),
+        ) else {
             return false;
         };
         if count <= 0 {
@@ -139,7 +140,9 @@ fn is_plausible_header(payload: &[u8], at: usize, order: ByteOrder) -> bool {
         let Some(bytes) = (count as usize).checked_mul(stride) else {
             return false;
         };
-        (base as usize).checked_add(bytes).is_some_and(|end| end <= len_vars)
+        (base as usize)
+            .checked_add(bytes)
+            .is_some_and(|end| end <= len_vars)
     };
     fits(18, 20, HOTSPOT_LEN) && fits(22, 24, PICTURE_OVERLAY_LEN)
 }
@@ -224,7 +227,11 @@ impl PictureOverlay {
     }
 }
 
-fn parse_pictures(var: &Var<'_>, header: &RoomRec, warn: &mut Vec<RoomWarning>) -> Vec<PictureOverlay> {
+fn parse_pictures(
+    var: &Var<'_>,
+    header: &RoomRec,
+    warn: &mut Vec<RoomWarning>,
+) -> Vec<PictureOverlay> {
     let declared = header.nbr_pictures.max(0) as usize;
     if declared == 0 {
         return Vec::new();
@@ -354,7 +361,12 @@ impl Hotspot {
     }
 }
 
-fn parse_points(var: &Var<'_>, nbr_pts: i16, pts_ofst: i16, warn: &mut Vec<RoomWarning>) -> Vec<Point> {
+fn parse_points(
+    var: &Var<'_>,
+    nbr_pts: i16,
+    pts_ofst: i16,
+    warn: &mut Vec<RoomWarning>,
+) -> Vec<Point> {
     if nbr_pts <= 0 {
         return Vec::new();
     }
@@ -458,7 +470,11 @@ fn parse_hotspots(var: &Var<'_>, header: &RoomRec, warn: &mut Vec<RoomWarning>) 
     out
 }
 
-fn parse_loose_props(var: &Var<'_>, header: &RoomRec, warn: &mut Vec<RoomWarning>) -> Vec<LooseProp> {
+fn parse_loose_props(
+    var: &Var<'_>,
+    header: &RoomRec,
+    warn: &mut Vec<RoomWarning>,
+) -> Vec<LooseProp> {
     let declared = header.nbr_lprops.max(0) as usize;
     if declared == 0 {
         return Vec::new();
@@ -561,7 +577,8 @@ fn parse_draw_cmds(var: &Var<'_>, header: &RoomRec, warn: &mut Vec<RoomWarning>)
     if declared == 0 {
         return Vec::new();
     }
-    let Some(mut cursor) = linked_base(header.first_draw_cmd, declared, "firstDrawCmd", warn) else {
+    let Some(mut cursor) = linked_base(header.first_draw_cmd, declared, "firstDrawCmd", warn)
+    else {
         return Vec::new();
     };
 
@@ -706,15 +723,14 @@ fn decode_draw_payload(
         });
         return None;
     }
-    let pen_rgb = [
-        *data.get(4)?,
-        *data.get(6)?,
-        *data.get(8)?,
-    ];
+    let pen_rgb = [*data.get(4)?, *data.get(6)?, *data.get(8)?];
     let mut points = Vec::with_capacity(count.min(4096));
     for k in 0..count {
         let at = DRAW_PAYLOAD_PREFIX + k * POINT_LEN;
-        points.push(Point::new(read_i16(data, order, at)?, read_i16(data, order, at + 2)?));
+        points.push(Point::new(
+            read_i16(data, order, at)?,
+            read_i16(data, order, at + 2)?,
+        ));
     }
 
     // Optional PC5 tail: line RGBA then fill RGBA.
@@ -747,7 +763,12 @@ fn decode_draw_payload(
 
 /// Resolve the base offset of a fixed-stride array, warning when the offset is
 /// absent, negative or out of range.
-fn array_base(ofst: i16, count: usize, field: &'static str, warn: &mut Vec<RoomWarning>) -> Option<usize> {
+fn array_base(
+    ofst: i16,
+    count: usize,
+    field: &'static str,
+    warn: &mut Vec<RoomWarning>,
+) -> Option<usize> {
     match ofst {
         0 => {
             warn.push(RoomWarning::AbsentOffset { field, count });
@@ -764,7 +785,12 @@ fn array_base(ofst: i16, count: usize, field: &'static str, warn: &mut Vec<RoomW
 /// Resolve the first link of a linked list. `0` means the list is empty even
 /// when a count was declared (some servers write `firstLProp = 0`); that is
 /// reported, not guessed at.
-fn linked_base(ofst: i16, count: usize, field: &'static str, warn: &mut Vec<RoomWarning>) -> Option<usize> {
+fn linked_base(
+    ofst: i16,
+    count: usize,
+    field: &'static str,
+    warn: &mut Vec<RoomWarning>,
+) -> Option<usize> {
     match ofst {
         0 => {
             warn.push(RoomWarning::AbsentOffset { field, count });
@@ -873,8 +899,14 @@ impl<'a> Var<'a> {
 
     /// Resolve a possibly-absent `PString` offset into a `String` (`0` and
     /// negative both yield `""`).
-    fn optional_string(&self, ofst: i16, field: &'static str, warn: &mut Vec<RoomWarning>) -> String {
-        self.optional_string_opt(ofst, field, warn).unwrap_or_default()
+    fn optional_string(
+        &self,
+        ofst: i16,
+        field: &'static str,
+        warn: &mut Vec<RoomWarning>,
+    ) -> String {
+        self.optional_string_opt(ofst, field, warn)
+            .unwrap_or_default()
     }
 
     /// Resolve a possibly-absent `PString` offset into an `Option<String>`.

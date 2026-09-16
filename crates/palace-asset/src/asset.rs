@@ -380,7 +380,8 @@ impl AssetTransfer {
     /// Use [`ASSETSEND`] to answer a `qAst` the server sent us as a client
     /// (peer propagation) and [`ASSETREGI`] when serving a prop we hold.
     pub fn encode_frame(&self, opcode: Opcode, ref_num: i32, order: ByteOrder) -> Result<Frame> {
-        let mut w = Writer::with_capacity(order, BLOCK_HEADER_LEN + DESCRIPTOR_LEN + self.data.len());
+        let mut w =
+            Writer::with_capacity(order, BLOCK_HEADER_LEN + DESCRIPTOR_LEN + self.data.len());
         self.encode_body(&mut w)?;
         Ok(Frame::new(opcode, ref_num, w.into_vec()))
     }
@@ -473,7 +474,10 @@ mod tests {
     #[test]
     fn trailing_padding_is_reported_not_swallowed() {
         let original = transfer(0, 1, b"xy");
-        let mut payload = original.encode_frame(OP_SEND, 0, ByteOrder::Little).unwrap().payload;
+        let mut payload = original
+            .encode_frame(OP_SEND, 0, ByteOrder::Little)
+            .unwrap()
+            .payload;
         payload.extend_from_slice(&[0, 0, 0]);
         let decoded = AssetTransfer::decode(&payload, ByteOrder::Little).unwrap();
         assert_eq!(decoded.data, b"xy");
@@ -514,7 +518,10 @@ mod tests {
     #[test]
     fn a_truncated_block_is_reported_rather_than_padded() {
         let original = transfer(0, 1, b"0123456789");
-        let mut payload = original.encode_frame(OP_SEND, 0, ByteOrder::Little).unwrap().payload;
+        let mut payload = original
+            .encode_frame(OP_SEND, 0, ByteOrder::Little)
+            .unwrap()
+            .payload;
         payload.truncate(payload.len() - 4);
         let err = AssetTransfer::decode(&payload, ByteOrder::Little).unwrap_err();
         assert!(matches!(err, AssetError::Truncated { .. }));
@@ -523,7 +530,10 @@ mod tests {
     #[test]
     fn a_block_number_outside_the_count_is_rejected() {
         let original = transfer(3, 2, b"x");
-        let payload = original.encode_frame(OP_SEND, 0, ByteOrder::Little).unwrap().payload;
+        let payload = original
+            .encode_frame(OP_SEND, 0, ByteOrder::Little)
+            .unwrap()
+            .payload;
         let err = AssetTransfer::decode(&payload, ByteOrder::Little).unwrap_err();
         assert!(matches!(err, AssetError::ImplausibleBlockNumber { .. }));
     }
@@ -531,7 +541,10 @@ mod tests {
     #[test]
     fn an_absurd_block_count_is_rejected() {
         let original = transfer(0, i16::MAX, b"x");
-        let payload = original.encode_frame(OP_SEND, 0, ByteOrder::Little).unwrap().payload;
+        let payload = original
+            .encode_frame(OP_SEND, 0, ByteOrder::Little)
+            .unwrap()
+            .payload;
         let err = AssetTransfer::decode(&payload, ByteOrder::Little).unwrap_err();
         assert!(matches!(err, AssetError::ImplausibleBlockCount { .. }));
     }

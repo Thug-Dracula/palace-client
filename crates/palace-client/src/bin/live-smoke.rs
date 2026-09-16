@@ -50,7 +50,9 @@ fn report(event: &ClientEvent) -> bool {
         ClientEvent::RoomEntered { room } => {
             println!("[room] #{} {:?} users={}", room.id, room.name, room.users)
         }
-        ClientEvent::Chat { line } => println!("[chat:{:?}] {}: {}", line.kind, line.name, line.text),
+        ClientEvent::Chat { line } => {
+            println!("[chat:{:?}] {}: {}", line.kind, line.name, line.text)
+        }
         ClientEvent::Screen { screen } => {
             println!(
                 "[screen] v{} room {} {}x{} buffer {}x{} scale {:.3} dpr {} avatars={} loose={} pending={}",
@@ -141,9 +143,7 @@ async fn sweep_viewports(
 ) {
     for (width, height, dpr, zoom, native) in cases.iter().copied() {
         handle.set_viewport(width, height, dpr, zoom, native);
-        println!(
-            "--> set_viewport {width}x{height} dpr={dpr} zoom={zoom} native={native}"
-        );
+        println!("--> set_viewport {width}x{height} dpr={dpr} zoom={zoom} native={native}");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

@@ -80,8 +80,12 @@ pub const MAX_ROOM_DIMENSION: u32 = 8192;
 /// Clamp a requested room size into `[512×384, MAX_ROOM_DIMENSION²]`.
 #[must_use]
 pub fn clamp_room_size(width: f64, height: f64) -> (u32, u32) {
-    let w = width.max(crate::viewport::MIN_ROOM_WIDTH).min(f64::from(MAX_ROOM_DIMENSION));
-    let h = height.max(crate::viewport::MIN_ROOM_HEIGHT).min(f64::from(MAX_ROOM_DIMENSION));
+    let w = width
+        .max(crate::viewport::MIN_ROOM_WIDTH)
+        .min(f64::from(MAX_ROOM_DIMENSION));
+    let h = height
+        .max(crate::viewport::MIN_ROOM_HEIGHT)
+        .min(f64::from(MAX_ROOM_DIMENSION));
     (w as u32, h as u32)
 }
 
@@ -207,7 +211,9 @@ impl SceneBuilder {
 
         for spec in avatars {
             let (x, y) = clamp_avatar_position(spec.x, spec.y, width as i32, height as i32);
-            scene.avatars.push(self.build_avatar(x, y, spec, &mut notes));
+            scene
+                .avatars
+                .push(self.build_avatar(x, y, spec, &mut notes));
         }
 
         scene.background = background;
@@ -215,14 +221,7 @@ impl SceneBuilder {
         scene
     }
 
-    fn loose_prop(
-        &self,
-        id: u32,
-        x: i32,
-        y: i32,
-        z: i64,
-        notes: &mut Vec<AssetNote>,
-    ) -> Sprite {
+    fn loose_prop(&self, id: u32, x: i32, y: i32, z: i64, notes: &mut Vec<AssetNote>) -> Sprite {
         let decoded = self.props.prop_or_placeholder(id, notes);
         Sprite::new(decoded.image, x, y, z).with_alpha(decoded.alpha)
     }
@@ -476,10 +475,7 @@ mod tests {
     fn a_positive_transparency_index_looks_up_the_hotspot_palette() {
         // Index 1 is 0xffffdfff -> rgb(255, 223, 255).
         let bytes = vec![
-            255, 223, 255, 255,
-            1, 2, 3, 255,
-            40, 50, 60, 255,
-            7, 8, 9, 255,
+            255, 223, 255, 255, 1, 2, 3, 255, 40, 50, 60, 255, 7, 8, 9, 255,
         ];
         let mut image = PropImage::from_rgba(2, 2, bytes).expect("image");
         apply_transparency_index(&mut image, 1);
@@ -499,8 +495,8 @@ mod tests {
         let mut props = PropStore::new();
         props.add_directory(&dir);
         let scene_builder = SceneBuilder::new(MediaStore::default(), props);
-        let empty = palace_room::decode_payload(&[0u8; 40], palace_wire::ByteOrder::Little)
-            .expect("room");
+        let empty =
+            palace_room::decode_payload(&[0u8; 40], palace_wire::ByteOrder::Little).expect("room");
         let scene = scene_builder.build(&empty, &[AvatarSpec::new(300, 200, vec![9001])]);
         let avatar = &scene.avatars[0];
         assert_eq!((avatar.x, avatar.y), (300, 200));
@@ -514,8 +510,8 @@ mod tests {
     #[test]
     fn extra_loose_props_append_after_the_rooms_own() {
         let scene_builder = builder();
-        let empty = palace_room::decode_payload(&[0u8; 40], palace_wire::ByteOrder::Little)
-            .expect("room");
+        let empty =
+            palace_room::decode_payload(&[0u8; 40], palace_wire::ByteOrder::Little).expect("room");
         let scene = scene_builder.build_with(
             &empty,
             &[],
@@ -527,9 +523,9 @@ mod tests {
         );
         assert_eq!(scene.loose_props.len(), 1);
         assert_eq!((scene.loose_props[0].x, scene.loose_props[0].y), (10, 20));
-        assert!(scene.notes.iter().any(|n| matches!(
-            n,
-            AssetNote::MissingProp { id: 1 }
-        )));
+        assert!(scene
+            .notes
+            .iter()
+            .any(|n| matches!(n, AssetNote::MissingProp { id: 1 })));
     }
 }

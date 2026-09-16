@@ -349,12 +349,7 @@ impl AssetScheduler {
 
     /// Cancel every request matching a predicate. Returns how many went.
     pub fn cancel_if(&mut self, mut pred: impl FnMut(&AssetKey) -> bool) -> usize {
-        let hit: Vec<AssetKey> = self
-            .entries
-            .keys()
-            .filter(|k| pred(k))
-            .copied()
-            .collect();
+        let hit: Vec<AssetKey> = self.entries.keys().filter(|k| pred(k)).copied().collect();
         for key in &hit {
             self.remove(key);
         }
@@ -745,7 +740,10 @@ mod tests {
         for _ in 0..200 {
             now += 1000;
             for event in s.poll(now) {
-                if let SchedulerEvent::Failed { attempts, reason, .. } = event {
+                if let SchedulerEvent::Failed {
+                    attempts, reason, ..
+                } = event
+                {
                     assert_eq!(attempts, DEFAULT_MAX_ATTEMPTS);
                     assert_eq!(reason, FailureReason::Timeout);
                     failures += 1;
@@ -756,7 +754,10 @@ mod tests {
             }
         }
         assert_eq!(failures, 1);
-        assert!(s.is_idle(), "the request must be given up on, not retried forever");
+        assert!(
+            s.is_idle(),
+            "the request must be given up on, not retried forever"
+        );
     }
 
     #[test]

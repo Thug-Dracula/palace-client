@@ -59,12 +59,12 @@ pub enum AssetError {
     /// `blockCount` was below 1 or above [`MAX_BLOCK_COUNT`].
     ImplausibleBlockCount { block_count: i64, max: u32 },
     /// `blockNumber` was outside `0..blockCount`.
-    ImplausibleBlockNumber {
-        block_number: i64,
-        block_count: i64,
-    },
+    ImplausibleBlockNumber { block_number: i64, block_count: i64 },
     /// `blockOffset` was negative, or non-zero on the first block.
-    ImplausibleBlockOffset { block_number: i64, block_offset: i64 },
+    ImplausibleBlockOffset {
+        block_number: i64,
+        block_offset: i64,
+    },
     /// A later block repeated an offset already claimed with a different size.
     InconsistentBlock {
         block_number: i64,
@@ -81,11 +81,7 @@ pub enum AssetError {
     /// the sender asked us to verify one.
     UnverifiableCrc { asset_type: u32, crc: u32 },
     /// An asset the caller asked for is not present.
-    NotCached {
-        asset_type: u32,
-        id: i32,
-        crc: u32,
-    },
+    NotCached { asset_type: u32, id: i32, crc: u32 },
     /// A URL could not be built or parsed.
     Url(String),
     /// The HTTP transport failed.
@@ -134,10 +130,7 @@ impl fmt::Display for AssetError {
             AssetError::ImplausibleBlockNumber {
                 block_number,
                 block_count,
-            } => write!(
-                f,
-                "blockNumber {block_number} outside 0..{block_count}"
-            ),
+            } => write!(f, "blockNumber {block_number} outside 0..{block_count}"),
             AssetError::ImplausibleBlockOffset {
                 block_number,
                 block_offset,
@@ -164,10 +157,7 @@ impl fmt::Display for AssetError {
                 f,
                 "asset size mismatch: descriptor declared {declared}, assembled {assembled}"
             ),
-            AssetError::Incomplete {
-                received,
-                expected,
-            } => write!(
+            AssetError::Incomplete { received, expected } => write!(
                 f,
                 "asset incomplete: {received} of {expected} block(s) received"
             ),

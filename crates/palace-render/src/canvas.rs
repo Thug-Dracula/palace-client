@@ -116,7 +116,9 @@ impl Canvas {
         let x0 = (rect.x * dpr).floor().max(0.0) as i64;
         let y0 = (rect.y * dpr).floor().max(0.0) as i64;
         let x1 = ((rect.x + rect.width) * dpr).ceil().min(self.width as f64) as i64;
-        let y1 = ((rect.y + rect.height) * dpr).ceil().min(self.height as f64) as i64;
+        let y1 = ((rect.y + rect.height) * dpr)
+            .ceil()
+            .min(self.height as f64) as i64;
         for y in y0..y1.max(y0) {
             for x in x0..x1.max(x0) {
                 self.write_device(x, y, rgba, 1.0);
@@ -251,11 +253,7 @@ impl Canvas {
     /// Encode the buffer as an 8-bit RGBA PNG.
     pub fn write_png(&self, path: impl AsRef<Path>) -> Result<(), RenderError> {
         let file = std::fs::File::create(path).map_err(RenderError::Io)?;
-        let mut encoder = png::Encoder::new(
-            std::io::BufWriter::new(file),
-            self.width,
-            self.height,
-        );
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), self.width, self.height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder
@@ -276,7 +274,9 @@ impl Canvas {
             return None;
         }
         let at = ((y as usize) * (self.width as usize) + (x as usize)) * 4;
-        self.pixels.get(at..at + 4).map(|s| [s[0], s[1], s[2], s[3]])
+        self.pixels
+            .get(at..at + 4)
+            .map(|s| [s[0], s[1], s[2], s[3]])
     }
 }
 
@@ -335,11 +335,14 @@ mod tests {
         let mut c = Canvas::for_room(3.0, 1.0, 1.5);
         assert_eq!(c.width(), 4);
         for lx in 0..3u32 {
-            c.blit(&solid(1, 1, [lx as u8 * 40, 0, 0, 255]), lx as f64, 0.0, 1.0);
+            c.blit(
+                &solid(1, 1, [lx as u8 * 40, 0, 0, 255]),
+                lx as f64,
+                0.0,
+                1.0,
+            );
         }
-        let covered: Vec<u8> = (0..4)
-            .map(|x| c.device_pixel(x, 0).unwrap()[0])
-            .collect();
+        let covered: Vec<u8> = (0..4).map(|x| c.device_pixel(x, 0).unwrap()[0]).collect();
         assert_eq!(covered, vec![0, 40, 40, 80]);
     }
 

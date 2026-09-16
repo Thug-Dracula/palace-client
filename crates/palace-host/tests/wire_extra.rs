@@ -82,5 +82,9 @@ fn a_room_narrower_than_the_margin_clamps_to_its_own_size() {
     context.room_width = 30;
     context.room_height = 30;
     let frame = effect_frame(&Effect::MoveUserAbs { x: 100, y: 100 }, &context).expect("uLoc");
-    assert_eq!(frame.payload, [30u8, 0, 30, 0], "y then x, pinned at the wall");
+    assert_eq!(
+        frame.payload,
+        [30u8, 0, 30, 0],
+        "y then x, pinned at the wall"
+    );
 }

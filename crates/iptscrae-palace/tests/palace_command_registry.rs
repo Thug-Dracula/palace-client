@@ -80,18 +80,19 @@ fn the_implemented_commands_forward_their_operands_to_the_trait() {
     let mut host = adapter();
 
     assert!(
-        host.command("SAY", &[Value::str("hello")]).unwrap().is_empty(),
+        host.command("SAY", &[Value::str("hello")])
+            .unwrap()
+            .is_empty(),
         "SAY pushes nothing"
     );
     assert!(
-        host.command("CHAT", &[Value::str("again")]).unwrap().is_empty(),
+        host.command("CHAT", &[Value::str("again")])
+            .unwrap()
+            .is_empty(),
         "CHAT is the SAY arm"
     );
-    host.command(
-        "SAYAT",
-        &[Value::str("hi"), Value::Int(10), Value::Int(20)],
-    )
-    .unwrap();
+    host.command("SAYAT", &[Value::str("hi"), Value::Int(10), Value::Int(20)])
+        .unwrap();
     host.command("PRIVATEMSG", &[Value::str("psst"), Value::Int(7)])
         .unwrap();
     host.command("SETPOS", &[Value::Int(3), Value::Int(4)])
@@ -101,7 +102,11 @@ fn the_implemented_commands_forward_their_operands_to_the_trait() {
     let inner = host.inner;
     assert_eq!(
         inner.spoke,
-        vec!["hello".to_owned(), "again".to_owned(), "@10,20 hi".to_owned()],
+        vec![
+            "hello".to_owned(),
+            "again".to_owned(),
+            "@10,20 hi".to_owned()
+        ],
         "SAYAT formats the balloon position the way the reference does"
     );
     assert_eq!(inner.private, vec![(7, "psst".to_owned())]);
@@ -271,7 +276,10 @@ fn register_palace_commands_installs_every_name_and_is_idempotent() {
             .iter()
             .filter(|spec| !core.contains(spec.name))
             .count();
-    assert_eq!(added, expected, "added count must match the newly registered names");
+    assert_eq!(
+        added, expected,
+        "added count must match the newly registered names"
+    );
 
     assert_eq!(
         register_palace_commands(&mut set),

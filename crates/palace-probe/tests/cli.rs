@@ -454,7 +454,10 @@ fn json_session_emits_a_machine_readable_summary() {
     let text = stdout(&out);
     assert!(text.contains("\"byte_order\": \"little\""), "{text}");
     assert!(text.contains("\"user_id\": 4242"), "{text}");
-    assert!(text.contains("\"server_name\": \"Balamb Garden\""), "{text}");
+    assert!(
+        text.contains("\"server_name\": \"Balamb Garden\""),
+        "{text}"
+    );
     assert!(text.contains("\"server_version\": \"1.22\""), "{text}");
     assert!(text.contains("\"room_count\": 81"), "{text}");
     assert!(text.contains("\"user_count\": 2"), "{text}");
@@ -503,7 +506,10 @@ fn capture_writes_a_replayable_fixture_directory() {
     assert!(manifest.is_file(), "fixture manifest was not written");
     let manifest_text = std::fs::read_to_string(&manifest).expect("read manifest");
     assert!(manifest_text.contains("\"byte_order\": \"little\""));
-    assert!(manifest_text.contains("\"server\": \"127.0.0.1:"), "{manifest_text}");
+    assert!(
+        manifest_text.contains("\"server\": \"127.0.0.1:"),
+        "{manifest_text}"
+    );
 
     let frames = dir.0.join("frames");
     let count = std::fs::read_dir(&frames)
@@ -519,7 +525,7 @@ fn capture_writes_a_replayable_fixture_directory() {
 fn unanswered_list_requests_are_reported_as_timeouts() {
     let port = spawn_fake_server(ServerPlan::silent_lists());
     let out = Command::new(BIN)
-        .args(&args_with_hard(port, "0.3"))
+        .args(args_with_hard(port, "0.3"))
         .output()
         .expect("run probe");
     assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
@@ -533,7 +539,7 @@ fn unanswered_list_requests_are_reported_as_timeouts() {
 fn malformed_list_bodies_are_logged_without_aborting_the_run() {
     let port = spawn_fake_server(ServerPlan::malformed_lists());
     let out = Command::new(BIN)
-        .args(&session_args(port))
+        .args(session_args(port))
         .output()
         .expect("run probe");
     assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
@@ -553,7 +559,7 @@ fn malformed_list_bodies_are_logged_without_aborting_the_run() {
 fn a_slow_list_reply_is_still_awaited() {
     let port = spawn_fake_server(ServerPlan::delayed_lists());
     let out = Command::new(BIN)
-        .args(&args_with_hard(port, "3"))
+        .args(args_with_hard(port, "3"))
         .output()
         .expect("run probe");
     assert_eq!(code(&out), 0, "stderr:\n{}", stderr(&out));
@@ -568,7 +574,7 @@ fn a_slow_list_reply_is_still_awaited() {
 fn an_impossible_frame_length_is_a_clean_error() {
     let port = spawn_fake_server(ServerPlan::huge_length());
     let out = Command::new(BIN)
-        .args(&session_args(port))
+        .args(session_args(port))
         .output()
         .expect("run probe");
     assert_eq!(code(&out), 1, "stdout:\n{}", stdout(&out));

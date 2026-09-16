@@ -119,8 +119,16 @@ fn every_corpus_record_parses_cleanly() {
         with_warnings
     );
     eprintln!("multi-record files: {multi_record_files:?}");
-    assert!(failures.is_empty(), "corpus failures:\n{}", failures.join("\n"));
-    assert_eq!(records, files.len() + 5, "5 extra records come from 4 concatenated captures");
+    assert!(
+        failures.is_empty(),
+        "corpus failures:\n{}",
+        failures.join("\n")
+    );
+    assert_eq!(
+        records,
+        files.len() + 5,
+        "5 extra records come from 4 concatenated captures"
+    );
 }
 
 #[test]
@@ -143,6 +151,9 @@ fn the_concatenated_captures_split_into_the_expected_records() {
         let bytes = std::fs::read(&path).expect("payload must be readable");
         let decoded = decode_stream(&bytes, ByteOrder::Little);
         assert_eq!(decoded.len(), *count, "{name} record count");
-        assert!(decoded.iter().all(Result::is_ok), "{name} must decode cleanly");
+        assert!(
+            decoded.iter().all(Result::is_ok),
+            "{name} must decode cleanly"
+        );
     }
 }

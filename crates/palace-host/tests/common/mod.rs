@@ -140,7 +140,10 @@ pub fn populated_host() -> ScriptHost {
 pub fn effect_of(name: &str, args: &[Value]) -> Effect {
     let mut host = populated_host();
     let pushed = host.command(name, args).expect("command succeeds");
-    assert!(pushed.is_empty(), "{name} must push nothing, got {pushed:?}");
+    assert!(
+        pushed.is_empty(),
+        "{name} must push nothing, got {pushed:?}"
+    );
     let mut effects = host.take_effects();
     assert_eq!(effects.len(), 1, "{name} records one effect: {effects:?}");
     effects.pop().expect("one effect")

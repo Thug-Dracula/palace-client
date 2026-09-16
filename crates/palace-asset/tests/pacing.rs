@@ -50,7 +50,9 @@ fn forty_five_requests_flush_twenty_at_a_time_every_five_hundred_milliseconds() 
 
     let mut flushes: Vec<(u64, usize)> = Vec::new();
     for _ in 0..BATCH_ITERATION_LIMIT {
-        let Some(due) = pipeline.next_deadline() else { break };
+        let Some(due) = pipeline.next_deadline() else {
+            break;
+        };
         clock.set(due);
         let n = frame_count(&pipeline.poll(clock.now_ms()));
         if n > 0 {
@@ -86,7 +88,9 @@ fn no_flush_ever_carries_more_than_twenty_requests() {
     let mut worst = 0usize;
     let mut total = 0usize;
     for _ in 0..BATCH_ITERATION_LIMIT {
-        let Some(due) = pipeline.next_deadline() else { break };
+        let Some(due) = pipeline.next_deadline() else {
+            break;
+        };
         clock.set(due);
         let n = frame_count(&pipeline.poll(clock.now_ms()));
         worst = worst.max(n);
@@ -162,7 +166,9 @@ fn a_dead_server_does_not_hang_the_scheduler_forever() {
     let mut failed = 0;
     let mut sends = 0;
     for _ in 0..BATCH_ITERATION_LIMIT {
-        let Some(due) = pipeline.next_deadline() else { break };
+        let Some(due) = pipeline.next_deadline() else {
+            break;
+        };
         clock.set(due);
         for event in pipeline.poll(clock.now_ms()) {
             match event {
@@ -249,7 +255,9 @@ fn the_raw_scheduler_emits_the_same_cadence_as_the_pipeline() {
     }
     let mut batches: Vec<(u64, usize)> = Vec::new();
     for _ in 0..BATCH_ITERATION_LIMIT {
-        let Some(due) = scheduler.next_deadline() else { break };
+        let Some(due) = scheduler.next_deadline() else {
+            break;
+        };
         clock.set(due);
         for event in scheduler.poll(clock.now_ms()) {
             if let SchedulerEvent::Send { batch } = event {
@@ -273,17 +281,19 @@ fn a_retry_is_also_paced_and_never_lands_in_the_same_window_as_a_fresh_batch() {
     clock.set(50);
     assert_eq!(frame_count(&pipeline.poll(clock.now_ms())), 1);
     clock.set(50 + DEFAULT_REQUEST_TIMEOUT_MS);
-    assert!(pipeline.poll(clock.now_ms()).iter().all(|e| !matches!(
-        e,
-        PipelineEvent::Send { .. }
-    )));
+    assert!(pipeline
+        .poll(clock.now_ms())
+        .iter()
+        .all(|e| !matches!(e, PipelineEvent::Send { .. })));
 
     // A fresh request arriving now is not starved by the backed-off retry.
     let fresh_at = clock.now_ms();
     pipeline.request_prop(2, fresh_at);
     let mut flushes: Vec<(u64, usize)> = Vec::new();
     for _ in 0..BATCH_ITERATION_LIMIT {
-        let Some(due) = pipeline.next_deadline() else { break };
+        let Some(due) = pipeline.next_deadline() else {
+            break;
+        };
         clock.set(due);
         let n = frame_count(&pipeline.poll(clock.now_ms()));
         if n > 0 {
