@@ -6,9 +6,14 @@ live pserver, handshakes, logs on, and prints the decoded room and user lists.
 
 This is **milestone 0** of the Palace-compatible Tauri client
 (`~/palace-corpus/TAURI-CLIENT-SCOPE.md`). It deliberately contains **no GUI, no
-rendering, no prop decoding and no IPTSCRAE**. Its job is to prove the protocol
-layer and to capture a replayable fixture corpus that every later milestone
-tests against without a server.
+rendering and no IPTSCRAE**. Its job is to prove the protocol layer and to capture
+a replayable fixture corpus that every later milestone tests against without a
+server — that is what `palace-wire` and `palace-probe` do.
+
+`crates/palace-prop/` is the first later milestone to land here: the prop (sprite)
+codec, which is independent of the protocol layer and has its own README, fixtures
+and differential harness. The protocol crates do not depend on it and it does not
+depend on them.
 
 The only server in scope is `localhost:9998` (Balamb Garden).
 
@@ -79,12 +84,16 @@ SUMMARY rooms=81 users=2
 |---|---|
 | `crates/palace-wire/` | Protocol library: framing, `ByteOrder` plumbing, opcode table, message codecs, fixture format. No I/O, no UI. |
 | `crates/palace-probe/` | The binary: TCP session, CLI, capture. |
+| `crates/palace-prop/` | Prop (sprite) codec: 8/16/20/S20/32-bit decoders, S20 encoder, M&M palette, asset CRC. Validated over 227,874 real props. See its README for the format spec. |
 | `fixtures/logon-run1/` | A real captured session (raw bytes + decoded manifest). |
 | `tools/diff_walker.py` | Differential check against `~/palace-corpus/tools/palace_walker.py`. |
+| `tools/oracle_prop.py`, `tools/diff_corpus.py`, `tools/gen_palette.py`, `tools/diff_prerendered.py` | The prop codec's independent oracles, differential runner and palette verifier. |
 
 Dependency policy: `palace-wire` depends only on `serde_json` (for the fixture
 manifest). The protocol core is std-only. `palace-probe` adds nothing but
-`palace-wire`.
+`palace-wire`. `palace-prop` depends on `flate2` (zlib) and `png` (debug output
+only) and deliberately **not** on `palace-wire` — props are a self-contained binary
+format that has nothing to do with the wire protocol.
 
 ---
 

@@ -11,3 +11,7 @@
 .vscode/
 .idea/
 *.swp
+
+# Python bytecode from the prop-codec oracles
+__pycache__/
+*.pyc

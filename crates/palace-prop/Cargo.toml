@@ -1,0 +1,15 @@
+[package]
+name = "palace-prop"
+description = "Palace prop codec: 8/16/20/S20/32-bit sprite decoders, S20 encoder, M&M palette and the asset CRC."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# zlib wrapping only — the codecs themselves are hand-written.
+flate2 = { workspace = true }
+# PNG output exists purely for eyeballing a decoded prop; it is never used to
+# parse one.
+png = { workspace = true }
