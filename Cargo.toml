@@ -8,6 +8,8 @@ members = [
     "crates/palace-probe",
     "crates/palace-render",
     "crates/palace-client",
+    "crates/iptscrae",
+    "crates/iptscrae-palace",
     "src-tauri",
 ]
 
@@ -26,6 +28,8 @@ palace-prop = { path = "crates/palace-prop" }
 palace-asset = { path = "crates/palace-asset" }
 palace-render = { path = "crates/palace-render" }
 palace-client = { path = "crates/palace-client" }
+iptscrae = { path = "crates/iptscrae" }
+iptscrae-palace = { path = "crates/iptscrae-palace" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
