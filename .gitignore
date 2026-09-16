@@ -3,6 +3,16 @@
 **/*.rs.bk
 **/*.profraw
 
+# Tauri generated schema (regenerated on every build)
+/src-tauri/gen/schemas
+
+# Frontend (SvelteKit + Vite + Bun)
+/node_modules/
+/build/
+/.svelte-kit/
+/vite.config.js.timestamp-*
+/vite.config.ts.timestamp-*
+
 # Local scratch
 /scratch/
 *.tmp

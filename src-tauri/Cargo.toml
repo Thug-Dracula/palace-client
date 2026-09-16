@@ -1,0 +1,27 @@
+[package]
+name = "palace-app"
+description = "Palace desktop client: the Tauri shell that presents composited frames and drives the headless runtime."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin name (Windows).
+name = "palace_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "palace-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["test"] }
+palace-client = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]

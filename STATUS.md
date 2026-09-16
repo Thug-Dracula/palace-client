@@ -1,7 +1,7 @@
 # Status / handoff — Palace Tauri client
 
-**Last updated:** 2026-09-16
-**Scope, decisions and design:** `$CORPUS/TAURI-CLIENT-SCOPE.md` ← read that too. It is the design authority; this file is only "where things stand right now".
+**Last updated:** 2026-09-16 (interactive client milestone)
+**Scope, decisions and design:** `$CORPUS/TAURI-CLIENT-SCOPE.md` ← read that too. It is the design authority; this file is only "where things stand right now". (Left untouched per the read-only rule for `$CORPUS/`.)
 
 This file exists so a **fresh session** can resume without carrying a long conversation.
 
@@ -9,66 +9,205 @@ This file exists so a **fresh session** can resume without carrying a long conve
 
 ## Where the code is
 
-`$REPO` — git repo, branch `master`, working tree clean.
-**372 tests passing, clippy clean.**
+Milestone branch: **`feat/palace-ui`**, developed in the worktree
+`$REPO-ui` (added with
+`git -C $REPO worktree add $REPO-ui -b feat/palace-ui`).
+The main checkout `$REPO` is untouched.
 
-All six crates are built, merged and independently verified:
+**397 tests passing, clippy clean, `cargo check` clean, `svelte-check` clean.**
+
+### The six original crates (unchanged contracts)
 
 | Crate | State | Evidence |
 |---|---|---|
-| `palace-wire` | ✅ done | framing, `ByteOrder`, 75-opcode table, codecs |
-| `palace-probe` | ✅ done | live logon; **81 rooms / 2 users**; matched `palace_walker.py` exactly |
-| `palace-room` | ✅ done | **804/804** corpus records parse clean, 0 warnings, 0 panics |
-| `palace-prop` | ✅ done | 5 decoders + S20 encoder; **3,000-prop differential = 0 disagreements**; 8-bit parity 2989/2989 vs `prop_decoder.py` |
-| `palace-asset` | ✅ merged | `qAst`/`sAst`/`rAst`, paced scheduler, media HTTP; validated against **327 real captured `sAst` frames** |
-| `palace-render` | ✅ merged | composites rooms → PNG; coordinate mapping round-trip tested across 5 rooms × 10 viewports × 6 zooms × 5 DPRs |
+| `palace-wire` | ✅ done | framing, `ByteOrder`, 75-opcode table, codecs. **`navr_frame` fixed** (see below). |
+| `palace-probe` | ✅ done | live logon; 81 rooms / 2 users. |
+| `palace-room` | ✅ done | 804/804 corpus records parse clean. |
+| `palace-prop` | ✅ done | 5 decoders + S20 encoder; 3,000-prop differential = 0 disagreements. |
+| `palace-asset` | ✅ done | `qAst`/`sAst`/`rAst`, paced scheduler, media HTTP. |
+| `palace-render` | ✅ done | composites rooms → PNG; coordinate mapping round-trip tested. |
 
-The protocol layer, both binary codecs, the asset layer and the compositor all exist and are validated against real corpus data. **The hardest technical risk is behind us.**
+### What this milestone added
 
----
-
-## You can look at it right now
-
-`$REPO/renders/` — 8 real rooms composited from the corpus, each with a `.report.txt`:
-
-- `901-balamb-garden.png` — Balamb Garden entrance (real backdrop + overlay)
-- `1672-ludo-ii-props-avatars.png` — real loose props + real avatars
-- `167-avatar-editor.png` — a **1280×720** room (room size is *not* fixed at 512×384)
-- `1672-ludo-ii-dpr2.png` — 2048×1280 buffer at DPR 2
-- `1021-rpg-loading.png` (exact 512×384 floor), `90-template-room.png`, `7022-okas-magic-bar.png`
-
-`renders/regenerate.sh` rebuilds them all.
-
-**These have not been checked by a human yet.** Visual correctness — does a Palace room *look* right? — is the one thing automated verification cannot confirm. Worth eyeballing before building on top of it.
+| Path | What |
+|---|---|
+| `crates/palace-client/` | **Headless runtime.** Connection supervisor thread (socket + `palace-asset` pipeline + `SceneBuilder`), a media HTTP worker thread, session state machine, frame store. Emits `ClientEvent`s; no Tauri types. |
+| `src-tauri/` (`palace-app`) | **Tauri v2 shell.** Commands, the `palace://` URI scheme that serves the frame as PNG, and a pump that forwards runtime events to the webview. |
+| `src/` | **SvelteKit 5 frontend** (Vite, adapter-static, Bun). Room viewport, room list, user list, chat, status bar, connect form. |
+| `crates/palace-client/src/bin/live-smoke.rs` | Live smoke harness (`cargo run -p palace-client --bin live-smoke`). Also sweeps viewports/zoom/1:1. |
 
 ---
 
-## NEXT TASK — wire it together, then put a window on it
+## How the pieces fit
 
-1. **Integrate.** These crates are proven independently but are not yet composed into one runtime. Build a `palace-client` crate that owns the connection (`palace-wire` FSM + `palace-asset`) and drives `palace-room` → `palace-prop` → `palace-render`.
-2. **Tauri shell.** New binary crate. Present composited frames via `register_asynchronous_uri_scheme_protocol`; HTML overlay for labels/hotspots/selection. Base the project shape on `$HOME/ProgramFiles/chiptune-player` (Tauri 2 + SvelteKit 5 + Vite).
-   - **Never return `Vec<u8>` from a Tauri command** — it arrives as a JSON number array (measured 22.5 MB for a 6.3 MB image). All blobs go through the custom protocol.
-   - WebGL on WebKitGTK can silently fall back to a software rasterizer with no detectable signal. The Rust compositor already avoids this — keep it that way, and test on real hardware early.
-3. Then: **IPTSCRAE** (fresh Rust VM — see scope doc; the reference interpreter is Angular-coupled and cannot be embedded), interaction completeness, hardening.
+```text
+TcpStream ─► Connection (palace-wire framing)
+                │  frames
+                ├─► SessionState::apply ──► ClientEvent (status/banner/rooms/users/chat/screen)
+                ├─► AssetPipeline (palace-asset) ──► prop blobs ──► SceneBuilder.props_mut()
+                └─► media worker thread (blocking ureq) ──► files ──► SceneBuilder.media_mut()
+                                        │
+                                   compose(): SceneBuilder.build_with → render() → Canvas::to_png_bytes()
+                                        │
+                                   FrameStore (Arc<Mutex<latest PNG + version>>)
+                                        │
+             Tauri: palace://localhost/frame?v=N ──► <img> in the webview (one bitmap)
+```
+
+* **Frame delivery**: `register_asynchronous_uri_scheme_protocol("palace", …)`,
+  answered on a worker thread, `Content-Type: image/png`, `Cache-Control: no-store`.
+  The frontend points an `<img>` at `palace://localhost/frame?v=<version>`.
+  **No `Vec<u8>` ever crosses a Tauri command** — commands only carry small JSON.
+* **Threading**: the connection/render loop and the media fetch are plain blocking
+  threads; the event pump is a `tauri::async_runtime` task. No command handler
+  blocks the UI thread.
+* **Presentation**: the frontend never computes a scale. `ViewGeometry` (built from
+  `palace-render`'s tested `ViewTransform`) reports `content_x/y/w/h`, and the
+  frontend applies it with `image-rendering: pixelated`. Resizing reports the new
+  viewport via `set_viewport`; a self-healing effect re-reports if the runtime's
+  geometry disagrees with the measured element.
+
+### palace-render extensions (additive, tested)
+
+* `Canvas::to_png_bytes()` — in-memory twin of `write_png`, for the URI scheme.
+* `PropStore::insert_blob(id, blob)` — insert a prop received over the wire.
+* `MediaStore::insert_path(name, path)` — register a file fetched after indexing.
+* `SceneBuilder::media_mut()` / `props_mut()` — let a live client fill the stores.
+* `PropBackend::Memory` — an in-memory prop source.
+
+All additions; no existing behaviour changed. The 372 original tests still pass.
 
 ---
 
-## Honest gaps
+## Bug found and fixed: `palace-wire::navr_frame`
 
-- **Multi-block asset transfer is reference-derived only** — no real multi-block capture exists anywhere in the corpus.
-- **16-bit props have zero real samples** — implemented from reference + synthetic tests, medium confidence.
-- **All 155 loose-prop IDs** in the 799-room corpus are missing from local stores, so corpus rooms only ever draw placeholders. Real prop art was demonstrated with IDs taken from `pserver.prp`.
-- `pserver_full.prp` is systematically corrupt (see scope doc's Verified findings).
-- **Draw commands, name tags and chat text are not rasterized** (0 of 799 rooms use draw commands).
-- Avatar anchor offset is `x−22, y−22`; one reference uses −21. Flagged as a 1 px ambiguity.
-- **Web panes with transparency/layering remain the highest-risk unbuilt feature** — possibly infeasible. PalaceChat itself hasn't achieved it on Linux. Plan to cut it.
+`navr_frame` built a **6-byte body** `[u32 2][u16 room_id]`, putting the length
+constant *inside* the payload. Both reference encoders write that `2` as the frame
+**length field**:
+
+* `$CORPUS/tools/palace_walker.py::make_navr` →
+  `struct.pack("<III", GOTO_ROOM, 2, refid) + struct.pack("<H", room_id)`
+* OpenPalace `actuallyGotoRoom` →
+  `writeInt(GOTO_ROOM); writeInt(2); writeInt(id); writeShort(roomId)`
+
+The old form made the server read destination room **2**, so navigation silently
+did nothing (observed live: the room never changed). Fixed to a 2-byte payload;
+`crates/palace-wire/tests/navr_encoding.rs` pins the exact wire bytes. Room
+switching now works live (`901 Balamb Garden → 817 Balamb Hotel`).
+
+## Gap filled: `xtlk` / `xwis` decryption
+
+`palace-wire` decodes plaintext `talk`/`whis` but has **no** cipher for the
+encrypted variants, so they degraded to `Message::Unknown`. The runtime now
+implements the Park–Miller Lehmer keystream (seed `0xa2c2a`, 512-byte table,
+reverse iteration, two table bytes per char) in `crates/palace-client/src/xtlk.rs`,
+ported from `QPalace`'s `QPCodec` and OpenPalace's `PalaceEncryption`. The LUT
+prefix is asserted against independently computed values and the round trip is
+tested. Outgoing chat still uses plaintext `talk` (the server relays it).
 
 ---
+
+## What is verified, and how
+
+**Hermetic (no network), `cargo test --workspace` — 397 pass:**
+
+* `crates/palace-client/tests/fixture_replay.rs` replays every server frame of
+  `fixtures/logon-run1/` through `SessionState` and asserts 81 rooms, Balamb
+  Garden #901, `sqoom23.gif`, 6 hotspots, 1 overlay, server v1.22, media base.
+* `xtlk` round-trip + LUT prefix + payload framing; synthetic plaintext/encrypted
+  talk, ping→pong, malformed-body tolerance, unknown-opcode silence.
+* `ViewGeometry::compute` across fit/1:1/zoom/non-4:3/DPR-clamp.
+* `navr` wire bytes; `Settings::with_args` CLI parsing.
+
+**Live (against `localhost:9998`, Balamb Garden), via the app and via
+`live-smoke`:**
+
+* Window shows a real composited room; media fetched live over HTTPS from the
+  server's advertised media base (`sqoom23.gif`, `notebar.gif`, then `balent.gif`,
+  `bent1..3.gif` for room 817).
+* Room switching works (`goto_room`), room list populates (81 rooms with real
+  names), user list shows the logged-on user with a face colour.
+* Chat round-trips: `live-smoke ping` came back as a `talk` from the server.
+* Viewport sweep (through the same `set_viewport` command the UI uses):
+
+  | vp | dpr | zoom | mode | scale | content | offset | buffer |
+  |---|---|---|---|---|---|---|---|
+  | 960×540 | 1 | 1.0 | fit | 1.4062 | 720×540 | (120,0) | 512×384 |
+  | 960×540 | 1 | 0.5 | fit | 0.7031 | 360×270 | (300,135) | 512×384 |
+  | 960×540 | 1 | 3.0 | fit | 4.2188 | 2160×1620 | (−600,−540) | 512×384 |
+  | 960×540 | 1 | — | **1:1** | **1.0000** | 512×384 | (224,78) | 512×384 |
+  | 640×480 | 2 | 1.0 | fit | 1.2500 | 640×480 | (0,0) | **1024×768** |
+  | 1920×1080 | 2 | 2.0 | fit | 5.6250 | 2880×2160 | (−480,−540) | 1024×768 |
+
+  Every value matches the independently tested `ViewTransform`.
+
+* Visual: screenshots at `/tmp/work/palace-crop2.png` (Balamb Garden live in
+  the window, room list 81/81, "Member 21 (you)", status bar
+  `connected · Balamb Garden · v1.22 · endian little · frame #4`) and
+  `/tmp/work/palace-room901.png`, `palace-room817.png` (headless composites).
+
+## Not verified / rough edges
+
+* **The last visual pass (zoom/1:1/resize screenshots) was done through the
+  runtime command path, not a mouse drag.** The session's screen locked from
+  inactivity partway through QA and unlocking needs the user's password, so the
+  final zoom/1:1/resize evidence is the numeric sweep above plus unit tests.
+  Everything is wired to the same `set_viewport` command, but a human should
+  still click the slider once.
+* **Avatars are not drawn yet.** On Balamb Garden the logged-on user arrives with
+  `props=0`, so there is nothing to draw; the renderer hides avatars whose prop
+  art has not arrived rather than littering the room with magenta placeholders.
+  Prop art for other users would need successful asset transfer (untested live —
+  no other users were online).
+* **Server churn during QA.** Repeated connections from one host in quick
+  succession made the server send `bye` (len 4, ref = the *previous* session's
+  user id, i.e. a server-side logoff notice) and close. The client
+  auto-reconnects with backoff and now **restores the room the user was in**
+  (`Shared::last_room`). A single normal session is unaffected; the first smoke
+  runs ran 22 s cleanly.
+* **No IPTSCRAE, hotspot clicks, sounds, drawing, deco, prop editing, web panes,
+  theming** — all explicitly out of scope for this milestone.
+* `Message::Logoff` still prints a diagnostic transcript line rather than being
+  interpreted; see the note above.
+* Name tags and chat text are not rasterized into the frame (presentation-layer
+  font work, as the renderer documents).
+
+## Known pre-existing gaps (carried over)
+
+* Multi-block asset transfer: reference-derived only, no real capture exists.
+* 16-bit props: zero real samples.
+* All 155 loose-prop IDs in the local corpus are missing from local stores.
+* `pserver_full.prp` is systematically corrupt.
+* Draw commands / name tags / chat text are not rasterized.
+* Avatar anchor offset `x−22, y−22`; one reference uses −21 (1 px ambiguity).
+
+## Running it
+
+```bash
+cd $REPO-ui
+bun install
+bun run check && bun run build          # frontend
+cargo test --workspace                  # 397 tests, no network
+bun run tauri dev                       # window; auto-connects to localhost:9998
+
+# headless live checks
+cargo run -p palace-client --bin live-smoke                                  # connect + render
+PALACE_SMOKE_ROOM=817 cargo run -p palace-client --bin live-smoke            # room switch
+PALACE_SMOKE_VIEWPORTS=1 cargo run -p palace-client --bin live-smoke         # zoom/1:1/resize
+PALACE_DEBUG_FRAMES=1 cargo run -p palace-client --bin live-smoke            # raw frame trace
+```
+
+Defaults: `localhost:9998`, user `Guest`. Override with `--host/--port/--user`
+or `PALACE_HOST`/`PALACE_PORT`/`PALACE_USER`. `PALACE_SEED_MEDIA` /
+`PALACE_SEED_PROPS` add read-only local fallback roots (colon-separated).
 
 ## Operational rules that have been earning their keep
 
-- **Delegate one milestone per agent, in its own git worktree.** Parallel tracks only when they touch disjoint crates. Merge conflicts land in `Cargo.toml` / `Cargo.lock` / `README.md` — resolve as union, and **never blanket `git add -A` during a conflicted merge** (that once committed conflict markers into `README.md`).
-- **ALWAYS re-run the agent's own verification command before merging.** This has caught or confirmed five real findings: a wrong padding formula, Taj's bad dither, an incorrect "8-bit is zlib" assumption (also wrong in `PRP-FORMAT.md`), a double-counted avatar anchor, and a stale todo.
-- **Never read the research dumps** in `~/.local/share/agent-runner/tool-output/` — they're distilled into the scope doc. Reference file *paths*, never paste contents.
-- **`$CORPUS/` is read-only reference.** Do not edit it; beware Python tools writing `__pycache__` there.
-- Update `$CORPUS/TAURI-CLIENT-SCOPE.md` at the end of each milestone.
+* **Delegate one milestone per agent, in its own git worktree.** Never blanket
+  `git add -A` during a conflicted merge.
+* **ALWAYS re-run the agent's own verification command before merging.**
+* **Never read the research dumps** in `~/.local/share/agent-runner/tool-output/`.
+* **`$CORPUS/` is read-only reference.** Do not edit it.
+* WebKitGTK: the Rust compositor keeps the webview's job to one bitmap, which is
+  what makes this milestone possible without WebGL. `WEBKIT_DISABLE_COMPOSITING_MODE=1`
+  was **not** needed here.

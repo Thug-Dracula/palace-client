@@ -1,0 +1,22 @@
+[package]
+name = "palace-client"
+description = "Headless Palace client runtime: connection FSM, session state, asset intake and frame production."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+palace-wire = { workspace = true }
+palace-room = { workspace = true }
+palace-prop = { workspace = true }
+palace-asset = { workspace = true }
+palace-render = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+# Frame encoding: the compositor hands us RGBA; the wire-facing frame cache is PNG.
+png = { workspace = true }
+
+[dev-dependencies]

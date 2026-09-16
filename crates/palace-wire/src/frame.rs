@@ -223,12 +223,13 @@ pub fn read_handshake<R: Read>(source: &mut R) -> Result<Handshake> {
 
 /// Convenience: build a `MSG_ROOMGOTO` (`navR`) frame requesting `room_id`.
 ///
-/// Layout is `[u32 2][u16 room_id]`; the leading `2` is a protocol constant
-/// present in every implementation we cross-checked (walker's `make_navr`,
-/// OpenPalace, QPalace, pserver). `refNum` is carried in the frame header.
+/// Payload is exactly the 16-bit room id; the header length field is `2`. Both
+/// `palace_walker.py::make_navr` and OpenPalace's `actuallyGotoRoom` write that
+/// `2` as the frame length, not as body bytes — a body of `[u32 2][u16 room]`
+/// (the previous form) makes the server navigate to room 2. Pinned by
+/// `tests/navr_encoding.rs`.
 pub fn navr_frame(room_id: u16, ref_num: i32, order: ByteOrder) -> Frame {
-    let mut w = Writer::with_capacity(order, 6);
-    w.write_u32(2);
+    let mut w = Writer::with_capacity(order, 2);
     w.write_u16(room_id);
     Frame::new(crate::opcode::ROOMGOTO, ref_num, w.into_vec())
 }
