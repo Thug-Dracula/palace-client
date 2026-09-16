@@ -1,0 +1,11 @@
+[package]
+name = "iptscrae-palace"
+description = "Palace command surface for the iptscrae VM: the host capability trait Palace commands are written against."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+iptscrae = { workspace = true }
