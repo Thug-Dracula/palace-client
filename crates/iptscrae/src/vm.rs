@@ -57,6 +57,18 @@ impl Execution {
     }
 }
 
+/// What one activation did, including variables read back afterwards.
+///
+/// See [`Engine::run_handler_capture`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Captured {
+    /// Instructions retired by this activation.
+    pub steps: u64,
+    /// One entry per name requested, in the order asked. `None` when the
+    /// activation never wrote the name.
+    pub captured: Vec<Option<Value>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Cond,
@@ -158,6 +170,23 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
     /// Consume the VM and return the stack, bottom-first.
     pub fn into_stack(self) -> Vec<Value> {
         self.stack.into_items()
+    }
+
+    /// The current value of a variable in this activation's local scope.
+    ///
+    /// Names are matched case-insensitively. `None` means the activation never
+    /// touched the name (or read it while it was still unset). Used to read back
+    /// a variable a host seeded through [`Host::initial_variables`] and the
+    /// script then rewrote — `CHATSTR` is the canonical case.
+    ///
+    /// [`Host::initial_variables`]: crate::host::Host::initial_variables
+    #[must_use]
+    pub fn local_value(&self, name: &str) -> Option<Value> {
+        let upper = name.to_ascii_uppercase();
+        self.locals
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(&upper))
+            .and_then(|(_, slot)| slot.value.clone())
     }
 
     /// Replace every variable reference on the stack with its current value.
@@ -1205,6 +1234,36 @@ impl<H: Host> Engine<H> {
         self.run_handler_resolved(&chunk)
     }
 
+    /// Run one handler and read back the named local variables afterwards.
+    ///
+    /// This is how a host observes a variable a script rewrote during the
+    /// activation — `ON OUTCHAT { "" CHATSTR = }` clears the outgoing chat text
+    /// by assigning to `CHATSTR`, which the host seeded through
+    /// [`Host::initial_variables`].
+    ///
+    /// [`Host::initial_variables`]: crate::host::Host::initial_variables
+    pub fn run_handler_capture(
+        &mut self,
+        chunk: &Chunk,
+        spot: i64,
+        capture: &[&str],
+    ) -> Result<Captured> {
+        let Engine {
+            host,
+            globals,
+            commands,
+            limits,
+        } = self;
+        let mut vm = Vm::new(host, globals, commands, *limits);
+        vm.set_spot(spot);
+        let steps = {
+            let execution = vm.run_chunk(chunk)?;
+            execution.steps
+        };
+        let captured = capture.iter().map(|name| vm.local_value(name)).collect();
+        Ok(Captured { steps, captured })
+    }
+
     /// Run one handler and return its final stack with variables resolved.
     pub fn run_handler_resolved(&mut self, chunk: &Chunk) -> Result<Vec<Value>> {
         let Engine {
@@ -1543,5 +1602,31 @@ mod tests {
     #[test]
     fn global_promotes_an_existing_local_value() {
         assert_eq!(int("9 x = x GLOBAL x"), 9);
+    }
+
+    #[test]
+    fn a_captured_local_reports_what_the_handler_wrote() {
+        let mut engine = Engine::new(NullHost);
+        let chunk =
+            parse_body("\"!\" CHATSTR =", &engine.commands, &engine.limits).expect("parses");
+        let captured = engine
+            .run_handler_capture(&chunk, 0, &["CHATSTR"])
+            .expect("runs");
+        assert_eq!(
+            captured.captured,
+            vec![Some(Value::str("!"))],
+            "the handler read and rewrote CHATSTR"
+        );
+        assert!(captured.steps > 0);
+    }
+
+    #[test]
+    fn a_captured_local_is_none_when_the_handler_never_wrote_it() {
+        let mut engine = Engine::new(NullHost);
+        let chunk = parse_body("1 2 +", &engine.commands, &engine.limits).expect("parses");
+        let captured = engine
+            .run_handler_capture(&chunk, 0, &["CHATSTR", "OTHER"])
+            .expect("runs");
+        assert_eq!(captured.captured, vec![None, None]);
     }
 }
