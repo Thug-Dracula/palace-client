@@ -1,0 +1,20 @@
+media roots indexed 7746 names, prop store holds 180665 ids
+room 7022 "[Oka's Magic Bar]" artist ""
+logical size 1200x720 (background 1200x720), dpr 1
+overlays 0 / 0 / 0 / 0 | loose props 15 | avatars 0
+report: prop 2708727655 missing; drew placeholder
+report: prop 899391823 missing; drew placeholder
+report: prop 3231840653 missing; drew placeholder
+report: prop 3793140373 missing; drew placeholder
+report: prop 2227836346 missing; drew placeholder
+report: prop 2069860001 missing; drew placeholder
+report: prop 4293755829 missing; drew placeholder
+report: prop 2942728001 missing; drew placeholder
+report: prop 3183703306 missing; drew placeholder
+report: prop 2573177231 missing; drew placeholder
+report: prop 2573177231 missing; drew placeholder
+report: prop 2987563748 missing; drew placeholder
+report: prop 3877153787 missing; drew placeholder
+report: prop 937679442 missing; drew placeholder
+report: prop 937679442 missing; drew placeholder
+wrote $HOME/palace-client-render/renders/7022-okas-magic-bar.png (1200x720 device px, dpr 1)

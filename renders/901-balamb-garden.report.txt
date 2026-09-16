@@ -1,0 +1,5 @@
+media roots indexed 7746 names, prop store holds 180665 ids
+room 901 "Balamb Garden" artist "Psycrow"
+logical size 512x384 (background 512x384), dpr 1
+overlays 1 / 0 / 0 / 0 | loose props 0 | avatars 0
+wrote $HOME/palace-client-render/renders/901-balamb-garden.png (512x384 device px, dpr 1)

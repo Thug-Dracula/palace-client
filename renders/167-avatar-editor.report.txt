@@ -1,0 +1,5 @@
+media roots indexed 7746 names, prop store holds 180665 ids
+room 167 "   + Avatar-Editor" artist ""
+logical size 1280x720 (background 1280x720), dpr 1
+overlays 1 / 0 / 0 / 0 | loose props 0 | avatars 0
+wrote $HOME/palace-client-render/renders/167-avatar-editor.png (1280x720 device px, dpr 1)
