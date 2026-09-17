@@ -595,9 +595,36 @@ is the signature of this bug: name-gated logic works, prop-gated logic cannot.
 - [ ] Decide whether `ASSET_REGI` (uploading the art) is required for the server to accept a worn
   prop, or whether `USER_PROP` alone suffices.
 
-### 2.17 The Colosseum "you get kicked out" bounce is the room working as designed
+### 2.17 The Colosseum "you get sent out" bounce is the prop bug — CORRECTED
 
-The audience rooms carry a capacity guard:
+An earlier version of this section blamed a capacity guard (`NBRROOMUSERS 19 >`). **That was wrong.**
+The user pointed out the server had a single user on it, so that guard could not have fired. The real
+cause is in the arena rooms' `ON ENTER`:
+
+```text
+{ "wrongo.wav" SOUND } IPTVERSION 1 == IF
+"You are being sent out." LOCALMSG
+31743 GOTOROOM
+... 976933367 HASPROP NOT   NBRUSERPROPS 1 == NOT   OR IF
+```
+
+Read as: **if the user is not wearing prop `976933367`, or does not have exactly one prop, eject them
+to room 31743** with "You are being sent out." and `wrongo.wav`. That matches the observed
+`SOUND "wrongo.wav"` + `GOTOROOM 31743` alongside `ON ENTER` exactly.
+
+`976933367` is the pass prop: it appears **719 times** in the room scripts, and rooms hand it out on the
+way in with `[ 976933367 ] SETPROPS` immediately before teleporting you:
+
+```text
+rooms2/003.scr.txt:95:  ON SELECT { [ 976933367 ] SETPROPS  ME DEST GOTOROOM }
+```
+
+So the sequence is: the room tells us to wear the pass prop and sends us in, **and then ejects us for
+not wearing it** — because `SETPROPS` only mutates our local state and never reaches the server (§2.16),
+so the server-side `HASPROP` is false. This is the same root cause as the Audience button, and one fix
+addresses both.
+
+The capacity guard is real but was not what fired:
 
 ```text
 { "@512 0Too many audience members; space needed for players!"
@@ -605,13 +632,9 @@ The audience rooms carry a capacity guard:
 NBRROOMUSERS 19 > IF
 ```
 
-Over 19 users (17 for non-wizards) they announce the message, play `wrongo.wav` and teleport you to
-**room 31743, the Colosseum menu**. That is exactly the observed `GOTOROOM 31743` + `SOUND "wrongo.wav"`
-and the "boots me out to the menu" symptom: the audience was full. `LOCALMSG` does reach the user —
-the runtime renders it as a `System` chat line (`runtime.rs:1612`) — so the ejection is explained in
-chat, not silent.
-
-Do not "fix" this by suppressing the teleport.
+Do not "fix" either by suppressing the teleport. `LOCALMSG` does reach the user — the runtime renders it
+as a `System` chat line (`runtime.rs:1612`) — so the user sees which of the two messages fired, which
+distinguishes them.
 
 ### 2.18 Media comes from seeded directories, not (only) from fetching
 
