@@ -54,21 +54,62 @@ pub struct ClientConfig {
 
 impl Default for ClientConfig {
     fn default() -> Self {
-        let cache_root = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("palace-client");
         ClientConfig {
             host: "localhost".to_string(),
             port: 9998,
             username: "Guest".to_string(),
             desired_room: 0,
-            cache_root,
+            cache_root: default_cache_root(),
             seed_media: Vec::new(),
             seed_props: Vec::new(),
         }
     }
+}
+
+/// Where fetched media and props are cached when nothing overrides it.
+///
+/// The candidates are passed in rather than read, so the Windows rung is
+/// testable from Linux — a Windows-only `cfg` would leave the precedence
+/// unverified on the machine this is developed on.
+fn cache_root_from(
+    xdg_cache_home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temp: PathBuf,
+) -> PathBuf {
+    xdg_cache_home
+        .or(local_app_data)
+        .or_else(|| home.map(|h| h.join(".cache")))
+        .unwrap_or(temp)
+        .join("palace-client")
+}
+
+/// `XDG_CACHE_HOME`, then `LOCALAPPDATA`, then `HOME/.cache`, then the temp dir.
+///
+/// `XDG_CACHE_HOME` and `HOME` are Unix conventions that Windows does not set, so
+/// without the `LOCALAPPDATA` rung this fell through to `/tmp` — which on Windows
+/// resolves to `C:\tmp`, a directory at the root of the current drive.
+fn default_cache_root() -> PathBuf {
+    cache_root_from(
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::temp_dir(),
+    )
+}
+
+/// The per-server directory name under the cache root.
+///
+/// `host:port` reads well but cannot name a Windows directory, so it is escaped:
+/// `localhost:9998` becomes `localhost%3A9998`. Escaping instead of replacing
+/// keeps distinct hosts distinct, and an IPv6 host carries colons of its own, so
+/// this is not only about separating the port.
+fn session_dir_name(host: &str, port: u16) -> String {
+    palace_asset::escape_name_component(&format!("{host}:{port}"))
+}
+
+fn session_cache_dir(cfg: &ClientConfig) -> PathBuf {
+    cfg.cache_root.join(session_dir_name(&cfg.host, cfg.port))
 }
 
 /// What the UI can ask the runtime to do.
@@ -473,7 +514,7 @@ fn run_session(
     cmd_rx: &mut UnboundedReceiver<ClientCommand>,
 ) -> Result<bool> {
     let cfg = &shared.cfg;
-    let session_root = cfg.cache_root.join(format!("{}:{}", cfg.host, cfg.port));
+    let session_root = session_cache_dir(cfg);
     let mut workspace = AssetWorkspace::new(&session_root)?;
 
     let (media_tx, media_rx) = mpsc::channel::<MediaJob>();
@@ -1912,6 +1953,64 @@ fn set_pic_opacity(state: &mut SessionState, spot: i32, index: i32, opacity: f64
 mod tests {
     use super::*;
     use palace_wire::byteorder::ByteOrder;
+
+    #[test]
+    fn a_session_cache_directory_is_legal_on_windows() {
+        let cfg = ClientConfig {
+            host: "localhost".to_string(),
+            port: 9998,
+            cache_root: PathBuf::from("cache"),
+            ..ClientConfig::default()
+        };
+        let dir = session_cache_dir(&cfg);
+        for component in dir.components() {
+            let text = component.as_os_str().to_string_lossy();
+            for bad in [':', '*', '?', '"', '<', '>', '|'] {
+                assert!(
+                    !text.contains(bad),
+                    "{bad:?} cannot appear in a Windows filename, but {component:?} has it"
+                );
+            }
+        }
+        assert!(
+            dir.ends_with("localhost%3A9998"),
+            "the port separator must be escaped, not literal: {dir:?}"
+        );
+        assert_eq!(
+            session_dir_name("::1", 9998),
+            "%3A%3A1%3A9998",
+            "an IPv6 host carries colons of its own, not only the port separator"
+        );
+    }
+
+    #[test]
+    fn the_cache_root_prefers_the_directory_each_platform_sets() {
+        let temp = PathBuf::from("temp-fallback");
+        let local = PathBuf::from("C:/Users/x/AppData/Local");
+        assert_eq!(
+            cache_root_from(None, Some(local.clone()), None, temp.clone()),
+            local.join("palace-client"),
+            "Windows sets LOCALAPPDATA and neither of the Unix variables"
+        );
+
+        let xdg = PathBuf::from("/xdg");
+        assert_eq!(
+            cache_root_from(Some(xdg.clone()), Some(local), None, temp.clone()),
+            xdg.join("palace-client"),
+            "an explicit XDG_CACHE_HOME wins over the platform default"
+        );
+
+        let home = PathBuf::from("home");
+        assert_eq!(
+            cache_root_from(None, None, Some(home.clone()), temp.clone()),
+            home.join(".cache").join("palace-client")
+        );
+        assert_eq!(
+            cache_root_from(None, None, None, temp.clone()),
+            temp.join("palace-client"),
+            "the temp dir is the last resort, not a hardcoded /tmp"
+        );
+    }
 
     fn user(id: i32, props: Vec<u32>) -> UserInfo {
         UserInfo {
