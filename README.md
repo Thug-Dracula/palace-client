@@ -100,10 +100,12 @@ how badly they hide:
 Alongside those, these subsystems are missing or incomplete:
 
 - **Audio.** Nothing plays.
-- **Drawing.** `LINE` reaches the server but is not rasterized locally;
-  `CIRCLE`, `FILL`, `PAINT` and `TEXT` are unimplemented; the `DRAW` opcode that
-  carries other people's strokes is dropped on receipt; and chat text is not
-  painted into the room image.
+- **Drawing.** Other people's strokes now render: the `DRAW` message is decoded
+  and rasterized with front and back layers, undo and clear-all, and our own
+  `LINE` strokes are painted locally as well as sent to the server. Still
+  missing: `CIRCLE`, `FILL`, `PAINT` and `TEXT`, and `DRAW`'s text operands,
+  whose layout the references leave undetermined. Chat text is not painted into
+  the room image.
 - **Dynamic room content.** `ADDPIC`, `ADDSPOT` and `SETSPOTSCRIPT` — the
   commands rooms use to build their own interfaces.
 - **HTTP.** `HTTPGET` and `LOADSCRIPT`. The response to a fetch is itself a
