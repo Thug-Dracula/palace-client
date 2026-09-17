@@ -47,9 +47,14 @@ jobs:
             exit 0
           fi
 
-          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+          # An alpha tag such as v0.2.0-alpha leaves the app itself at 0.2.0:
+          # Windows installers reject a pre-release suffix in the app version.
+          tag_base="${GITHUB_REF_NAME%%-*}"
+          tag_base="${tag_base#v}"
+
+          if [ "$tag_base" != "$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match version $version in src-tauri/tauri.conf.json"
-            echo "::error::bump \"version\" in src-tauri/tauri.conf.json, commit that, then tag v$version"
+            echo "::error::expected v$version or v$version-<suffix>; bump \"version\" in src-tauri/tauri.conf.json to match"
             exit 1
           fi
 
@@ -177,6 +182,13 @@ jobs:
         run: |
           notes="Don't expect this to be a working client. It isn't one yet. If you want to download it, it should be because you want to contribute, or you're just curious and want to see what state it's in."
 
+          # A hyphen in the tag marks a pre-release, so v0.1.0-alpha publishes as
+          # a pre-release while a plain v1.0.0 publishes as a normal release.
+          case "$GITHUB_REF_NAME" in
+            *-*) release_flags=(--prerelease) ;;
+            *)   release_flags=() ;;
+          esac
+
           # Look the release up by tag, not by name: 'gh release view' also
           # matches a release whose *name* equals the tag, which silently hides
           # a release that has been detached from its tag.
@@ -190,6 +202,7 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --title "$GITHUB_REF_NAME" \
               --notes "$notes" \
+              "${release_flags[@]}" \
               --generate-notes \
               --verify-tag \
               dist/*
