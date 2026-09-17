@@ -16,7 +16,13 @@ use palace_wire::messages::{self, AssetSpec, Message, Point};
 use palace_wire::opcode;
 use serde::Serialize;
 
+use crate::runtime::set_local_spot_state;
 use crate::xtlk;
+
+/// A door hotspot's `state` field is its lock: `HS_Unlock` is 0 and `HS_Lock`
+/// is 1 (protocol reference :1677-1680).
+pub(crate) const HS_UNLOCK: i16 = 0;
+pub(crate) const HS_LOCK: i16 = 1;
 
 /// Where the connection stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -448,6 +454,30 @@ impl SessionState {
                     );
                     applied.chat.push(line);
                 }
+            }
+            Message::DoorLock(lock) => {
+                applied.render = set_local_spot_state(
+                    self,
+                    lock.room_id,
+                    i32::from(lock.door_id),
+                    i32::from(HS_LOCK),
+                );
+            }
+            Message::DoorUnlock(lock) => {
+                applied.render = set_local_spot_state(
+                    self,
+                    lock.room_id,
+                    i32::from(lock.door_id),
+                    i32::from(HS_UNLOCK),
+                );
+            }
+            Message::SpotState(spot) => {
+                applied.render = set_local_spot_state(
+                    self,
+                    spot.room_id,
+                    i32::from(spot.spot_id),
+                    i32::from(spot.state),
+                );
             }
             Message::RoomDescription(_) => {
                 match palace_room::decode_payload(&frame.payload, order) {
@@ -980,5 +1010,117 @@ mod tests {
         );
         assert!(applied.render);
         assert!(state.room_desc.as_ref().unwrap().loose_props.is_empty());
+    }
+
+    fn door_body(room_id: i16, door_id: i16) -> Vec<u8> {
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(room_id);
+        w.write_i16(door_id);
+        w.into_vec()
+    }
+
+    fn spot_state_body(room_id: i16, spot_id: i16, value: i16) -> Vec<u8> {
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(room_id);
+        w.write_i16(spot_id);
+        w.write_i16(value);
+        w.into_vec()
+    }
+
+    fn hotspot_state(state: &SessionState, id: i16) -> i16 {
+        state
+            .room_desc
+            .as_ref()
+            .expect("a room")
+            .hotspots
+            .iter()
+            .find(|hotspot| hotspot.id == id)
+            .expect("the hotspot is in the room")
+            .state
+    }
+
+    #[test]
+    fn door_lock_and_unlock_set_the_local_hotspot_state() {
+        let mut state = room_state();
+        assert_eq!(
+            hotspot_state(&state, 7),
+            HS_UNLOCK,
+            "the fixture door starts unlocked"
+        );
+
+        let applied = state.apply(
+            &Frame::new(opcode::DOORLOCK, 0, door_body(86, 7)),
+            ByteOrder::Little,
+        );
+        assert!(applied.render, "the lock recomposes the room");
+        assert_eq!(hotspot_state(&state, 7), HS_LOCK);
+
+        let applied = state.apply(
+            &Frame::new(opcode::DOORUNLOCK, 0, door_body(86, 7)),
+            ByteOrder::Little,
+        );
+        assert!(applied.render);
+        assert_eq!(hotspot_state(&state, 7), HS_UNLOCK);
+    }
+
+    #[test]
+    fn spot_state_sets_the_value_the_message_carries() {
+        let mut state = room_state();
+        let applied = state.apply(
+            &Frame::new(opcode::SPOTSTATE, 0, spot_state_body(86, 105, 1)),
+            ByteOrder::Little,
+        );
+        assert!(applied.render);
+        assert_eq!(hotspot_state(&state, 105), 1);
+    }
+
+    #[test]
+    fn a_lock_aimed_at_another_room_leaves_this_room_alone() {
+        let mut state = room_state();
+
+        let applied = state.apply(
+            &Frame::new(opcode::DOORLOCK, 0, door_body(999, 7)),
+            ByteOrder::Little,
+        );
+        assert!(
+            !applied.render,
+            "a foreign room's lock changes nothing here"
+        );
+        assert_eq!(hotspot_state(&state, 7), HS_UNLOCK);
+
+        assert!(
+            state
+                .apply(
+                    &Frame::new(opcode::DOORLOCK, 0, door_body(86, 7)),
+                    ByteOrder::Little
+                )
+                .render
+        );
+        let applied = state.apply(
+            &Frame::new(opcode::DOORUNLOCK, 0, door_body(999, 7)),
+            ByteOrder::Little,
+        );
+        assert!(
+            !applied.render,
+            "a foreign room's unlock must not open our door"
+        );
+        assert_eq!(hotspot_state(&state, 7), HS_LOCK);
+
+        let applied = state.apply(
+            &Frame::new(opcode::SPOTSTATE, 0, spot_state_body(999, 105, 1)),
+            ByteOrder::Little,
+        );
+        assert!(!applied.render, "a foreign room's spot state is ignored");
+        assert_eq!(hotspot_state(&state, 105), HS_UNLOCK);
+    }
+
+    #[test]
+    fn a_lock_for_a_hotspot_this_room_does_not_have_changes_nothing() {
+        let mut state = room_state();
+        let applied = state.apply(
+            &Frame::new(opcode::DOORLOCK, 0, door_body(86, 32000)),
+            ByteOrder::Little,
+        );
+        assert!(!applied.render);
     }
 }

@@ -211,6 +211,35 @@ fn prop_del_frame(order: ByteOrder, index: i32) -> Vec<u8> {
         .expect("dPrp encodes")
 }
 
+fn door_lock_frame(order: ByteOrder, room_id: i16, door_id: i16) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i16(room_id);
+    w.write_i16(door_id);
+    Frame::new(opcode::DOORLOCK, 0, w.into_vec())
+        .encode(order)
+        .expect("lock encodes")
+}
+
+fn spot_state_frame(order: ByteOrder, room_id: i16, spot_id: i16, state: i16) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i16(room_id);
+    w.write_i16(spot_id);
+    w.write_i16(state);
+    Frame::new(opcode::SPOTSTATE, 0, w.into_vec())
+        .encode(order)
+        .expect("sSta encodes")
+}
+
+/// A server-side `talk` frame, used as an ordered marker: frames are processed
+/// in arrival order, so seeing this chat line proves every earlier frame ran.
+fn talk_marker_frame(order: ByteOrder, text: &str) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_cstring(text);
+    Frame::new(opcode::TALK, SELF_ID, w.into_vec())
+        .encode(order)
+        .expect("talk encodes")
+}
+
 /// Write a decodable solid prop blob named `<id>.bin` for each id, so the prop
 /// store holds — and therefore draws — them.
 fn seed_props_dir(ids: &[u32], rgb: [u8; 3]) -> PathBuf {
@@ -2729,4 +2758,354 @@ fn propdel_minus_one_clears_every_loose_prop() {
     cleanup(&cache);
     cleanup(&seed);
     cleanup(&props);
+}
+
+// ---------------------------------------------------------------------------
+// Door locks: a locked door is a door whose hotspot state is 1, so a click on
+// it is refused locally instead of dispatching SELECT
+// ---------------------------------------------------------------------------
+
+/// Find the first door in a room that also has an `ON SELECT` handler, so a
+/// click on it is observably dispatched when it is not locked.
+fn clickable_door(room: &palace_room::RoomDesc) -> &palace_room::Hotspot {
+    room.hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot.hotspot_type == 1
+                && hotspot
+                    .script
+                    .as_deref()
+                    .is_some_and(|script| script.contains("ON SELECT"))
+        })
+        .expect("the room has a door with an ON SELECT script")
+}
+
+/// The viewport point that hits a hotspot's anchor, through the transform the
+/// compositor reported.
+fn hotspot_click(spot: &palace_room::Hotspot, screen: &ScreenState) -> (f64, f64) {
+    let point = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(
+            f64::from(spot.loc.h),
+            f64::from(spot.loc.v),
+        ));
+    (point.x, point.y)
+}
+
+/// Room 887's `ON ENTER` arms a one-shot `1 ALARMEXEC` that rewrites door 1 and
+/// door 2's states on a later tick; a lock sent before it fires would be undone.
+/// Wait for that alarm's recompose — the only one after the first frame here —
+/// before a lock test acts.
+fn wait_for_entry_alarm(handle: &ClientHandle, screen: &ScreenState) {
+    let version = screen.version;
+    assert!(
+        wait_for(
+            || handle.frames().version() > version,
+            Duration::from_secs(5)
+        ),
+        "the room's entry alarm recomposed the frame"
+    );
+}
+
+#[test]
+fn a_click_on_a_locked_door_is_refused_without_dispatching_select() {
+    const LOCK_MARKER: &str = "door-lock-processed";
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("887");
+    let room = palace_room::decode_payload(&payload, order).expect("room 887 decodes");
+    let door = clickable_door(&room);
+    assert_eq!(door.state, 0, "the fixture door starts unlocked");
+
+    let mut initial = vec![server_bytes(&fixture)[0].clone()];
+    initial.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let tail = vec![
+        door_lock_frame(order, 887, door.id),
+        talk_marker_frame(order, LOCK_MARKER),
+    ];
+    let (server, gate) = MockServer::start_gated(initial, tail);
+    let cache = unique_temp_dir("locked-door-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 887)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 887)
+        .expect("a frame was composed for room 887");
+    let (x, y) = hotspot_click(door, screen);
+    wait_for_entry_alarm(&handle, screen);
+
+    handle.set_mouse(300, 200);
+    handle.click(x, y);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "SELECT" && run.fired >= 1)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        script_runs(&events)
+            .iter()
+            .any(|run| run.event == "SELECT" && run.fired >= 1),
+        "an unlocked door still dispatches SELECT: {:?}",
+        script_runs(&events)
+    );
+    assert!(
+        !notes(&events)
+            .iter()
+            .any(|text| text.contains("locked door")),
+        "nothing was refused while the door was unlocked"
+    );
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            chats(collected)
+                .iter()
+                .any(|text| text.contains(LOCK_MARKER))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        chats(&events).iter().any(|text| text.contains(LOCK_MARKER)),
+        "the DOORLOCK frame was processed before the click: {:?}",
+        chats(&events)
+    );
+
+    handle.click(x, y);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("locked door"))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("locked door")),
+        "the locked door was refused: {:?}",
+        notes(&events)
+    );
+    assert!(
+        !script_runs(&events).iter().any(|run| run.event == "SELECT"),
+        "the refused click did not dispatch SELECT: {:?}",
+        script_runs(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_lock_for_another_room_does_not_refuse_this_rooms_door() {
+    const MARKER: &str = "foreign-lock-processed";
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("887");
+    let room = palace_room::decode_payload(&payload, order).expect("room 887 decodes");
+    let door = clickable_door(&room);
+
+    let mut initial = vec![server_bytes(&fixture)[0].clone()];
+    initial.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let tail = vec![
+        door_lock_frame(order, 999, door.id),
+        spot_state_frame(order, 887, 33, 1),
+        talk_marker_frame(order, MARKER),
+    ];
+    let (server, gate) = MockServer::start_gated(initial, tail);
+    let cache = unique_temp_dir("foreign-lock-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 887)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 887)
+        .expect("a frame was composed for room 887");
+    let (x, y) = hotspot_click(door, screen);
+    wait_for_entry_alarm(&handle, screen);
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| chats(collected).iter().any(|text| text.contains(MARKER)),
+        Duration::from_secs(10),
+    );
+    assert!(
+        chats(&events).iter().any(|text| text.contains(MARKER)),
+        "both gate frames were processed before the click: {:?}",
+        chats(&events)
+    );
+
+    handle.set_mouse(300, 200);
+    handle.click(x, y);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "SELECT" && run.fired >= 1)
+                || notes(collected)
+                    .iter()
+                    .any(|text| text.contains("locked door"))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        script_runs(&events)
+            .iter()
+            .any(|run| run.event == "SELECT" && run.fired >= 1),
+        "a lock aimed at room 999 must not lock this room's door: {:?}",
+        notes(&events)
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains(&format!("hit hotspot {}", door.id))),
+        "the click landed on the door: {:?}",
+        notes(&events)
+    );
+    assert!(
+        !notes(&events)
+            .iter()
+            .any(|text| text.contains("locked door")),
+        "the foreign lock produced no refusal here: {:?}",
+        notes(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_non_door_hotspot_with_a_nonzero_state_still_dispatches_select() {
+    const MARKER: &str = "spot-state-processed";
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let spot = room
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot.hotspot_type == 0
+                && hotspot
+                    .script
+                    .as_deref()
+                    .is_some_and(|script| script.contains("ON SELECT"))
+        })
+        .expect("room 901 has an ordinary hotspot with an ON SELECT script");
+
+    let frames = room_only_frames(&fixture);
+    let tail = vec![
+        spot_state_frame(order, 901, spot.id, 1),
+        talk_marker_frame(order, MARKER),
+    ];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("ordinary-state-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901)
+        .expect("a frame was composed for room 901");
+    let (x, y) = hotspot_click(spot, screen);
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| chats(collected).iter().any(|text| text.contains(MARKER)),
+        Duration::from_secs(10),
+    );
+    assert!(
+        chats(&events).iter().any(|text| text.contains(MARKER)),
+        "the SPOTSTATE frame was processed before the click: {:?}",
+        chats(&events)
+    );
+
+    handle.set_mouse(300, 200);
+    handle.click(x, y);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "SELECT" && run.fired >= 1)
+                || notes(collected)
+                    .iter()
+                    .any(|text| text.contains("locked door"))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        script_runs(&events)
+            .iter()
+            .any(|run| run.event == "SELECT" && run.fired >= 1),
+        "a HS_Normal hotspot with state 1 is script state, not a lock: {:?}",
+        notes(&events)
+    );
+    assert!(
+        !notes(&events)
+            .iter()
+            .any(|text| text.contains("locked door")),
+        "an ordinary hotspot is never refused: {:?}",
+        notes(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
 }

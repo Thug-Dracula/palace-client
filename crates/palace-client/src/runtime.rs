@@ -34,11 +34,19 @@ use crate::error::{ClientError, Result};
 use crate::frame::{FrameStore, ScreenState, ViewGeometry};
 use crate::session::{Connection, POLL_SLICE};
 use crate::state::{
-    ChatKind, ChatLine, ConnectionStatus, RoomInfo, ServerBanner, SessionState, UserInfo,
+    ChatKind, ChatLine, ConnectionStatus, RoomInfo, ServerBanner, SessionState, UserInfo, HS_LOCK,
 };
 
 const MEDIA_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const PROP_REQUEST_BUDGET: usize = 80;
+
+/// The `HS_*` types that are doors and can carry a lock on their `state`:
+/// `HS_Door`, `HS_ShutableDoor`, `HS_LockableDoor` (protocol reference
+/// :1664-1668). `HS_Bolt` (4) is not a door — it locks the door named by its
+/// `dest` — so it is never treated as one here.
+const HS_DOOR: i16 = 1;
+const HS_SHUTABLE_DOOR: i16 = 2;
+const HS_LOCKABLE_DOOR: i16 = 3;
 
 /// How to reach a server and what to draw with.
 #[derive(Debug, Clone)]
@@ -730,16 +738,22 @@ fn run_session(
                             shared.note(format!(
                                 "script: click at room ({rx},{ry}) hit hotspot {id}"
                             ));
-                            for event in run_dispatch(
-                                &mut scripts,
-                                ScriptEvent::Select,
-                                &mut state,
-                                shared,
-                                &mut conn,
-                                &mut dirty_render,
-                                Some(id),
-                            ) {
-                                shared.emit(event);
+                            if is_locked_door(&mut state, id) {
+                                shared.note(format!(
+                                    "script: hotspot {id} is a locked door, click refused"
+                                ));
+                            } else {
+                                for event in run_dispatch(
+                                    &mut scripts,
+                                    ScriptEvent::Select,
+                                    &mut state,
+                                    shared,
+                                    &mut conn,
+                                    &mut dirty_render,
+                                    Some(id),
+                                ) {
+                                    shared.emit(event);
+                                }
                             }
                         }
                         None => {
@@ -1502,7 +1516,9 @@ fn apply_effect(
         }
         Effect::SetSpotState { spot, state: value }
         | Effect::SetSpotStateLocal { spot, state: value } => {
-            let applied = set_local_spot_state(state, *spot, *value);
+            let room_id = state.room_desc.as_ref().map(|room| room.header.room_id);
+            let applied =
+                room_id.is_some_and(|room_id| set_local_spot_state(state, room_id, *spot, *value));
             if applied {
                 *dirty_render = true;
             }
@@ -1761,8 +1777,9 @@ fn apply_effect(
         }],
 
         // A lock rides the wire as `DOORLOCK` / `DOORUNLOCK`, so the room's other
-        // occupants see it. This client keeps no lock state of its own — nothing
-        // consults it, because a click does not yet refuse to open a locked door.
+        // occupants see it. The lock state this client consults is the door
+        // hotspot's `state`, which the server's echoed `DOORLOCK`/`DOORUNLOCK`
+        // sets; a click on a locked door is refused before `SELECT` is dispatched.
         Effect::Lock { spot } => vec![ClientEvent::Note {
             text: format!("script: LOCK {spot}"),
         }],
@@ -1777,16 +1794,26 @@ fn apply_effect(
     }
 }
 
-/// Change a hotspot's state in the locally rendered room.
-fn set_local_spot_state(state: &mut SessionState, spot: i32, value: i32) -> bool {
+/// Change a hotspot's state in `room_id`, which must be the room the client is
+/// currently showing: a message aimed at another room changes nothing. The
+/// `state` field is what encodes a door's lock (:1677-1680), so the door and
+/// spot messages share this setter with the local script effects.
+pub(crate) fn set_local_spot_state(
+    state: &mut SessionState,
+    room_id: i16,
+    spot: i32,
+    value: i32,
+) -> bool {
     let Some(room) = state.room_desc.as_mut() else {
         return false;
     };
-    let Some(hotspot) = room
-        .hotspots
-        .iter_mut()
-        .find(|hotspot| i32::from(hotspot.id) == spot)
-    else {
+    if room.header.room_id != room_id {
+        return false;
+    }
+    let Ok(spot) = i16::try_from(spot) else {
+        return false;
+    };
+    let Some(hotspot) = room.hotspots.iter_mut().find(|hotspot| hotspot.id == spot) else {
         return false;
     };
     hotspot.state = value.clamp(0, i32::from(i16::MAX)) as i16;
@@ -1900,13 +1927,37 @@ fn drop_prop(state: &mut SessionState, x: i32, y: i32) -> Option<u32> {
     Some(prop)
 }
 
-fn hotspot_mut(state: &mut SessionState, spot: i32) -> Option<&mut palace_room::Hotspot> {
-    state
-        .room_desc
-        .as_mut()?
-        .hotspots
+fn hotspot_mut(
+    state: &mut SessionState,
+    room_id: i16,
+    spot: i32,
+) -> Option<&mut palace_room::Hotspot> {
+    let room = state.room_desc.as_mut()?;
+    if room.header.room_id != room_id {
+        return None;
+    }
+    room.hotspots
         .iter_mut()
         .find(|hotspot| i32::from(hotspot.id) == spot)
+}
+
+/// The room the client is currently showing, from the parsed room description.
+fn current_room_id(state: &SessionState) -> Option<i16> {
+    state.room_desc.as_ref().map(|room| room.header.room_id)
+}
+
+/// True when `spot` is a door (`HS_Door`, `HS_ShutableDoor`, `HS_LockableDoor`)
+/// whose `state` is `HS_Lock`. A bolt (`HS_Bolt`, 4) locks the door named by its
+/// `dest` and is not itself a door, so a click on a bolt is never refused here.
+fn is_locked_door(state: &mut SessionState, spot: i32) -> bool {
+    let Some(room_id) = current_room_id(state) else {
+        return false;
+    };
+    let info =
+        hotspot_mut(state, room_id, spot).map(|hotspot| (hotspot.hotspot_type, hotspot.state));
+    info.is_some_and(|(kind, value)| {
+        matches!(kind, HS_DOOR | HS_SHUTABLE_DOOR | HS_LOCKABLE_DOOR) && value == HS_LOCK
+    })
 }
 
 /// `SETLOC` / `SETLOCLOCAL`: `x y` are the spot's new absolute position, so this
@@ -1914,7 +1965,10 @@ fn hotspot_mut(state: &mut SessionState, spot: i32) -> Option<&mut palace_room::
 /// reference server assigns it, and OpenPalace changed its own implementation
 /// from relative to absolute to match.
 fn move_spot_to(state: &mut SessionState, spot: i32, x: i32, y: i32) -> bool {
-    let Some(hotspot) = hotspot_mut(state, spot) else {
+    let Some(room_id) = current_room_id(state) else {
+        return false;
+    };
+    let Some(hotspot) = hotspot_mut(state, room_id, spot) else {
         return false;
     };
     hotspot.loc = point(x, y);
@@ -1925,7 +1979,10 @@ fn move_spot_to(state: &mut SessionState, spot: i32, x: i32, y: i32) -> bool {
 /// the hotspot's current state when `index` is `None`. The manual's worked
 /// example proves these replace the offset rather than adding to it.
 fn set_pic_offset(state: &mut SessionState, spot: i32, index: Option<i32>, x: i32, y: i32) -> bool {
-    let Some(hotspot) = hotspot_mut(state, spot) else {
+    let Some(room_id) = current_room_id(state) else {
+        return false;
+    };
+    let Some(hotspot) = hotspot_mut(state, room_id, spot) else {
         return false;
     };
     let index = match index {
