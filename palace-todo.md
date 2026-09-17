@@ -831,6 +831,57 @@ Under investigation by comparing our reported click coordinates against hotspot 
 from the room descriptor. Do not special-case room 7774; whichever of these it is affects every room
 that hit-tests this way.
 
+### 2.24 The arena blocker: the room builds its own interface from a fetched script we never load
+
+**This is the answer to "why does the arena refuse me", and it is not the click.**
+
+Room 7774's `ON ENTER` fetches a script:
+
+```text
+ON ENTER { "http://chat.animanic.de/media/custo2.txt" LOADSCRIPT }
+```
+
+That URL is real and served — fetched directly, **HTTP 200, 25,620 bytes** — and the script it returns
+is what *constructs the room's interface*:
+
+```text
+[1000,0 537,0 537,363 933,363 933,396 1000,396] 0,0 ADDSPOT but1 =     creates a hotspot at runtime
+"cust.gif" but1 ADDPIC 768,198 0 but1 SETPICLOCLOCAL                   pushes a picture
+2 1 1 but1 SETSPOTOPTIONS                                              configures it
+{ na2 GLOBAL na GLOBAL mx GLOBAL my GLOBAL MOUSEPOS my = mx = ... }    hit-tests with the pointer
+```
+
+`LOADSCRIPT` is unimplemented (§2.11), so the script never loads; `ADDSPOT`, `ADDPIC`,
+`SETSPOTOPTIONS` and `SETPICLOCLOCAL` are unimplemented (§2.20), so even if it loaded, the interface
+would not be built. The panel's hotspots and picture therefore never exist, the room's own guard stays
+false, and every click falls through to its `wrongo.wav` else-branch.
+
+The investigation that established this also cleared the suspects it replaced. The click coordinate is
+correct (x = 278 and 295 both fall inside the live room's 5v5 band), the viewport transform is correct,
+`MOUSEPOS` order is correct (a reversed push is caught by a test), the `GLOBAL`/`SWAP`/`=` assignment
+idiom is correct, and the hit test selects hotspot 102, the panel itself. Seeding the guard's globals
+(`cname`, `in69`) makes the *same clicks* navigate:
+
+```text
+click at room (137,368)  unseeded -> SOUND "wrongo.wav"
+click at room (137,368)  seeded   -> GOTOROOM 31741
+click at room (278,375)  seeded   -> GOTOROOM 31747
+```
+
+So the room is not rejecting the click; it is rejecting a session whose interface was never built.
+`in69` appears nowhere in the room's own scripts, which is consistent with it arriving from a fetched
+one. The same mechanism explains the 5v5's `ON ROOMREADY {"ludo/" HTTPGET}` (§2.14).
+
+**Fix, in two parts, both now the top of the queue:**
+
+- [ ] `LOADSCRIPT` + `HTTPGET` — fetch the URL, and when the response type is `text/iptscrae` execute
+  the body as a script, firing `HTTPRECEIVED` spot-scoped (§2.14 has the mechanism).
+- [ ] `ADDPIC`/`ADDSPOT`/`SETSPOTOPTIONS`/`SETPICLOCLOCAL` — the commands that script uses to build the
+  interface.
+
+Neither is useful alone: without the fetch the script never arrives, and without the content commands
+the script cannot build anything.
+
 ---
 
 ## Part 3 — How to verify
