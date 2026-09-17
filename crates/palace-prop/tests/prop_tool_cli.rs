@@ -712,3 +712,178 @@ fn inventory_reports_a_truncated_zlib_payload_as_a_failure() {
     assert!(text.contains("failed=1"), "{text}");
     assert!(text.contains("32-bit=0"), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// bag
+// ---------------------------------------------------------------------------
+
+/// Prefix a fixture prop with the bag's fixed 32-byte metadata block.
+fn bag_blob(prop: &[u8]) -> Vec<u8> {
+    let mut blob = vec![0xab; 32];
+    blob.extend_from_slice(prop);
+    blob
+}
+
+/// A `.pids`/`.props` pair holding `blobs` (which must already carry the prefix),
+/// tiled contiguously. Identities are `(1, 2), (3, 4), ...`.
+fn bag_pair(blobs: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>) {
+    let mut index = Vec::new();
+    let mut props = Vec::new();
+    for (n, blob) in blobs.iter().enumerate() {
+        let a = (1 + n * 2) as u32;
+        index.extend_from_slice(&a.to_be_bytes());
+        index.extend_from_slice(&(a + 1).to_be_bytes());
+        index.extend_from_slice(&(props.len() as u32).to_be_bytes());
+        index.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+        props.extend_from_slice(blob);
+    }
+    (index, props)
+}
+
+fn write_bag(dir: &TempDir, index: &[u8], props: &[u8]) -> PathBuf {
+    let bundle = dir.path("Test.bundle");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(bundle.join("Test.pids"), index).unwrap();
+    std::fs::write(bundle.join("Test.props"), props).unwrap();
+    bundle
+}
+
+#[test]
+fn help_mentions_the_bag_subcommand() {
+    let out = run(&["help"]);
+    assert_eq!(code(&out), 0);
+    let text = stderr(&out);
+    assert!(text.contains("prop-tool bag list"), "{text}");
+    assert!(text.contains("prop-tool bag extract"), "{text}");
+}
+
+#[test]
+fn bag_list_prints_the_index_metrics_and_one_line_per_entry() {
+    let dir = TempDir::new("bag-list");
+    let avatar = std::fs::read(fixture("8bit_avatar.bin")).unwrap();
+    let (index, props) = bag_pair(&[bag_blob(&avatar), bag_blob(&avatar)]);
+    let bundle = write_bag(&dir, &index, &props);
+
+    let out = run(&["bag", "list", bundle.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("2 records, 2 entries, out-of-bounds=0, tiling=1/1, trailing=0"),
+        "{text}"
+    );
+    assert!(text.contains("a\tb\toffset\tsize\tformat\tdims"), "{text}");
+    assert!(text.contains("00000001\t00000002"), "{text}");
+    assert!(text.contains("8-bit\t44x44"), "{text}");
+}
+
+#[test]
+fn bag_list_accepts_a_pids_path_and_honours_limit() {
+    let dir = TempDir::new("bag-list-pids");
+    let avatar = std::fs::read(fixture("8bit_avatar.bin")).unwrap();
+    let (index, props) = bag_pair(&[bag_blob(&avatar), bag_blob(&avatar)]);
+    let bundle = write_bag(&dir, &index, &props);
+
+    let out = run(&[
+        "bag",
+        "list",
+        bundle.join("Test.pids").to_str().unwrap(),
+        "--limit",
+        "1",
+    ]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("00000001\t00000002"), "{text}");
+    assert!(
+        !text.contains("00000003\t00000004"),
+        "limit ignored:\n{text}"
+    );
+}
+
+#[test]
+fn bag_extract_writes_one_png_per_decodable_entry() {
+    let dir = TempDir::new("bag-extract");
+    let avatar = std::fs::read(fixture("8bit_avatar.bin")).unwrap();
+    let (index, props) = bag_pair(&[bag_blob(&avatar), bag_blob(&avatar)]);
+    let bundle = write_bag(&dir, &index, &props);
+    let outdir = dir.path("pngs");
+
+    let out = run(&[
+        "bag",
+        "extract",
+        bundle.to_str().unwrap(),
+        outdir.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("bag extract: wrote 2, failed 0"));
+
+    let png = std::fs::read(outdir.join("8-bit_00000001_00000002.png")).expect("first png");
+    assert_eq!(png_size(&png), Some((44, 44)));
+    assert!(outdir.join("8-bit_00000003_00000004.png").is_file());
+}
+
+#[test]
+fn bag_extract_honours_a_format_filter() {
+    let dir = TempDir::new("bag-extract-format");
+    let avatar = std::fs::read(fixture("8bit_avatar.bin")).unwrap();
+    let (index, props) = bag_pair(&[bag_blob(&avatar)]);
+    let bundle = write_bag(&dir, &index, &props);
+    let outdir = dir.path("pngs");
+
+    let out = run(&[
+        "bag",
+        "extract",
+        bundle.to_str().unwrap(),
+        outdir.to_str().unwrap(),
+        "--format",
+        "16-bit",
+    ]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("wrote 0, failed 0"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn bag_extract_reports_a_missing_bundle_with_exit_one() {
+    let dir = TempDir::new("bag-missing");
+    let out = run(&[
+        "bag",
+        "extract",
+        "/nonexistent/PropBag.bundle",
+        dir.path("out").to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("/nonexistent/PropBag.bundle"));
+}
+
+#[test]
+fn bag_without_a_subcommand_exits_two_with_usage() {
+    let out = run(&["bag"]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("usage:"));
+}
+
+#[test]
+fn bag_unknown_subcommand_exits_two_and_echoes_it() {
+    let out = run(&["bag", "frobnicate"]);
+    assert_eq!(code(&out), 2);
+    let text = stderr(&out);
+    assert!(text.contains("unknown bag subcommand"), "{text}");
+    assert!(text.contains("frobnicate"), "{text}");
+}
+
+#[test]
+fn bag_list_without_a_path_exits_two() {
+    let out = run(&["bag", "list"]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("usage:"));
+}
+
+#[test]
+fn bag_extract_without_an_outdir_exits_two() {
+    let out = run(&["bag", "extract", "/tmp/whatever"]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("usage:"));
+}

@@ -49,12 +49,22 @@
 //!
 //! The full derivation, byte offsets and corpus counts are in the crate README.
 //!
+//! ## The prop bag
+//!
+//! [`bag::PropBag`] reads the modern client's own collection: the
+//! `PropBag.bundle/` directory of a `*.pids` index plus a concatenated `*.props`
+//! blob file. Each blob is a fixed 32-byte opaque prefix followed by an ordinary
+//! prop at `blob[32..]`, so [`bag::BagEntry::decode`] is just [`decode`] with the
+//! prefix stripped. The module documents the identity pair and states plainly
+//! which parts are certain and which are undetermined.
+//!
 //! ## What this crate is not
 //!
 //! It knows nothing about the `.prp` roster container, the wire protocol or the
 //! network. Props are a self-contained binary format, so this crate has no
 //! dependency on `palace-wire` — only on `flate2` for the zlib step and `png` for
-//! debug output.
+//! debug output. The bag reader lives here because the bag is a prop container,
+//! not because it is part of the codec.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -62,6 +72,7 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+pub mod bag;
 pub mod codec;
 pub mod crc;
 pub mod encode;
@@ -70,6 +81,7 @@ pub mod header;
 pub mod image;
 pub mod palette;
 
+pub use bag::{BagEntry, PropBag, BAG_INDEX_RECORD_LEN, BAG_PREFIX_LEN};
 pub use crc::{asset_crc, payload_crc, ASSET_CRC_MAGIC};
 pub use encode::{encode_s20_blob, encode_s20_payload, quantize};
 pub use error::{PropError, Result, MAX_DIMENSION, MAX_PIXELS};
