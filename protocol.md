@@ -287,10 +287,14 @@ unsigned, so it is exposed as `u32`.
 
 **Traversal, not stride.** In the live corpus loose props are written 48 bytes
 apart even though a record is 24 bytes (the 24 bytes between records are zero),
-and the server threads `nextOfst` so that `firstLProp` points at the *last*
-array entry and each link steps *backwards*. None of that matters to the walker
-because it follows the link. pserver does the opposite: it packs records at
-stride 24 and writes `nextOfst = 0` for every one. The walker detects a `0` link
+and the server threads `nextOfst` so that `firstLProp` points at the highest
+offset and each link steps *backwards through the buffer*. That is a fact about
+the byte offsets, **not** about the logical order — the head of the chain is still
+prop number 0, which is the numbering a script's `REMOVELOOSEPROP` /
+`MOVELOOSEPROP` index counts in (`PalaceClient.as` loads by walking the link
+forward and appending, then applies that index to the list it built *and* sends it
+on unchanged). Following the link is what matters. pserver does the opposite: it
+packs records at stride 24 and writes `nextOfst = 0` for every one. The walker detects a `0` link
 before the declared count is reached and falls back to the packed stride,
 recording a `LinkedFallback` warning.
 

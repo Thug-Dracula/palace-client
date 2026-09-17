@@ -328,28 +328,46 @@ An aborted agent may have committed real work before dying. "No task_id" means t
 
 The correct method: use the reference registry (OpenPalace `IptDefaultCommands.as` + `PalaceIptscraeCommands.as`) as the command vocabulary, then compare against the **union** of both Rust registries. Any future coverage claim must do the same.
 
-## Known defect: the effect-application gap (found 2026-09-16)
+## The effect-application gap (found 2026-09-16, **closed** 2026-09-16)
 
-`apply_effect()` in `crates/palace-client/src/runtime.rs` ends with a catch-all:
+`apply_effect()` in `crates/palace-client/src/runtime.rs` used to end with a
+catch-all, `other => vec![ClientEvent::Note { … }]`, so **any `Effect` with no
+explicit match arm was logged and nothing else**: the transcript said "script: X"
+and the room did not change.
 
-```rust
-other => vec![ClientEvent::Note { text: format!("script: {other}") }],
-```
+All 16 missing arms are now written and **the catch-all is gone**, so the match is
+exhaustive. Deleting a single arm now fails the build with `E0004` — verified by
+deleting the `LOCK` arm and reading the error. That is what stops a new `Effect`
+from silently doing nothing.
 
-**Any `Effect` without an explicit match arm is logged and nothing else.** It is
-recorded, surfaced in the transcript as "script: X", and never applied to the
-room. So the script appears to run and the room does not change.
-
-Of 58 `Effect` variants, 42 have explicit arms. These 16 do not:
-
-| Variant | Visible in the room? |
+| Variants | Now |
 |---|---|
-| `AddLooseProp`, `RemoveLooseProp`, `MoveLooseProp`, `DonProp`, `DoffProp`, `DropProp` | **Yes** — `build.rs` draws `room.loose_props` |
-| `SetFace`, `SetColor` | **Yes** — the compositor draws avatars from `UserInfo.face` / `color` |
-| `SetPenColor`, `SetPenSize`, `MovePen`, `PaintLayer` | Not yet — draw commands are not rasterized |
-| `Lock`, `Unlock`, `SetSpotAlarm` | Not visual — state only |
+| `AddLooseProp`, `RemoveLooseProp`, `MoveLooseProp`, `ClearLooseProps`, `DropProp` | Applied to `room_desc.loose_props`, which `build.rs` draws |
+| `SetFace`, `SetColor` | Applied to `users[self].face` / `.color`, which the compositor draws |
+| `DonProp`, `DoffProp`, `RemoveProp` | Applied to the signed-in user's worn-prop list |
+| `SetPenColor`, `SetPenSize`, `MovePen`, `PaintLayer` | Reported: the pen is `ScriptHost`'s, and nothing rasterizes a stroke yet |
+| `Lock`, `Unlock` | Reported: the frame goes on the wire, and nothing local consults lock state |
+| `SetSpotAlarm` | Reported: `ScriptHost` records the alarm and the engine runs it |
 
-### The one already fixed: `DIMROOM`
+### The double defect: seven arms that apply nothing
+
+The table that used to sit here counted *missing arms*, which was too kind a
+metric. Seven variants already had an arm that sets `*dirty_render = true` and
+emits a note but **mutates no state at all** — so they force a re-render that is
+guaranteed byte-identical. An inert arm is indistinguishable from a working one
+inside a `match`, which is how this stayed hidden.
+
+| Arm | Currently | Should mutate |
+|---|---|---|
+| `MoveSpot`, `MoveSpotLocal` (`SETLOC`) | dirty + note | `hotspot.loc` — the renderer reads it (`build.rs:329`) |
+| `SetPicOffset`, `SetPicOffsetLocal` (`SETPICLOC`) | dirty + note | `states[].pic_loc` (`build.rs:330`) |
+| `SetPicOpacity` | note only, not even dirty | `Sprite.alpha` exists (`scene.rs:83`); needs client-side state |
+| `HideAvatars`, `ShowAvatars` | dirty + note | a flag `compose` consults |
+
+**Still open.** `SETLOC`/`SETPICLOC` need their absolute-vs-relative semantics
+settled against the references before they can be applied.
+
+### The one fixed earlier: `DIMROOM`
 
 `DIMROOM` was the proof case. `palace-render` had `Scene.dim_level` and
 `Canvas::apply_dim` all along, but the builder hardcoded `dim_level = 1.0` and the
@@ -366,25 +384,30 @@ The scale is from the reference, not guessed: OpenPalace's
 `PalaceCurrentRoom.dimRoom` does `level = clamp(0, 100); dimLevel = level / 100`,
 and renders it as `alpha="{1 - dimLevel}"` black — the same maths as `apply_dim`.
 
-### Fixing the rest
+### Testing an applied effect, and a harness trap
 
-Follow the two patterns already in the file:
+**Assert what the renderer sees, not what the state says.** Asserting
+`state.room_dim` proves nothing, because the defect was precisely that state and
+render were not connected. `a_face_or_colour_change_reaches_the_composited_scene`
+drives the real `avatar_specs` and `SceneBuilder::build_with` and compares the
+drawn image; cutting `.with_face_color(…)` back out of `avatar_specs` fails it.
 
-* `set_local_spot_state(state, spot, value)` mutates `state.room_desc` and is the
-  template for room-local state (spot state, and the loose-prop variants, which
-  should mutate `room_desc.loose_props`).
-* `SetUserName` mutates `state.users` and is the template for user-local state
-  (`SetFace`, `SetColor` should update `state.users[self].face` / `.color`).
+**Trap: the mock sessions have no `is_self`.** `banner.user_id` comes from
+`handshake.user_id()`, and in `tests/mock_runtime.rs` no `UserInfo` ever matches
+it, so `is_self` is `None` for the whole run. Every self-targeted effect —
+`SETFACE`, `SETCOLOR`, `DONPROP`, `NAKED`, `SETPROPS`, `SETUSERNAME` — therefore
+answers "(no change)" over the socket, and cannot be frame-tested through it. That
+is a fixture gap rather than a product bug: the same fixture does deliver the room
+and the user list. Before writing a socket-level test for a self effect, fix the
+fixture so it sends a user-list record carrying the handshake's user id.
 
-Then set `*dirty_render = true`, and remove the variant from the catch-all by
-giving it an explicit arm.
-
-**Test it the way the renderer sees it.** Asserting `state.room_dim` is not enough:
-the defect was precisely that state and render were not connected. Assert the
-composited frame changes — a dimmed room is measurably darker, a removed loose prop
-disappears from `scene.loose_props`. `crates/palace-client/tests/mock_runtime.rs`
-can drive the real runtime against a mock server; a room script that calls the
-effect is the cleanest fixture.
+**`protocol.md` needs one correction.** Its loose-prop section says the server
+"threads `nextOfst` so that `firstLProp` points at the *last* array entry and each
+link steps *backwards*", which reads as though traversal order were the reverse of
+the prop numbering. It is not. `PalaceClient.as` loads a room by walking
+`firstLProp` forward and appending, and then applies a script's index to that same
+list *and* forwards it unchanged, so traversal order **is** the prop numbering.
+That sentence describes the byte offsets, and should say so.
 
 ## Running it
 
