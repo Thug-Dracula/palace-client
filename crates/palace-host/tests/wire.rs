@@ -3,7 +3,7 @@
 //! Layouts are the ones OpenPalace's `PalaceClient.as` senders write, so a
 //! change here must be justified against that source.
 
-use palace_host::{effect_frame, Effect, PenState, WireContext};
+use palace_host::{effect_frame, move_target, Effect, PenState, WireContext};
 use palace_wire::byteorder::ByteOrder;
 use palace_wire::opcode;
 
@@ -65,6 +65,28 @@ fn goto_room_is_the_navr_frame_the_server_expects() {
 }
 
 #[test]
+fn goto_room_truncates_ids_above_65535_to_their_low_16_bits() {
+    // Colosseum scripts use ids like 73251. RoomID is 16-bit on the wire, so the
+    // low 16 bits name the room (73251 & 0xffff = 7715, 0x1e23). A clamp would
+    // instead send 65535 -- a nonexistent room. Assert the bytes on the wire.
+    for (requested, expected) in [(73251i32, 7715u16), (73202, 7666)] {
+        let frame = effect_frame(&Effect::GotoRoom { room: requested }, &ctx()).expect("navR");
+        let encoded = frame.encode(ByteOrder::Little).expect("encodes");
+        assert_eq!(
+            &encoded[12..14],
+            expected.to_le_bytes(),
+            "room {requested} must encode as {expected} (low 16 bits), got {:?}",
+            &encoded[12..14]
+        );
+        assert_ne!(
+            frame.payload,
+            u16::MAX.to_le_bytes(),
+            "room {requested} must not be clamped to u16::MAX"
+        );
+    }
+}
+
+#[test]
 fn move_clamps_to_the_room_and_writes_y_then_x() {
     let frame = effect_frame(&Effect::MoveUserAbs { x: 600, y: 400 }, &ctx()).expect("uLoc");
     assert_eq!(frame.opcode, opcode::USERMOVE);
@@ -86,6 +108,33 @@ fn move_clamps_low_to_22() {
 fn relative_move_uses_our_position() {
     let frame = effect_frame(&Effect::MoveUserRel { dx: 10, dy: -10 }, &ctx()).expect("uLoc");
     assert_eq!(frame.payload, [90u8, 0, 210, 0], "y=90 x=210");
+}
+
+#[test]
+fn move_target_is_the_position_the_frame_encodes() {
+    let context = ctx();
+    for effect in [
+        Effect::MoveUserAbs { x: 600, y: 400 },
+        Effect::MoveUserAbs { x: 0, y: 5 },
+        Effect::MoveUserRel { dx: 10, dy: -10 },
+        Effect::MoveUserRel {
+            dx: -1_000,
+            dy: 1_000,
+        },
+    ] {
+        let (x, y) = move_target(&effect, &context).expect("a move has a target");
+        let frame = effect_frame(&effect, &context).expect("a move has a frame");
+        assert_eq!(
+            frame.payload,
+            [y as u8, (y >> 8) as u8, x as u8, (x >> 8) as u8],
+            "the applied target and the sent frame must be the same position for {effect:?}"
+        );
+    }
+    assert_eq!(
+        move_target(&Effect::Beep, &context),
+        None,
+        "a non-move effect has no target"
+    );
 }
 
 #[test]
@@ -219,6 +268,33 @@ fn paintclear_is_a_detonate_with_no_operand() {
     assert_eq!(frame.payload.len(), 10);
     assert_eq!(u16::from_le_bytes([frame.payload[4], frame.payload[5]]), 3);
     assert_eq!(u16::from_le_bytes([frame.payload[6], frame.payload[7]]), 0);
+}
+
+#[test]
+fn set_user_name_writes_a_plain_pstring_with_our_ref() {
+    // `struct ClientMsg_userName { PString name; }` -- reference :2144-2146.
+    // Body is one length byte then the name, with no alignment padding.
+    let frame = effect_frame(
+        &Effect::SetUserName {
+            name: "Rico".to_string(),
+        },
+        &ctx(),
+    )
+    .expect("usrN");
+    assert_eq!(frame.opcode, opcode::USERNAME);
+    assert_eq!(frame.ref_num, 13, "the renamed user is our own id");
+    assert_eq!(frame.payload, b"\x04Rico");
+    assert_eq!(frame.payload.len(), 5, "no alignment padding");
+
+    let encoded = frame.encode(ByteOrder::Little).expect("encodes");
+    #[rustfmt::skip]
+    let expected: Vec<u8> = vec![
+        0x4e, 0x72, 0x73, 0x75, // "usrN"
+        0x05, 0x00, 0x00, 0x00, // length = 5
+        0x0d, 0x00, 0x00, 0x00, // refNum = 13
+        0x04, b'R', b'i', b'c', b'o',
+    ];
+    assert_eq!(encoded, expected);
 }
 
 #[test]

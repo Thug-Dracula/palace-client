@@ -215,11 +215,10 @@ impl SessionState {
     /// Build a `navR` frame for a room id, carrying our user id as the ref.
     #[must_use]
     pub fn navigate_frame(&self, room_id: i32) -> Frame {
-        navr_frame(
-            room_id.clamp(0, u16::MAX as i32) as u16,
-            self.banner.user_id,
-            self.byte_order(),
-        )
+        // RoomID is 16-bit on the wire, so narrow by truncation to its low 16
+        // bits; clamping to 65535 would send a different, non-existent room
+        // (73251 -> 7715, not 65535).
+        navr_frame(room_id as u16, self.banner.user_id, self.byte_order())
     }
 
     /// The session's byte order, as the handshake negotiated it.
@@ -418,6 +417,11 @@ impl SessionState {
                 applied.users = changed;
                 applied.render = changed;
             }
+            Message::UserName(name) => {
+                let changed = self.set_user_name(name.user_id, &name.name);
+                applied.users = changed;
+                applied.render = changed;
+            }
             Message::UserProp(prop) => {
                 let changed = self.set_user_props(prop.user_id, &prop.props);
                 applied.users = changed;
@@ -515,6 +519,11 @@ impl SessionState {
                     "server asked this client to authenticate; it cannot answer yet, so logon will not complete",
                 ));
             }
+            Message::NavError(err) => {
+                applied
+                    .chat
+                    .push(self.system_line(ChatKind::Error, err.describe()));
+            }
             Message::RoomDescription(_) => {
                 match palace_room::decode_payload(&frame.payload, order) {
                     Ok(room) => {
@@ -606,6 +615,24 @@ impl SessionState {
         let changed = user.color != color;
         user.color = color;
         changed
+    }
+
+    /// Apply a server-reported rename (`usrN`) to a known user.
+    ///
+    /// Assigns rather than merging: the spec makes the received name
+    /// authoritative, which is how a failed rename is reverted — the server
+    /// sends the previous name back and this puts it in place. An unknown user
+    /// is ignored; `usrN` renames someone the client already knows, it does not
+    /// introduce a new user.
+    fn set_user_name(&mut self, user_id: i32, name: &str) -> bool {
+        let Some(user) = self.known_user_mut(user_id) else {
+            return false;
+        };
+        if user.name == name {
+            return false;
+        }
+        user.name = name.to_string();
+        true
     }
 
     /// Replace a user's worn props wholesale, in the order received.
@@ -868,6 +895,49 @@ mod tests {
             "a server asking for authentication must be reported, because silence here is an unexplained stall: {:?}",
             applied.chat
         );
+    }
+
+    #[test]
+    fn a_refused_room_change_is_reported_to_the_user() {
+        let mut state = room_state();
+
+        // The user asked for room 7715 and the server refused it as unknown.
+        let applied = state.apply(
+            &Frame::new(opcode::NAVERROR, 1, Vec::new()),
+            ByteOrder::Little,
+        );
+
+        let line = applied
+            .chat
+            .iter()
+            .find(|line| line.text.contains("room change failed"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a refused room change must be visible, not silent: {:?}",
+                    applied.chat
+                )
+            });
+        assert_eq!(line.kind, ChatKind::Error);
+        assert!(
+            line.text.contains("unknown room"),
+            "the failure must be named in words, not just a number: {:?}",
+            line.text
+        );
+        assert_eq!(state.last_error(), Some(line.text.as_str()));
+    }
+
+    #[test]
+    fn navigate_frame_truncates_ids_above_65535_to_their_low_16_bits() {
+        let state = room_state();
+        for (requested, expected) in [(73251i32, 7715u16), (73202, 7666)] {
+            let frame = state.navigate_frame(requested);
+            let encoded = frame.encode(ByteOrder::Little).expect("encodes");
+            assert_eq!(
+                &encoded[12..14],
+                expected.to_le_bytes(),
+                "room {requested} must encode as {expected} (low 16 bits)"
+            );
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@ use palace_client::{
     ChatKind, ClientConfig, ClientEvent, ClientHandle, ConnectionStatus, RoomInfo, ScreenState,
     ServerBanner, UserInfo,
 };
-use palace_wire::byteorder::{ByteOrder, Writer};
+use palace_wire::byteorder::{ByteOrder, Reader, Writer};
 use palace_wire::fixture::{default_fixture_dir, Fixture};
 use palace_wire::frame::Frame;
 use palace_wire::messages::{reference_logon_record, AssetSpec, Message, Point, UserRec};
@@ -150,6 +150,15 @@ fn user_color_frame(order: ByteOrder, id: i32, color: i16) -> Vec<u8> {
     Frame::new(opcode::USERCOLOR, id, w.into_vec())
         .encode(order)
         .expect("usrC encodes")
+}
+
+/// A `usrN` body built independently of the crate encoder: a plain `PString`.
+fn user_name_frame(order: ByteOrder, id: i32, name: &str) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_pstring(name);
+    Frame::new(opcode::USERNAME, id, w.into_vec())
+        .encode(order)
+        .expect("usrN encodes")
 }
 
 fn user_prop_frame(order: ByteOrder, id: i32, props: &[(i32, u32)]) -> Vec<u8> {
@@ -1292,18 +1301,26 @@ fn a_click_at_a_viewport_pixel_lands_on_the_room_cell_the_frame_drew_there() {
     for zoom in [1.0, 1.5, 2.0] {
         for dpr in [1.0, 1.25, 2.0] {
             handle.set_viewport(1000.0, 700.0, dpr, zoom, false);
+            // Wait for the frame the *requested* viewport produced, not simply a
+            // 1000-wide one: a leftover frame from the previous zoom would carry
+            // the old transform and make the click map through it.
+            let matches_request = |screen: &&ScreenState| {
+                (screen.geometry.viewport_w - 1000.0).abs() < 1e-9
+                    && (screen.geometry.zoom - zoom).abs() < 1e-9
+                    && (screen.geometry.dpr - dpr).abs() < 1e-9
+            };
             let events = collect_events(
                 &mut rx,
                 |collected| {
-                    screens(collected).iter().any(|screen| {
-                        screen.room_id == 901 && (screen.geometry.viewport_w - 1000.0).abs() < 1e-9
-                    })
+                    screens(collected)
+                        .iter()
+                        .any(|screen| screen.room_id == 901 && matches_request(screen))
                 },
                 Duration::from_secs(10),
             );
             let screen = *screens(&events)
                 .iter()
-                .find(|screen| (screen.geometry.viewport_w - 1000.0).abs() < 1e-9)
+                .find(|screen| screen.room_id == 901 && matches_request(screen))
                 .expect("the requested viewport was composited");
             let transform = screen.geometry.transform();
             for (room_x, room_y) in [
@@ -2452,6 +2469,250 @@ fn a_self_user_appearance_message_reaches_the_self_record() {
 }
 
 #[test]
+fn a_script_rename_sends_a_usern_frame_with_our_id_and_name() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, mut rx, screen, cache, seed) =
+        start_room_with_self(&fixture, "rename-send");
+    let initial_version = screen.version;
+
+    handle.run_script("\"Bob\" SETUSERNAME");
+    assert!(
+        wait_for(
+            || server
+                .received_frames(order)
+                .iter()
+                .any(|frame| frame.opcode == opcode::USERNAME),
+            Duration::from_secs(5)
+        ),
+        "SETUSERNAME reached the server as a usrN frame"
+    );
+    match sent_message(&server, order, opcode::USERNAME) {
+        Message::UserName(name) => {
+            assert_eq!(name.user_id, SELF_ID, "the rename names our own user id");
+            assert_eq!(name.name, "Bob");
+        }
+        other => panic!("expected UserName, got {other:?}"),
+    }
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("script: SETUSERNAME \"Bob\""))
+                && screens(collected)
+                    .iter()
+                    .any(|screen| screen.room_id == 901 && screen.version > initial_version)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("script: SETUSERNAME \"Bob\"")),
+        "the rename was reported: {:?}",
+        notes(&events)
+    );
+    assert!(
+        !notes(&events)
+            .iter()
+            .any(|text| text.contains("local only")),
+        "the stale '(local only)' note is gone: {:?}",
+        notes(&events)
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.room_id == 901 && screen.version > initial_version),
+        "the rename was applied locally at once and forced a re-render: {:?}",
+        screens(&events)
+            .iter()
+            .map(|screen| screen.version)
+            .collect::<Vec<_>>()
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_usern_for_another_user_renames_that_user() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(user_new_frame(
+        order,
+        21,
+        "Other",
+        1,
+        2,
+        &[],
+        Point::new(100, 120),
+    ));
+    let tail = vec![user_name_frame(order, 21, "Renamed")];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("remote-rename-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+                && user_lists(collected).iter().any(|users| {
+                    users
+                        .iter()
+                        .any(|user| user.id == 21 && user.name == "Other")
+                })
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        user_lists(&events).iter().any(|users| users
+            .iter()
+            .any(|user| user.id == 21 && user.name == "Other")),
+        "another user entered before the rename: {:?}",
+        user_lists(&events)
+    );
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            user_lists(collected).iter().any(|users| {
+                users
+                    .iter()
+                    .any(|user| user.id == 21 && user.name == "Renamed")
+            })
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        user_lists(&events).iter().any(|users| users
+            .iter()
+            .any(|user| user.id == 21 && user.name == "Renamed")),
+        "usrN renamed the other user and re-emitted the room list: {:?}",
+        user_lists(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_usern_for_the_local_user_with_the_previous_name_reverts_it() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(self_user_frame(order));
+    let tail = vec![user_name_frame(order, SELF_ID, "RustProbe")];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("self-revert-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+                && user_lists(collected).iter().any(|users| {
+                    users
+                        .iter()
+                        .any(|user| user.id == SELF_ID && user.name == "RustProbe")
+                })
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        user_lists(&events).iter().any(|users| users
+            .iter()
+            .any(|user| user.id == SELF_ID && user.name == "RustProbe")),
+        "our user entered as RustProbe: {:?}",
+        user_lists(&events)
+    );
+
+    // Rename ourselves locally. The mock server is gated, so it has not
+    // answered yet; the model must already read "Bob", which shows as a fresh
+    // render of the name tag.
+    let entry_version = screens(&events)
+        .iter()
+        .find(|screen| screen.room_id == 901)
+        .map(|screen| screen.version)
+        .expect("the entered room was composited");
+    handle.run_script("\"Bob\" SETUSERNAME");
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901 && screen.version > entry_version)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.room_id == 901 && screen.version > entry_version),
+        "the local rename was applied at once and forced a re-render: {:?}",
+        screens(&events)
+            .iter()
+            .map(|screen| screen.version)
+            .collect::<Vec<_>>()
+    );
+
+    // The documented failure path: the server reports the *previous* name back.
+    // Applying it verbatim must put RustProbe in place, so a Users event for the
+    // self user can only be emitted if "Bob" had been applied locally first.
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            user_lists(collected).iter().any(|users| {
+                users
+                    .iter()
+                    .any(|user| user.id == SELF_ID && user.name == "RustProbe")
+            })
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        user_lists(&events).iter().any(|users| users
+            .iter()
+            .any(|user| user.id == SELF_ID && user.name == "RustProbe")),
+        "the server's previous-name reply reverted the local rename: {:?}",
+        user_lists(&events)
+    );
+
+    match sent_message(&server, order, opcode::USERNAME) {
+        Message::UserName(name) => {
+            assert_eq!(name.user_id, SELF_ID);
+            assert_eq!(name.name, "Bob", "the rename we asked for was sent");
+        }
+        other => panic!("expected UserName, got {other:?}"),
+    }
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
 fn propnew_appends_a_loose_prop_that_reaches_the_composited_frame() {
     let fixture = logon_fixture();
     let order = fixture.byte_order;
@@ -2790,12 +3051,14 @@ fn propdel_minus_one_clears_every_loose_prop() {
 }
 
 // ---------------------------------------------------------------------------
-// Door locks: a locked door is a door whose hotspot state is 1, so a click on
-// it is refused locally instead of dispatching SELECT
+// Door locks: only a lockable door (`HS_LockableDoor`, type 3) whose hotspot
+// state is 1 is refused locally instead of dispatching SELECT. A plain door's
+// state is a picture selector, so state 1 must still dispatch.
 // ---------------------------------------------------------------------------
 
-/// Find the first door in a room that also has an `ON SELECT` handler, so a
-/// click on it is observably dispatched when it is not locked.
+/// Find the first plain door (`HS_Door`, type 1) in a room that also has an
+/// `ON SELECT` handler, so a click on it is observably dispatched when it is
+/// not refused.
 fn clickable_door(room: &palace_room::RoomDesc) -> &palace_room::Hotspot {
     room.hotspots
         .iter()
@@ -2809,6 +3072,21 @@ fn clickable_door(room: &palace_room::RoomDesc) -> &palace_room::Hotspot {
         .expect("the room has a door with an ON SELECT script")
 }
 
+/// Find the first lockable door (`HS_LockableDoor`, type 3) with an
+/// `ON SELECT` handler: the only door whose state-1 click may be refused.
+fn lockable_door(room: &palace_room::RoomDesc) -> &palace_room::Hotspot {
+    room.hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot.hotspot_type == 3
+                && hotspot
+                    .script
+                    .as_deref()
+                    .is_some_and(|script| script.contains("ON SELECT"))
+        })
+        .expect("the room has a lockable door with an ON SELECT script")
+}
+
 /// The viewport point that hits a hotspot's anchor, through the transform the
 /// compositor reported.
 fn hotspot_click(spot: &palace_room::Hotspot, screen: &ScreenState) -> (f64, f64) {
@@ -2820,6 +3098,17 @@ fn hotspot_click(spot: &palace_room::Hotspot, screen: &ScreenState) -> (f64, f64
             f64::from(spot.loc.v),
         ));
     (point.x, point.y)
+}
+
+/// The room id of the first `ROOMGOTO` (`navR`) frame the client sent, if any.
+/// The client sends it when a script's `GOTOROOM` becomes an effect, and the
+/// server answers it with the destination room's descriptor.
+fn sent_room_goto(server: &MockServer, order: ByteOrder) -> Option<u16> {
+    let frames = server.received_frames(order);
+    let frame = frames
+        .iter()
+        .find(|frame| frame.opcode == opcode::ROOMGOTO)?;
+    Reader::new(&frame.payload, order).read_u16().ok()
 }
 
 /// Room 887's `ON ENTER` arms a one-shot `1 ALARMEXEC` that rewrites door 1 and
@@ -2838,14 +3127,15 @@ fn wait_for_entry_alarm(handle: &ClientHandle, screen: &ScreenState) {
 }
 
 #[test]
-fn a_click_on_a_locked_door_is_refused_without_dispatching_select() {
-    const LOCK_MARKER: &str = "door-lock-processed";
+fn a_click_on_a_plain_door_with_state_one_still_dispatches_select() {
+    const LOCK_MARKER: &str = "plain-door-lock-processed";
     let fixture = logon_fixture();
     let order = fixture.byte_order;
     let payload = room_payload("887");
     let room = palace_room::decode_payload(&payload, order).expect("room 887 decodes");
     let door = clickable_door(&room);
-    assert_eq!(door.state, 0, "the fixture door starts unlocked");
+    assert_eq!(door.hotspot_type, 1, "HS_Door, which cannot be locked");
+    assert_eq!(door.state, 0, "the fixture door starts at picture 0");
 
     let mut initial = vec![server_bytes(&fixture)[0].clone()];
     initial.push(
@@ -2858,7 +3148,7 @@ fn a_click_on_a_locked_door_is_refused_without_dispatching_select() {
         talk_marker_frame(order, LOCK_MARKER),
     ];
     let (server, gate) = MockServer::start_gated(initial, tail);
-    let cache = unique_temp_dir("locked-door-cache");
+    let cache = unique_temp_dir("plain-door-cache");
     let seed = seed_solid_media_dir(&room, BRIGHT);
     let (handle, stream) =
         ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
@@ -2879,31 +3169,6 @@ fn a_click_on_a_locked_door_is_refused_without_dispatching_select() {
         .expect("a frame was composed for room 887");
     let (x, y) = hotspot_click(door, screen);
     wait_for_entry_alarm(&handle, screen);
-
-    handle.set_mouse(300, 200);
-    handle.click(x, y);
-    let events = collect_events(
-        &mut rx,
-        |collected| {
-            script_runs(collected)
-                .iter()
-                .any(|run| run.event == "SELECT" && run.fired >= 1)
-        },
-        Duration::from_secs(10),
-    );
-    assert!(
-        script_runs(&events)
-            .iter()
-            .any(|run| run.event == "SELECT" && run.fired >= 1),
-        "an unlocked door still dispatches SELECT: {:?}",
-        script_runs(&events)
-    );
-    assert!(
-        !notes(&events)
-            .iter()
-            .any(|text| text.contains("locked door")),
-        "nothing was refused while the door was unlocked"
-    );
 
     gate.store(true, Ordering::Relaxed);
     let events = collect_events(
@@ -2921,27 +3186,33 @@ fn a_click_on_a_locked_door_is_refused_without_dispatching_select() {
         chats(&events)
     );
 
+    handle.set_mouse(300, 200);
     handle.click(x, y);
     let events = collect_events(
         &mut rx,
         |collected| {
-            notes(collected)
+            script_runs(collected)
                 .iter()
-                .any(|text| text.contains("locked door"))
+                .any(|run| run.event == "SELECT" && run.fired >= 1)
+                || notes(collected)
+                    .iter()
+                    .any(|text| text.contains("locked door"))
         },
         Duration::from_secs(10),
     );
     assert!(
-        notes(&events)
+        script_runs(&events)
             .iter()
-            .any(|text| text.contains("locked door")),
-        "the locked door was refused: {:?}",
+            .any(|run| run.event == "SELECT" && run.fired >= 1),
+        "a plain door at state 1 must dispatch SELECT: {:?}",
         notes(&events)
     );
     assert!(
-        !script_runs(&events).iter().any(|run| run.event == "SELECT"),
-        "the refused click did not dispatch SELECT: {:?}",
-        script_runs(&events)
+        !notes(&events)
+            .iter()
+            .any(|text| text.contains("locked door")),
+        "a plain door is never refused, whatever its picture state: {:?}",
+        notes(&events)
     );
 
     handle.disconnect();
@@ -2955,9 +3226,9 @@ fn a_lock_for_another_room_does_not_refuse_this_rooms_door() {
     const MARKER: &str = "foreign-lock-processed";
     let fixture = logon_fixture();
     let order = fixture.byte_order;
-    let payload = room_payload("887");
-    let room = palace_room::decode_payload(&payload, order).expect("room 887 decodes");
-    let door = clickable_door(&room);
+    let payload = room_payload("86");
+    let room = palace_room::decode_payload(&payload, order).expect("room 86 decodes");
+    let door = lockable_door(&room);
 
     let mut initial = vec![server_bytes(&fixture)[0].clone()];
     initial.push(
@@ -2967,7 +3238,7 @@ fn a_lock_for_another_room_does_not_refuse_this_rooms_door() {
     );
     let tail = vec![
         door_lock_frame(order, 999, door.id),
-        spot_state_frame(order, 887, 33, 1),
+        spot_state_frame(order, 86, 1, 1),
         talk_marker_frame(order, MARKER),
     ];
     let (server, gate) = MockServer::start_gated(initial, tail);
@@ -2979,19 +3250,14 @@ fn a_lock_for_another_room_does_not_refuse_this_rooms_door() {
 
     let events = collect_events(
         &mut rx,
-        |collected| {
-            screens(collected)
-                .iter()
-                .any(|screen| screen.room_id == 887)
-        },
+        |collected| screens(collected).iter().any(|screen| screen.room_id == 86),
         Duration::from_secs(20),
     );
     let screen = screens(&events)
         .into_iter()
-        .find(|screen| screen.room_id == 887)
-        .expect("a frame was composed for room 887");
+        .find(|screen| screen.room_id == 86)
+        .expect("a frame was composed for room 86");
     let (x, y) = hotspot_click(door, screen);
-    wait_for_entry_alarm(&handle, screen);
 
     gate.store(true, Ordering::Relaxed);
     let events = collect_events(
@@ -3038,6 +3304,206 @@ fn a_lock_for_another_room_does_not_refuse_this_rooms_door() {
             .iter()
             .any(|text| text.contains("locked door")),
         "the foreign lock produced no refusal here: {:?}",
+        notes(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_click_on_a_lockable_door_that_is_locked_is_still_refused() {
+    const LOCK_MARKER: &str = "lockable-door-lock-processed";
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("86");
+    let room = palace_room::decode_payload(&payload, order).expect("room 86 decodes");
+    let door = lockable_door(&room);
+    assert_eq!(door.hotspot_type, 3, "HS_LockableDoor");
+    assert_eq!(door.state, 0, "the lockable fixture door starts unlocked");
+
+    let mut initial = vec![server_bytes(&fixture)[0].clone()];
+    initial.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let tail = vec![
+        door_lock_frame(order, 86, door.id),
+        talk_marker_frame(order, LOCK_MARKER),
+    ];
+    let (server, gate) = MockServer::start_gated(initial, tail);
+    let cache = unique_temp_dir("lockable-door-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| screens(collected).iter().any(|screen| screen.room_id == 86),
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 86)
+        .expect("a frame was composed for room 86");
+    let (x, y) = hotspot_click(door, screen);
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            chats(collected)
+                .iter()
+                .any(|text| text.contains(LOCK_MARKER))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        chats(&events).iter().any(|text| text.contains(LOCK_MARKER)),
+        "the DOORLOCK frame was processed before the click: {:?}",
+        chats(&events)
+    );
+
+    handle.set_mouse(300, 200);
+    handle.click(x, y);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("locked door"))
+                || script_runs(collected)
+                    .iter()
+                    .any(|run| run.event == "SELECT" && run.fired >= 1)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("locked door")),
+        "a lockable door at state 1 is still refused: {:?}",
+        notes(&events)
+    );
+    assert!(
+        !script_runs(&events).iter().any(|run| run.event == "SELECT"),
+        "the refused click did not dispatch SELECT: {:?}",
+        script_runs(&events)
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains(&format!("hit hotspot {}", door.id))),
+        "the click landed on the door: {:?}",
+        notes(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_click_on_a_door_sends_the_room_change_to_its_destination() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("25567");
+    let room = palace_room::decode_payload(&payload, order).expect("room 25567 decodes");
+    let door = room
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot.hotspot_type == 1
+                && hotspot.dest != 0
+                && hotspot.script.as_deref().is_some_and(|script| {
+                    script.contains("ON SELECT") && script.contains("DEST GOTOROOM")
+                })
+        })
+        .expect("room 25567 has a door whose SELECT walks its DEST");
+    assert_eq!(door.hotspot_type, 1, "HS_Door");
+    assert_eq!(door.dest, 889, "the door's destination room");
+
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("door-gotoroom-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 25567)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 25567)
+        .expect("a frame was composed for room 25567");
+    assert!(
+        sent_room_goto(&server, order).is_none(),
+        "the client asked to change rooms before the door was clicked"
+    );
+
+    let (x, y) = hotspot_click(door, screen);
+    handle.set_mouse(300, 200);
+    handle.click(x, y);
+
+    assert!(
+        wait_for(
+            || sent_room_goto(&server, order).is_some(),
+            Duration::from_secs(10)
+        ),
+        "the clicked door's DEST GOTOROOM sent a room-change request"
+    );
+    assert_eq!(
+        sent_room_goto(&server, order),
+        Some(door.dest as u16),
+        "the room-change request names the clicked door's destination"
+    );
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains(&format!("script: GOTOROOM {}", door.dest)))
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains(&format!("hit hotspot {}", door.id))),
+        "the click landed on the door, not a neighbour: {:?}",
+        notes(&events)
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains(&format!("script: GOTOROOM {}", door.dest))),
+        "the door's script reported GOTOROOM to its destination: {:?}",
+        notes(&events)
+    );
+    assert!(
+        !notes(&events)
+            .iter()
+            .any(|text| text.contains("locked door")),
+        "a plain door is never refused: {:?}",
         notes(&events)
     );
 
@@ -3131,6 +3597,678 @@ fn a_non_door_hotspot_with_a_nonzero_state_still_dispatches_select() {
             .any(|text| text.contains("locked door")),
         "an ordinary hotspot is never refused: {:?}",
         notes(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+// ---------------------------------------------------------------------------
+// Walk, visibility and appearance commands
+// ---------------------------------------------------------------------------
+
+/// Serve the handshake, the room descriptor and the self user, then wait for the
+/// composited room frame every one of these tests starts from.
+fn start_room_with_self(
+    fixture: &Fixture,
+    tag: &str,
+) -> (
+    MockServer,
+    ClientHandle,
+    UnboundedReceiver<ClientEvent>,
+    ScreenState,
+    PathBuf,
+    PathBuf,
+) {
+    let order = fixture.byte_order;
+    let room = room_desc(fixture);
+    let mut frames = room_only_frames(fixture);
+    frames.push(self_user_frame(order));
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir(&format!("{tag}-cache"));
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901 && screen.avatars >= 1)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901 && screen.avatars >= 1)
+        .expect("a frame with the self user was composed for room 901")
+        .clone();
+    (server, handle, rx, screen, cache, seed)
+}
+
+/// The first frame the client sent with `wanted`'s opcode, decoded.
+fn sent_message(
+    server: &MockServer,
+    order: ByteOrder,
+    wanted: palace_wire::opcode::Opcode,
+) -> Message {
+    let frames = server.received_frames(order);
+    let frame = frames
+        .iter()
+        .find(|frame| frame.opcode == wanted)
+        .unwrap_or_else(|| panic!("the client sent {}", wanted.describe()));
+    Message::decode(frame.opcode, frame.ref_num, &frame.payload, order)
+        .unwrap_or_else(|error| panic!("{} decodes: {error}", wanted.describe()))
+}
+
+/// Every `USERMOVE` the client sent, decoded to `(x, y)` in send order.
+fn sent_moves(server: &MockServer, order: ByteOrder) -> Vec<(i32, i32)> {
+    server
+        .received_frames(order)
+        .iter()
+        .filter(|frame| frame.opcode == opcode::USERMOVE)
+        .map(|frame| {
+            match Message::decode(frame.opcode, frame.ref_num, &frame.payload, order)
+                .expect("uLoc decodes")
+            {
+                Message::UserMove(mv) => (i32::from(mv.position.h), i32::from(mv.position.v)),
+                other => panic!("expected UserMove, got {other:?}"),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn a_floor_click_walks_while_a_hotspot_click_still_selects_and_does_not() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let (server, handle, mut rx, screen, cache, seed) = start_room_with_self(&fixture, "walk");
+
+    // A room point far outside every hotspot is the floor: the click walks.
+    let empty = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
+    handle.click(empty.x, empty.y);
+
+    assert!(
+        wait_for(
+            || server
+                .received_frames(order)
+                .iter()
+                .any(|frame| frame.opcode == opcode::USERMOVE),
+            Duration::from_secs(5)
+        ),
+        "a bare floor click sent MSG_USERMOVE"
+    );
+    let expected = (
+        screen.geometry.room_w as i32 - 22,
+        screen.geometry.room_h as i32 - 22,
+    );
+    let frames = server.received_frames(order);
+    let moved = frames
+        .iter()
+        .find(|frame| frame.opcode == opcode::USERMOVE)
+        .expect("a usermove frame");
+    assert_eq!(moved.ref_num, SELF_ID, "refNum names the moving user");
+    match Message::decode(moved.opcode, moved.ref_num, &moved.payload, order).expect("uLoc decodes")
+    {
+        Message::UserMove(mv) => assert_eq!(
+            (i32::from(mv.position.h), i32::from(mv.position.v)),
+            expected,
+            "the target is clamped to the avatar margin, like the renderer"
+        ),
+        other => panic!("expected UserMove, got {other:?}"),
+    }
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("walking to room"))
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("hit no hotspot")),
+        "the walk still reports the click hit no hotspot: {:?}",
+        notes(&events)
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("walking to room")),
+        "and reports the move: {:?}",
+        notes(&events)
+    );
+
+    // A hotspot click keeps its old path and must not also walk.
+    let spot = room
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot
+                .script
+                .as_deref()
+                .is_some_and(|script| script.contains("ON SELECT"))
+        })
+        .expect("the room has a scripted hotspot");
+    let before = server
+        .received_frames(order)
+        .iter()
+        .filter(|frame| frame.opcode == opcode::USERMOVE)
+        .count();
+    let (x, y) = hotspot_click(spot, &screen);
+    handle.click(x, y);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "SELECT" && run.fired >= 1)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        script_runs(&events)
+            .iter()
+            .any(|run| run.event == "SELECT" && run.fired >= 1),
+        "the hotspot still dispatches SELECT: {:?}",
+        notes(&events)
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("hit hotspot")),
+        "the hotspot click is still reported as a hit: {:?}",
+        notes(&events)
+    );
+    let after = server
+        .received_frames(order)
+        .iter()
+        .filter(|frame| frame.opcode == opcode::USERMOVE)
+        .count();
+    assert_eq!(before, after, "a hotspot click must not also walk");
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_setpos_script_moves_the_local_user_to_the_clamped_position() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, mut rx, screen, cache, seed) = start_room_with_self(&fixture, "setpos");
+    let expected = (screen.geometry.room_w as i32 - 22, 22);
+    let initial_version = screen.version;
+
+    handle.run_script("9000 -50 SETPOS");
+    assert!(
+        wait_for(
+            || !sent_moves(&server, order).is_empty(),
+            Duration::from_secs(5)
+        ),
+        "a SETPOS script sent MSG_USERMOVE"
+    );
+    assert_eq!(
+        sent_moves(&server, order),
+        vec![expected],
+        "SETPOS is clamped to the room, exactly as the frame is"
+    );
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.version > initial_version)
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.version > initial_version),
+        "the move forced a re-render: {:?}",
+        screens(&events)
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains(&format!("SETPOS to ({},{})", expected.0, expected.1))),
+        "the note states the position come to rest at: {:?}",
+        notes(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_move_script_moves_the_local_user_relative_to_where_they_stand() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, mut rx, _screen, cache, seed) = start_room_with_self(&fixture, "move-rel");
+
+    handle.run_script("100 100 SETPOS");
+    assert!(
+        wait_for(
+            || sent_moves(&server, order).len() == 1,
+            Duration::from_secs(5)
+        ),
+        "the SETPOS that fixes the origin landed"
+    );
+    assert_eq!(sent_moves(&server, order), vec![(100, 100)]);
+
+    handle.run_script("10 20 MOVE");
+    assert!(
+        wait_for(
+            || sent_moves(&server, order).len() == 2,
+            Duration::from_secs(5)
+        ),
+        "the MOVE landed"
+    );
+    assert_eq!(
+        sent_moves(&server, order),
+        vec![(100, 100), (110, 120)],
+        "MOVE is relative to the position we stand at, not the room origin"
+    );
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("MOVE (10,20) to (110,120)"))
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("MOVE (10,20) to (110,120)")),
+        "the note names the delta and the rest position: {:?}",
+        notes(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn the_local_position_after_a_setpos_is_the_position_in_the_sent_frame() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, _rx, _screen, cache, seed) = start_room_with_self(&fixture, "move-local");
+
+    handle.run_script("100 200 SETPOS");
+    assert!(
+        wait_for(
+            || sent_moves(&server, order).len() == 1,
+            Duration::from_secs(5)
+        ),
+        "the SETPOS landed"
+    );
+    let setpos = sent_moves(&server, order)[0];
+    assert_eq!(setpos, (100, 200));
+
+    // A relative move is computed from the local model. If SETPOS had not been
+    // applied locally, this frame would be relative to the old position.
+    handle.run_script("10 20 MOVE");
+    assert!(
+        wait_for(
+            || sent_moves(&server, order).len() == 2,
+            Duration::from_secs(5)
+        ),
+        "the MOVE landed"
+    );
+    let moves = sent_moves(&server, order);
+    assert_eq!(
+        moves[1],
+        (setpos.0 + 10, setpos.1 + 20),
+        "the local model took the SETPOS position, so the next relative move starts there"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn hiding_avatars_empties_the_scene_and_showing_restores_it() {
+    let fixture = logon_fixture();
+    let (server, handle, mut rx, screen, cache, seed) =
+        start_room_with_self(&fixture, "visibility");
+    assert!(
+        screen.avatars >= 1,
+        "the self user is drawn before anything is hidden"
+    );
+
+    handle.set_visibility(true, false);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901 && screen.avatars == 0)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.room_id == 901 && screen.avatars == 0),
+        "hiding avatars leaves none in the composed scene: {:?}",
+        screens(&events)
+    );
+
+    handle.set_visibility(true, true);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901 && screen.avatars >= 1)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.room_id == 901 && screen.avatars >= 1),
+        "showing avatars restores them: {:?}",
+        screens(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn set_avatar_sends_the_face_and_colour_frames_normalised() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, _rx, screen, cache, seed) = start_room_with_self(&fixture, "set-avatar");
+
+    handle.set_avatar(2, 3);
+    assert!(
+        wait_for(
+            || {
+                let frames = server.received_frames(order);
+                frames.iter().any(|frame| frame.opcode == opcode::USERFACE)
+                    && frames.iter().any(|frame| frame.opcode == opcode::USERCOLOR)
+            },
+            Duration::from_secs(5)
+        ),
+        "set_avatar sent both MSG_USERFACE and MSG_USERCOLOR"
+    );
+    match sent_message(&server, order, opcode::USERFACE) {
+        Message::UserFace(face) => {
+            assert_eq!(face.face_nbr, 2);
+            assert_eq!(face.user_id, SELF_ID);
+        }
+        other => panic!("expected UserFace, got {other:?}"),
+    }
+    match sent_message(&server, order, opcode::USERCOLOR) {
+        Message::UserColor(color) => {
+            assert_eq!(color.color_nbr, 3);
+            assert_eq!(color.user_id, SELF_ID);
+        }
+        other => panic!("expected UserColor, got {other:?}"),
+    }
+
+    // Values past the sheet are normalised before they reach the wire: face 99
+    // wraps to 0, colour 99 clamps to the last colour.
+    handle.set_avatar(99, 99);
+    assert!(
+        wait_for(
+            || {
+                let frames = server.received_frames(order);
+                let face = frames
+                    .iter()
+                    .filter(|frame| frame.opcode == opcode::USERFACE)
+                    .count();
+                let color = frames
+                    .iter()
+                    .filter(|frame| frame.opcode == opcode::USERCOLOR)
+                    .count();
+                face >= 2 && color >= 2
+            },
+            Duration::from_secs(5)
+        ),
+        "the clamped request also sent both frames"
+    );
+    let frames = server.received_frames(order);
+    let last_face = frames
+        .iter()
+        .rfind(|frame| frame.opcode == opcode::USERFACE)
+        .expect("a face frame");
+    match Message::decode(
+        last_face.opcode,
+        last_face.ref_num,
+        &last_face.payload,
+        order,
+    )
+    .expect("usrF decodes")
+    {
+        Message::UserFace(face) => assert_eq!(face.face_nbr, 0, "face 99 wraps to face 0"),
+        other => panic!("expected UserFace, got {other:?}"),
+    }
+    let last_color = frames
+        .iter()
+        .rfind(|frame| frame.opcode == opcode::USERCOLOR)
+        .expect("a colour frame");
+    match Message::decode(
+        last_color.opcode,
+        last_color.ref_num,
+        &last_color.payload,
+        order,
+    )
+    .expect("usrC decodes")
+    {
+        Message::UserColor(color) => {
+            assert_eq!(color.color_nbr, 15, "colour 99 clamps to the last colour")
+        }
+        other => panic!("expected UserColor, got {other:?}"),
+    }
+
+    assert!(
+        handle.frames().version() > screen.version,
+        "the change re-rendered the frame without waiting for a server echo"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+/// The name a frame draws above an avatar is the name the wire carried in the
+/// `UserRec`, and it is rasterized for the *specific* string on the spec — not
+/// just "some tag". The same test checks that the prop filter still wins: a user
+/// whose prop art never arrives is skipped, so they must get no tag at all.
+///
+/// This is the guard that failed while `avatar_specs` left `AvatarSpec::name`
+/// `None`: every tag was silently suppressed and the whole suite stayed green.
+#[test]
+fn a_named_user_reaches_the_frame_as_a_name_tag() {
+    const NAME: &str = "Alpha";
+    const GHOST: &str = "Ghost";
+    const OTHER_ID: i32 = 77;
+    const GHOST_ID: i32 = 78;
+    const MISSING_PROP: u32 = 4_242;
+
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(user_new_frame(
+        order,
+        OTHER_ID,
+        NAME,
+        3,
+        5,
+        &[],
+        Point::new(200, 240),
+    ));
+    frames.push(user_new_frame(
+        order,
+        GHOST_ID,
+        GHOST,
+        3,
+        5,
+        &[MISSING_PROP],
+        Point::new(100, 100),
+    ));
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("name-tag-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    // The named user is drawn; the one wearing an unseeded prop is skipped and
+    // counted. Wait for the frame that reports exactly that.
+    fn drawn_and_skipped(screen: &&ScreenState) -> bool {
+        screen.room_id == 901
+            && screen.avatars == 1
+            && screen
+                .notes
+                .iter()
+                .any(|note| note.contains("prop art not received"))
+    }
+    let events = collect_events(
+        &mut rx,
+        |collected| screens(collected).iter().any(drawn_and_skipped),
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(drawn_and_skipped)
+        .expect("the named user was drawn and the prop-less one skipped")
+        .clone();
+    assert_eq!(
+        screen.avatars, 1,
+        "the prop filter still skips the user whose art has not arrived"
+    );
+
+    // A settled frame with names visible, then the same frame with names off.
+    // Avatars stay on, so the only difference is the tags.
+    let visible_version = settled_frame_version(&handle, Duration::from_secs(5));
+    let with_names = frame_rgba(&handle.frames().png().expect("a composed frame"));
+    handle.set_visibility(false, true);
+    assert!(
+        wait_for(
+            || handle.frames().version() > visible_version,
+            Duration::from_secs(5)
+        ),
+        "toggling names re-rendered the frame"
+    );
+    settled_frame_version(&handle, Duration::from_secs(5));
+    let without_names = frame_rgba(&handle.frames().png().expect("a composed frame"));
+
+    let width = screen.geometry.bitmap_w as usize;
+    let height = screen.geometry.bitmap_h as i64;
+    let room_w = screen.geometry.room_w as i32;
+    let room_h = screen.geometry.room_h as i32;
+    // The tag blit origin, exactly as `draw_name_tag` computes it.
+    let tag_origin = |name: &str, anchor: (i32, i32)| {
+        let tag = palace_render::name_tag(name).expect("the name rasterizes");
+        let (text_x, text_y) = palace_render::name_tag_position(anchor.0, anchor.1, tag.text_width);
+        let (origin_x, origin_y) = (tag.origin_x, tag.origin_y);
+        (
+            tag,
+            (text_x - f64::from(origin_x)).floor() as i64,
+            (text_y - f64::from(origin_y)).floor() as i64,
+        )
+    };
+    // The wire name's fully opaque glyph pixels must be pure white exactly at the
+    // reference placement. A `None` name draws nothing, so this assertion is what
+    // catches the regression.
+    let alpha = palace_render::clamp_avatar_position(240, 200, room_w, room_h);
+    let (tag, blit_x, blit_y) = tag_origin(NAME, alpha);
+    let mut opaque = 0usize;
+    let mut changed = 0usize;
+    for sy in 0..tag.image.height() {
+        for sx in 0..tag.image.width() {
+            let Some(pixel) = tag.image.pixel(sx, sy) else {
+                continue;
+            };
+            if pixel[3] != 255 {
+                continue;
+            }
+            let dx = blit_x + i64::from(sx);
+            let dy = blit_y + i64::from(sy);
+            if dx < 0 || dy < 0 || dx >= width as i64 || dy >= height {
+                continue;
+            }
+            let at = (dy as usize * width + dx as usize) * 4;
+            opaque += 1;
+            assert_eq!(
+                with_names[at..at + 4],
+                pixel,
+                "the tag for {NAME} must be drawn at ({dx},{dy})"
+            );
+            if with_names[at..at + 4] != without_names[at..at + 4] {
+                changed += 1;
+            }
+        }
+    }
+    assert!(
+        opaque > 0,
+        "the name {NAME} has fully opaque glyph pixels to find"
+    );
+    assert!(changed > 0, "the tag is drawn only while names are visible");
+
+    // The prop filter wins over the name: the skipped user's glyph pixels must
+    // stay un-drawn, proving the two rules do not contradict each other.
+    let ghost_anchor = palace_render::clamp_avatar_position(100, 100, room_w, room_h);
+    let (ghost_tag, ghost_blit_x, ghost_blit_y) = tag_origin(GHOST, ghost_anchor);
+    let mut ghost_opaque = 0usize;
+    let mut ghost_matched = 0usize;
+    for sy in 0..ghost_tag.image.height() {
+        for sx in 0..ghost_tag.image.width() {
+            let Some(pixel) = ghost_tag.image.pixel(sx, sy) else {
+                continue;
+            };
+            if pixel[3] != 255 {
+                continue;
+            }
+            let dx = ghost_blit_x + i64::from(sx);
+            let dy = ghost_blit_y + i64::from(sy);
+            if dx < 0 || dy < 0 || dx >= width as i64 || dy >= height {
+                continue;
+            }
+            ghost_opaque += 1;
+            let at = (dy as usize * width + dx as usize) * 4;
+            if with_names[at..at + 4] == pixel {
+                ghost_matched += 1;
+            }
+        }
+    }
+    assert!(
+        ghost_opaque > 0,
+        "the skipped name has opaque pixels to look for"
+    );
+    assert_eq!(
+        ghost_matched, 0,
+        "a user whose prop art never arrived must not be tagged"
     );
 
     handle.disconnect();

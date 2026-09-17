@@ -152,6 +152,7 @@ pub const PALACE_COMMANDS: &[CommandSpec] = &[
     spec("MACRO", 1, 0, NONE),
     spec("SETCOLOR", 1, 0, NONE),
     spec("SETFACE", 1, 0, NONE),
+    spec("SETUSERNAME", 1, 0, NONE),
     spec("SETALARM", 2, 0, NONE),
     spec("ALARMEXEC", 2, 0, NONE),
     spec("ADDLOOSEPROP", 3, 0, NONE),

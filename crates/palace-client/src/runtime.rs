@@ -14,14 +14,15 @@ use std::time::{Duration, Instant};
 
 use palace_asset::{AssetPipeline, AssetType, PipelineEvent};
 use palace_host::{
-    effect_frame, Effect, HostView, PenState, ScriptEngine, ScriptEvent, UserView, WireContext,
+    effect_frame, move_target, Effect, HostView, PenState, ScriptEngine, ScriptEvent, UserView,
+    WireContext,
 };
 use palace_render::{
-    clamp_dpr, render, AnimationClock, AvatarSpec, MediaStore, PointF, PropStore, RenderOptions,
-    SceneBuilder, SizeF, ViewTransform, COLOR_VARIANTS, FACE_VARIANTS,
+    clamp_avatar_position, clamp_dpr, render, AnimationClock, AvatarSpec, MediaStore, PointF,
+    PropStore, RenderOptions, SceneBuilder, SizeF, ViewTransform, COLOR_VARIANTS, FACE_VARIANTS,
 };
 use palace_wire::byteorder::Writer;
-use palace_wire::frame::Frame;
+use palace_wire::frame::{user_color_frame, user_face_frame, user_move_frame, Frame};
 use palace_wire::messages::{reference_logon_record, AssetSpec, Point, Talk};
 use palace_wire::opcode;
 use serde::Serialize;
@@ -40,15 +41,14 @@ use crate::state::{
 const MEDIA_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const PROP_REQUEST_BUDGET: usize = 80;
 
-/// The `HS_*` types whose `state` may mean locked: `HS_Door` and
-/// `HS_LockableDoor` (protocol reference :1664-1668).
-///
-/// `HS_ShutableDoor` (2) is deliberately absent. Its two states are the pictures
-/// of a door that is opened and closed *by clicking*, so reading state 1 as
-/// "locked" would refuse the click that closes an open door — breaking the one
-/// thing that type exists for. `HS_Bolt` (4) is not a door either: it locks the
-/// door named by its `dest`.
+/// `HS_Door` (1): "a door" (protocol reference :1665). It cannot be locked —
+/// the reference names only `HS_LockableDoor` (3) as "a door that can be
+/// locked" (:1667) — so a plain door's `state` is a picture selector and
+/// nothing else. Named here so the exclusion stays explicit in
+/// [`state_means_locked`].
 const HS_DOOR: i16 = 1;
+/// `HS_LockableDoor` (3): "a door that can be locked" (:1667). The only door
+/// whose `state` may mean `HS_Lock`.
 const HS_LOCKABLE_DOOR: i16 = 3;
 
 /// How to reach a server and what to draw with.
@@ -131,6 +131,14 @@ pub enum ClientCommand {
     Click {
         x: f64,
         y: f64,
+    },
+    SetVisibility {
+        names: bool,
+        avatars: bool,
+    },
+    SetAvatar {
+        face: i16,
+        color: i16,
     },
     RunScript(String),
     SetViewport {
@@ -329,6 +337,16 @@ impl ClientHandle {
     /// Run a bare IPTSCRAE instruction sequence against the live host.
     pub fn run_script(&self, source: impl Into<String>) {
         self.send(ClientCommand::RunScript(source.into()));
+    }
+
+    /// Show or hide name tags and avatars in the composed frame.
+    pub fn set_visibility(&self, names: bool, avatars: bool) {
+        self.send(ClientCommand::SetVisibility { names, avatars });
+    }
+
+    /// Change the signed-in user's face and colour, locally and on the server.
+    pub fn set_avatar(&self, face: i16, color: i16) {
+        self.send(ClientCommand::SetAvatar { face, color });
     }
 
     /// Report the pointer position, in viewport pixels.
@@ -607,6 +625,23 @@ fn run_session(
                 }
                 ClientCommand::Say(text) => say = Some(text),
                 ClientCommand::Click { x, y } => click_pending = Some((x, y)),
+                ClientCommand::SetVisibility { names, avatars } => {
+                    if apply_visibility(&mut state, &mut builder, names, avatars) {
+                        dirty_render = true;
+                    }
+                }
+                ClientCommand::SetAvatar { face, color } => {
+                    let face = normalize_face(i32::from(face));
+                    let color = normalize_color(i32::from(color));
+                    let order = state.byte_order();
+                    conn.send(&user_face_frame(face, state.banner.user_id, order))?;
+                    conn.send(&user_color_frame(color, state.banner.user_id, order))?;
+                    let face_changed = set_self_face(&mut state, i32::from(face));
+                    let color_changed = set_self_color(&mut state, i32::from(color));
+                    if face_changed || color_changed {
+                        dirty_render = true;
+                    }
+                }
                 ClientCommand::RunScript(source) => run_source_pending = Some(source),
                 ClientCommand::SetViewport {
                     width,
@@ -760,7 +795,25 @@ fn run_session(
                             }
                         }
                         None => {
-                            shared.note(format!("script: click at room ({rx},{ry}) hit no hotspot"))
+                            shared
+                                .note(format!("script: click at room ({rx},{ry}) hit no hotspot"));
+                            let (room_w, room_h) = shared.room_size();
+                            match walk_target(&state, room_w, room_h, rx, ry) {
+                                Some((mx, my)) => {
+                                    conn.send(&user_move_frame(
+                                        Point::new(my as i16, mx as i16),
+                                        state.banner.user_id,
+                                        state.byte_order(),
+                                    ))?;
+                                    if apply_self_move(&mut state, mx, my) {
+                                        dirty_render = true;
+                                    }
+                                    shared.note(format!("script: walking to room ({mx},{my})"));
+                                }
+                                None => shared.note(
+                                    "script: click ignored, not connected or no room is loaded",
+                                ),
+                            }
                         }
                     }
                 }
@@ -1236,10 +1289,11 @@ fn avatar_specs(users: &[UserInfo], props: &PropStore) -> (Vec<AvatarSpec>, usiz
                 hidden += 1;
                 return None;
             }
-            Some(
+            let mut spec =
                 AvatarSpec::new(i32::from(user.x), i32::from(user.y), user.props.clone())
-                    .with_face_color(user.face, user.color),
-            )
+                    .with_face_color(user.face, user.color);
+            spec.name = Some(user.name.clone());
+            Some(spec)
         })
         .collect();
     (avatars, hidden)
@@ -1251,6 +1305,25 @@ fn visible_avatars(state: &SessionState, props: &PropStore) -> (Vec<AvatarSpec>,
     } else {
         avatar_specs(&state.users_in_room(), props)
     }
+}
+
+/// Apply a visibility request to the render inputs.
+///
+/// Name tags live on the [`SceneBuilder`] and survive a room change; avatars are
+/// suppressed by [`SessionState::avatars_hidden`], the same switch the
+/// `HIDEAVATARS`/`SHOWAVATARS` effects throw. Returns whether either input moved,
+/// so the caller re-renders only for a real toggle.
+fn apply_visibility(
+    state: &mut SessionState,
+    builder: &mut SceneBuilder,
+    names: bool,
+    avatars: bool,
+) -> bool {
+    let names_changed = builder.name_tags_visible() != names;
+    builder.set_name_tags_visible(names);
+    let avatars_changed = state.avatars_hidden == avatars;
+    state.avatars_hidden = !avatars;
+    names_changed || avatars_changed
 }
 
 /// Build the snapshot a running script observes.
@@ -1313,6 +1386,39 @@ fn click_room_point(shared: &Arc<Shared>, x: f64, y: f64) -> Option<(i32, i32)> 
     let transform = shared.transform()?;
     let point = transform.viewport_to_room(PointF::new(x, y));
     Some((point.x.round() as i32, point.y.round() as i32))
+}
+
+/// The room position a bare floor click asks the signed-in user to walk to.
+///
+/// `None` when there is nowhere to walk: the session is not connected, or no
+/// room is loaded. A target is clamped exactly as the renderer clamps an avatar
+/// anchor, so the client and the frame agree on where the avatar comes to rest.
+fn walk_target(
+    state: &SessionState,
+    room_width: i32,
+    room_height: i32,
+    rx: i32,
+    ry: i32,
+) -> Option<(i32, i32)> {
+    if state.status != ConnectionStatus::Connected || state.room_desc.is_none() {
+        return None;
+    }
+    Some(clamp_avatar_position(rx, ry, room_width, room_height))
+}
+
+/// Apply our own move to the model at once.
+///
+/// The reference server relays a user's own `uLoc` only to the *other* users in
+/// the room (protocol reference :2126), so it never echoes it back; without this
+/// the avatar would not move until the client reconnected.
+fn apply_self_move(state: &mut SessionState, x: i32, y: i32) -> bool {
+    let Some(user) = state.users.get_mut(&state.banner.user_id) else {
+        return false;
+    };
+    let changed = user.x != x as i16 || user.y != y as i16;
+    user.x = x as i16;
+    user.y = y as i16;
+    changed
 }
 
 fn report_event(report: &palace_host::DispatchReport) -> ClientEvent {
@@ -1585,11 +1691,37 @@ fn apply_effect(
                 ),
             }]
         }
-        Effect::MoveUserAbs { x, y } | Effect::MoveUserRel { dx: x, dy: y } => {
-            *dirty_render = true;
-            vec![ClientEvent::Note {
-                text: format!("script: moved to ({x},{y})"),
-            }]
+        // The frame was already sent above by `effect_frame`, which computes the
+        // target with the same `move_target` used here, so the position applied
+        // locally is the position on the wire. The server relays our own `uLoc`
+        // only to the other users (protocol reference :2126), so without this the
+        // avatar would not move on our own screen.
+        Effect::MoveUserAbs { .. } | Effect::MoveUserRel { .. } => {
+            let ready = state.status == ConnectionStatus::Connected && state.room_desc.is_some();
+            match move_target(effect, context) {
+                Some((x, y)) if ready => {
+                    let applied = apply_self_move(state, x, y);
+                    *dirty_render |= applied;
+                    let suffix = if applied {
+                        ""
+                    } else {
+                        " (you are not in the room)"
+                    };
+                    let text = match effect {
+                        Effect::MoveUserRel { dx, dy } => {
+                            format!("script: MOVE ({dx},{dy}) to ({x},{y}){suffix}")
+                        }
+                        _ => format!("script: SETPOS to ({x},{y}){suffix}"),
+                    };
+                    vec![ClientEvent::Note { text }]
+                }
+                _ => vec![ClientEvent::Note {
+                    text: format!(
+                        "script: {} not applied, not connected or no room is loaded",
+                        effect.command()
+                    ),
+                }],
+            }
         }
         Effect::GotoRoom { room } => {
             if let Ok(mut guard) = shared.last_room.lock() {
@@ -1655,11 +1787,10 @@ fn apply_effect(
             Vec::new()
         }
         Effect::SetUserName { name } => {
-            if let Some(user) = state.users.get_mut(&state.banner.user_id) {
-                user.name = name.clone();
-            }
+            let changed = set_self_name(state, name);
+            *dirty_render |= changed;
             vec![ClientEvent::Note {
-                text: format!("script: SETUSERNAME {name:?} (local only)"),
+                text: format!("script: SETUSERNAME {name:?}"),
             }]
         }
         Effect::SetChatString { .. } => Vec::new(),
@@ -1780,9 +1911,10 @@ fn apply_effect(
         }],
 
         // A lock rides the wire as `DOORLOCK` / `DOORUNLOCK`, so the room's other
-        // occupants see it. The lock state this client consults is the door
-        // hotspot's `state`, which the server's echoed `DOORLOCK`/`DOORUNLOCK`
-        // sets; a click on a locked door is refused before `SELECT` is dispatched.
+        // occupants see it. The lock state this client consults is a
+        // lockable door's `state`, which the server's echoed
+        // `DOORLOCK`/`DOORUNLOCK` sets; a click on a locked *lockable* door is
+        // refused before `SELECT` is dispatched (see `state_means_locked`).
         Effect::Lock { spot } => vec![ClientEvent::Note {
             text: format!("script: LOCK {spot}"),
         }],
@@ -1843,14 +1975,25 @@ fn point(x: i32, y: i32) -> Point {
     Point::new(y as i16, x as i16)
 }
 
-/// Change the signed-in user's face cell, following OpenPalace's model rule:
+/// The face cell a requested face maps to, following OpenPalace's model rule:
 /// floor at 0, and anything past the last defined face becomes face 0.
-fn set_self_face(state: &mut SessionState, face: i32) -> bool {
-    let face = if face > i32::from(FACE_VARIANTS - 1) {
+fn normalize_face(face: i32) -> i16 {
+    if face > i32::from(FACE_VARIANTS - 1) {
         0
     } else {
-        face.max(0)
-    } as i16;
+        face.max(0) as i16
+    }
+}
+
+/// The colour index a requested colour maps to, clamped into
+/// `0..COLOR_VARIANTS`.
+fn normalize_color(color: i32) -> i16 {
+    color.clamp(0, i32::from(COLOR_VARIANTS - 1)) as i16
+}
+
+/// Change the signed-in user's face cell to `face` after normalisation.
+fn set_self_face(state: &mut SessionState, face: i32) -> bool {
+    let face = normalize_face(face);
     let Some(user) = state.users.get_mut(&state.banner.user_id) else {
         return false;
     };
@@ -1859,14 +2002,30 @@ fn set_self_face(state: &mut SessionState, face: i32) -> bool {
     changed
 }
 
+/// Change the signed-in user's colour to `color` after normalisation.
 fn set_self_color(state: &mut SessionState, color: i32) -> bool {
-    let color = color.clamp(0, i32::from(COLOR_VARIANTS - 1)) as i16;
+    let color = normalize_color(color);
     let Some(user) = state.users.get_mut(&state.banner.user_id) else {
         return false;
     };
     let changed = user.color != color;
     user.color = color;
     changed
+}
+
+/// Change the signed-in user's name to `name`.
+///
+/// Applied at once, before the matching `usrN` frame is sent, so a later script
+/// dispatch in the same event cascade reads the new name from `USERNAME`.
+fn set_self_name(state: &mut SessionState, name: &str) -> bool {
+    let Some(user) = state.users.get_mut(&state.banner.user_id) else {
+        return false;
+    };
+    if user.name == name {
+        return false;
+    }
+    user.name = name.to_string();
+    true
 }
 
 /// Wear one more prop, appending it to the worn list. A prop already worn, or a
@@ -1949,8 +2108,27 @@ fn current_room_id(state: &SessionState) -> Option<i16> {
     state.room_desc.as_ref().map(|room| room.header.room_id)
 }
 
+/// Whether a clicked hotspot is a door this client must refuse to open.
+///
+/// `state` is primarily a picture selector, not a lock flag: the protocol
+/// reference says it "selects which of the pictures associated with the hotspot
+/// should be displayed. Among other things, it encodes whether a door is locked
+/// or unlocked: `HS_Unlock 0`, `HS_Lock 1`" (:1677-1680). Only a door that
+/// *can* be locked therefore gets refusal on state 1; a plain `HS_Door` (1)
+/// is just "a door" (:1665), so its state 1 is the second picture of an
+/// ordinary two-frame door. The failure modes are asymmetric — refusing a
+/// legitimate door means its script never runs and the door breaks permanently,
+/// while failing to refuse a locked one merely lets the server deny the move —
+/// so the rule stays as narrow as the spec allows.
 fn state_means_locked(hotspot_type: i16, state: i16) -> bool {
-    matches!(hotspot_type, HS_DOOR | HS_LOCKABLE_DOOR) && state == HS_LOCK
+    match hotspot_type {
+        HS_LOCKABLE_DOOR => state == HS_LOCK,
+        // `HS_Door` (1) cannot be locked; `HS_ShutableDoor` (2) uses its states
+        // as the pictures of a door opened/closed by clicking; `HS_Bolt` (4)
+        // locks the door named by its `dest`, not itself.
+        HS_DOOR => false,
+        _ => false,
+    }
 }
 
 fn is_locked_door(state: &mut SessionState, spot: i32) -> bool {
@@ -2053,20 +2231,20 @@ mod tests {
     use palace_wire::byteorder::ByteOrder;
 
     #[test]
-    fn only_a_kind_of_door_that_can_be_locked_reads_state_one_as_locked() {
-        for door in [1_i16, 3] {
-            assert!(state_means_locked(door, 1), "type {door} state 1 is locked");
-            assert!(
-                !state_means_locked(door, 0),
-                "type {door} state 0 is unlocked"
-            );
-        }
+    fn only_a_lockable_door_reads_state_one_as_locked() {
         assert!(
-            !state_means_locked(2, 1),
-            "a shuttable door's states are closed and open, so state 1 must not refuse its click"
+            state_means_locked(HS_LOCKABLE_DOOR, 1),
+            "HS_LockableDoor state 1 is locked"
         );
-        for other in [0_i16, 4, 5] {
-            assert!(!state_means_locked(other, 1), "type {other} is not a door");
+        assert!(
+            !state_means_locked(HS_LOCKABLE_DOOR, 0),
+            "HS_LockableDoor state 0 is unlocked"
+        );
+        for other in [HS_DOOR, 2, 4, 0, 5] {
+            assert!(
+                !state_means_locked(other, 1),
+                "type {other} state 1 is a picture selector, not a lock, so its click must not be refused"
+            );
         }
     }
 
@@ -2508,5 +2686,137 @@ mod tests {
         assert_eq!(hidden, 0);
         assert_eq!(avatars.len(), 1);
         assert_eq!((avatars[0].face, avatars[0].color), (3, 7));
+    }
+
+    #[test]
+    fn a_floor_click_resolves_to_a_renderer_clamped_walk_target() {
+        let mut state = session_in_room();
+        state.status = ConnectionStatus::Connected;
+        assert_eq!(
+            walk_target(&state, 512, 384, 30_000, 30_000),
+            Some((490, 362)),
+            "a click past the room edge comes to rest on the avatar margin"
+        );
+        assert_eq!(
+            walk_target(&state, 512, 384, -50, -50),
+            Some((22, 22)),
+            "a click before the origin is pushed onto the top-left margin"
+        );
+        assert_eq!(
+            walk_target(&state, 512, 384, 200, 100),
+            Some((200, 100)),
+            "an interior point is not moved"
+        );
+    }
+
+    #[test]
+    fn a_walk_is_refused_without_a_connection_or_a_room() {
+        let mut state = session_in_room();
+        state.status = ConnectionStatus::Disconnected;
+        assert_eq!(
+            walk_target(&state, 512, 384, 100, 100),
+            None,
+            "a disconnected session must not ask to move"
+        );
+        state.status = ConnectionStatus::Connected;
+        state.room_desc = None;
+        assert_eq!(
+            walk_target(&state, 512, 384, 100, 100),
+            None,
+            "without a room there is no place to walk to"
+        );
+    }
+
+    #[test]
+    fn a_self_move_updates_our_own_position_before_the_server_relays_it() {
+        let mut state = session_in_room();
+        state.status = ConnectionStatus::Connected;
+        assert!(
+            apply_self_move(&mut state, 123, 45),
+            "the first move changes the model"
+        );
+        let me = state.users.get(&SELF_ID).expect("the self user is known");
+        assert_eq!(
+            (me.x, me.y),
+            (123, 45),
+            "the server relays our own uLoc only to others, so we apply it"
+        );
+        assert!(
+            !apply_self_move(&mut state, 123, 45),
+            "moving to the same spot changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_user_name_reaches_the_avatar_spec() {
+        let (avatars, hidden) = avatar_specs(&[user(1, vec![])], &PropStore::new());
+        assert_eq!(hidden, 0);
+        assert_eq!(
+            avatars[0].name.as_deref(),
+            Some("user-1"),
+            "the tag the compositor draws needs the name on the spec"
+        );
+    }
+
+    #[test]
+    fn a_user_with_missing_prop_art_is_still_counted_even_with_a_name() {
+        let (avatars, hidden) = avatar_specs(&[user(2, vec![123])], &PropStore::new());
+        assert!(avatars.is_empty(), "the avatar is still skipped");
+        assert_eq!(hidden, 1, "and still counted for the reason note");
+    }
+
+    #[test]
+    fn a_visibility_request_reaches_the_render_inputs() {
+        let mut state = session_in_room();
+        let mut builder = SceneBuilder::new(MediaStore::default(), PropStore::new());
+        assert!(builder.name_tags_visible(), "names start visible");
+        assert!(!state.avatars_hidden, "avatars start visible");
+
+        assert!(apply_visibility(&mut state, &mut builder, false, false));
+        assert!(
+            !builder.name_tags_visible(),
+            "names off must reach the scene builder"
+        );
+        assert!(state.avatars_hidden, "avatars off must reach the model");
+        assert!(
+            visible_avatars(&state, builder.props()).0.is_empty(),
+            "hidden avatars must leave the scene"
+        );
+        assert!(
+            !apply_visibility(&mut state, &mut builder, false, false),
+            "applying the same flags again changes nothing"
+        );
+
+        assert!(apply_visibility(&mut state, &mut builder, true, true));
+        assert!(builder.name_tags_visible());
+        assert!(!state.avatars_hidden);
+        assert_eq!(
+            visible_avatars(&state, builder.props()).0.len(),
+            1,
+            "showing again restores the avatar"
+        );
+    }
+
+    #[test]
+    fn face_and_colour_requests_are_normalised_to_the_sheet() {
+        assert_eq!(normalize_face(-5), 0);
+        assert_eq!(normalize_face(0), 0);
+        assert_eq!(normalize_face(12), 12);
+        assert_eq!(
+            normalize_face(13),
+            0,
+            "past the last face falls back to face 0"
+        );
+        assert_eq!(normalize_face(9_999), 0);
+
+        assert_eq!(normalize_color(-3), 0);
+        assert_eq!(normalize_color(0), 0);
+        assert_eq!(normalize_color(15), 15);
+        assert_eq!(
+            normalize_color(16),
+            15,
+            "past the last colour clamps to the last"
+        );
+        assert_eq!(normalize_color(9_999), 15);
     }
 }
