@@ -6,10 +6,11 @@
 //! host-primitive forwarding, and the relationship between the `IMPLEMENTED`
 //! list and the registry — rather than only through a running script.
 
-use iptscrae::{Builtin, Chunk, CommandKind, CommandSet, Host, IptError, Result, Value};
+use iptscrae::{Builtin, Chunk, CommandKind, CommandSet, Engine, Host, IptError, Result, Value};
 use iptscrae_palace::commands::{
     command_spec, register_palace_commands, PalaceCommands, Push, IMPLEMENTED, PALACE_COMMANDS,
 };
+use iptscrae_palace::harness::SkeletonHost;
 use iptscrae_palace::PalaceHost;
 
 /// A host recording every effect the adapter forwards, overriding the `Host`
@@ -256,6 +257,12 @@ fn register_palace_commands_installs_every_name_and_is_idempotent() {
     assert!(!set.contains("SGLOBAL"), "SGLOBAL is a Palace addition");
 
     let added = register_palace_commands(&mut set);
+    assert_eq!(PALACE_COMMANDS.len(), 121 + 12, "12 sourced additions");
+    assert_eq!(
+        added,
+        120 + 12,
+        "ALARMEXEC/IPTVERSION overlap core; SGLOBAL adds one"
+    );
     assert_eq!(
         set.get("SGLOBAL"),
         Some(CommandKind::Builtin(Builtin::Global)),
@@ -291,6 +298,86 @@ fn register_palace_commands_installs_every_name_and_is_idempotent() {
         Some(CommandKind::Builtin(Builtin::GrepStr)),
         "a core command keeps its core binding"
     );
+}
+
+#[test]
+fn extended_signatures_match_the_sparky_gs_handlers() {
+    for (name, pops, pushes, push) in [
+        ("AUTOUSERLAYER", 1, 0, Push::None),
+        ("SETTOOLTIP", 1, 0, Push::None),
+        ("CLEARTOOLTIP", 0, 0, Push::None),
+        ("SETSPOTOPTIONS", 4, 0, Push::None),
+        ("ADDPIC", 2, 0, Push::None),
+        ("REMOVEPIC", 2, 0, Push::None),
+        ("ADDSPOT", 3, 1, Push::Int),
+        ("SETSPOTSCRIPT", 3, 0, Push::None),
+        ("LOADSCRIPT", 1, 0, Push::None),
+        ("HTTPGET", 1, 0, Push::None),
+        ("BAN", 1, 0, Push::None),
+        ("KICK", 1, 0, Push::None),
+        ("SHELLCMD", 1, 0, Push::None),
+    ] {
+        let spec = command_spec(name).unwrap_or_else(|| panic!("missing {name}"));
+        assert_eq!(
+            (spec.pops, spec.pushes, spec.push),
+            (pops, pushes, push),
+            "{name}"
+        );
+    }
+}
+
+fn assert_script_dispatches(name: &str, operands: &str, results: &[Value]) {
+    let source = format!("777 {operands} {name}");
+    let mut engine = SkeletonHost::engine();
+    let stack = engine.run_source_resolved(&source).unwrap();
+    assert_eq!(
+        engine.host.invocations.get(name),
+        Some(&1),
+        "{name} must dispatch, not resolve as a variable; stack: {stack:?}"
+    );
+    let mut expected = vec![Value::Int(777)];
+    expected.extend_from_slice(results);
+    assert_eq!(stack, expected, "{name} must preserve the stack sentinel");
+
+    let mut unavailable = Engine::new(adapter()).with_commands(SkeletonHost::command_set());
+    assert_eq!(
+        unavailable.run_source(&source).unwrap_err(),
+        IptError::CommandUnavailable {
+            command: name.to_owned()
+        }
+        .in_command(name),
+        "{name} must report unsupported rather than silently become a variable"
+    );
+}
+
+#[test]
+fn newly_registered_addpic_dispatches() {
+    assert_script_dispatches("ADDPIC", "\"picture.png\" 7", &[]);
+}
+
+#[test]
+fn newly_registered_httpget_dispatches() {
+    assert_script_dispatches("HTTPGET", "\"https://example.invalid/data\"", &[]);
+}
+
+#[test]
+fn newly_registered_settooltip_dispatches() {
+    assert_script_dispatches("SETTOOLTIP", "\"hint\"", &[]);
+}
+
+#[test]
+fn newly_registered_addspot_dispatches() {
+    assert_script_dispatches("ADDSPOT", "[0 0 10 0 10 10] 20 30", &[Value::Int(0)]);
+}
+
+#[test]
+fn newly_registered_cleartooltip_dispatches() {
+    assert_script_dispatches("CLEARTOOLTIP", "", &[]);
+}
+
+#[test]
+fn shellcmd_already_dispatches_but_remains_unavailable() {
+    assert_script_dispatches("SHELLCMD", "\"not executed\"", &[]);
 }
 
 #[test]
