@@ -400,30 +400,40 @@ So it is **ROOMLOAD → ENTER → ROOMREADY**. We fire only `ENTER`. Rooms put t
 - [ ] Implement in this order: the room lifecycle events, then `HTTPGET` + `HTTPRECEIVED`/`HTTPERROR`.
   With those, `LOADSCRIPT` (§2.11) is plausibly just "fetch, then execute" on the same mechanism.
 
-### 2.13 Every command Colosseum uses that this client does not implement, ranked
+### 2.13 Commands Colosseum uses that this client does not act on, ranked
 
-Derived by counting uppercase tokens across `$CORPUS/scripts/` + `$CORPUS/animanic_walk/` and
-subtracting both the command table (`crates/iptscrae-palace/src/commands.rs`) and the interpreter's
-builtin registry (`crates/iptscrae/src/registry.rs`). Event names and RPG stat variables (`STR` 1454 =
-strength, `MAG`, `ATK`, `MDEF`, `ACC`, `EVADE`, `RES`, `CHARGE`) are noise and are excluded — do not be
-fooled by `STR`'s count, it is a stat.
+Method: count uppercase tokens across `$CORPUS/scripts/` + `$CORPUS/animanic_walk/`, then
+subtract the command table (`crates/iptscrae-palace/src/commands.rs`), the interpreter's builtin
+registry (`crates/iptscrae/src/registry.rs`), **and the explicit recognised-but-unimplemented arm at
+`crates/palace-host/src/host.rs:694-704`**. Skipping that third set is what produced the first, wrong
+version of this list — count the operand signatures, not just the names.
 
-| Command | Uses | Status |
+**The precise status of everything below: the command is recognised and its operands are consumed
+correctly (so the stack stays balanced and `IF` still parses), but `unimplemented()` reports it and
+nothing happens.** It is not "unknown to the VM".
+
+| Command | Uses | Note |
 |---|---|---|
-| `ADDPIC` | 115 | **blocked on an unknown** — needs the client→server "new picture" body, which §1.6 established is undocumented everywhere. Do not guess it |
-| `SETSPOTSCRIPT` | 82 | script-level; needs a spot-script wire body |
-| `ADDSPOT` | 81 | same class as `ADDPIC` |
-| `HTTP` | 75 | see §2.12 |
-| `SGLOBAL` | 74 | pserver server-globals; semantics not yet researched |
-| `LOADSCRIPT` | 51 | see §2.11 |
-| `HTTPGET` | 50 | see §2.12 |
-| `SETTOOLTIP` | 47 | hover text; needs ROLLOVER/ROLLOUT dispatch first (§2.2 events) |
+| `ADDPIC` | 115 | needs the client→server picture body, undocumented everywhere (§1.6). May be permanently blocked — do not guess it |
+| `SETSPOTSCRIPT` | 82 | needs a spot-script wire body |
+| `ADDSPOT` | 81 | as `ADDPIC` |
+| `LOADSCRIPT` | 51 | §2.11 |
+| `HTTPGET` | 50 | §2.12 |
+| `SETTOOLTIP` | 47 | hover text; needs ROLLOVER/ROLLOUT dispatch first |
 | `CLEARTOOLTIP` | 41 | as above |
 
-Ordering to work in, by what actually unblocks a room: **the room lifecycle + HTTP (§2.12)** first,
-because it gates both `HTTPGET`/`HTTP` and probably `LOADSCRIPT`; then the hover pair
-(ROLLOVER/ROLLOUT + tooltips); then `SGLOBAL`. The `ADDPIC`/`ADDSPOT` family may be permanently blocked —
-that is a finding, not a gap to fill by guessing.
+Work order: **room lifecycle + HTTP (§2.12)** first — it gates `HTTPGET` and probably `LOADSCRIPT`;
+then the hover pair (ROLLOVER/ROLLOUT + the tooltip commands); then the `ADDPIC`/`ADDSPOT` family, and
+accept that it may be permanently blocked.
+
+**Checked and NOT gaps** — recorded so nobody re-derives them as missing, which is what happened here:
+
+- `SGLOBAL` (74) — an alias of the core `GLOBAL`, registered at `commands.rs:215`, with
+  `sglobal_is_the_spot_scope_alias_of_global` covering it.
+- `STR` (1454) — implemented at `host.rs:690` (int or string to string). Its count is also misleading:
+  in these RPG scripts `STR` is overwhelmingly the **strength stat**.
+- `HTTP` (75) — an opcode name (`HTTPSERVER`, `opcode.rs:137`), not a command. The bare uses are a variable.
+- `IDLE` — an event our VM lacks but Colosseum never uses (0 occurrences).
 
 ---
 
