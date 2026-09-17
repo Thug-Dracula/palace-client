@@ -221,16 +221,24 @@ Two routes, both needing a decision:
 
 ### 2.2 Publish the current work
 
-- [ ] Re-run the scrub-and-push to bring the public copy up to date.
+- [x] Re-run the scrub-and-push to bring the public copy up to date.
 
 ```bash
 tools/publish-public.sh git@github.com:example-user/palace-client.git
 ```
 
-There is **no git remote** on this repo — publication is a scrubbed clone pushed to the public repo.
-The published copy was last built when this repo was at 76 commits; it is now at 84, so the published
-copy is behind by roughly 8 commits. The Windows build in that release therefore contains none of the
-`ec21f1e`…`23acbd3` work. `tools/public-scrub.map` is gitignored and local-only.
+There is **no git remote** on this repo — publication is a scrubbed clone pushed to the public repo,
+so this command is the only way to publish. `tools/public-scrub.map` is gitignored and local-only.
+
+Republished 2026-09-17 at 122 commits; public `main` is now `72610c35`. The script verifies the tree
+and every commit's blobs — binaries included — for the leak patterns *before* it pushes, and it pushes
+without `--force`, so a rejected push fails safely instead of rewriting the public history. The
+non-forced push fast-forwarded, which is the intended property: rewriting the same source with the
+same map reproduces the earlier rewritten commits byte-for-byte, so each publication *extends* the
+last rather than forking from it. If the map is ever edited, every rewritten hash changes and the push
+will be rejected — read that rejection as a signal to reconcile deliberately, never as a reason to
+force. (`command -v git-filter-repo` reports it missing, yet `git filter-repo` runs: it is found
+through git's exec-path, not `PATH`. The prerequisite check is unreliable; the script is not.)
 
 ### 2.3 Protocol features that are decoded-but-local or missing
 
