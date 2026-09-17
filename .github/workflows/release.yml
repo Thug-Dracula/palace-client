@@ -182,13 +182,6 @@ jobs:
         run: |
           notes="Don't expect this to be a working client. It isn't one yet. If you want to download it, it should be because you want to contribute, or you're just curious and want to see what state it's in."
 
-          # A hyphen in the tag marks a pre-release, so v0.1.0-alpha publishes as
-          # a pre-release while a plain v1.0.0 publishes as a normal release.
-          case "$GITHUB_REF_NAME" in
-            *-*) release_flags=(--prerelease) ;;
-            *)   release_flags=() ;;
-          esac
-
           # Look the release up by tag, not by name: 'gh release view' also
           # matches a release whose *name* equals the tag, which silently hides
           # a release that has been detached from its tag.
@@ -202,7 +195,6 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --title "$GITHUB_REF_NAME" \
               --notes "$notes" \
-              "${release_flags[@]}" \
               --generate-notes \
               --verify-tag \
               dist/*
