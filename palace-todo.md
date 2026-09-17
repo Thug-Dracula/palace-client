@@ -240,6 +240,28 @@ will be rejected — read that rejection as a signal to reconcile deliberately, 
 force. (`command -v git-filter-repo` reports it missing, yet `git filter-repo` runs: it is found
 through git's exec-path, not `PATH`. The prerequisite check is unreliable; the script is not.)
 
+**Local clippy is weaker than CI, and this bit us.** CI installs `dtolnay/rust-toolchain@stable`,
+which is *rolling*, while this machine was on `rustc 1.95.0` and CI was on `1.98.0`. Clippy 1.98 added
+`unneeded_wildcard_pattern`, so `Effect::FetchScript { url: _, .. }` passed every local gate and failed
+CI — which failed the first `v0.2.0-alpha` release attempt. **A local clippy pass is not sufficient
+verification here; CI is the authority, and a green local run means only that this toolchain has
+nothing to say.** Either update the local toolchain before trusting it, or expect a fix-and-retry cycle
+per push. Nothing else in the tree carries that particular pattern.
+
+**Cutting a release, in order**, because the order is load-bearing:
+1. Bump `version` in `src-tauri/tauri.conf.json` **and** `Cargo.toml`'s `[workspace.package]` (and
+   `package.json` for tidiness); refresh `Cargo.lock` with `cargo metadata`. The workflow compares the
+   tag's numeric part against `tauri.conf.json` and fails the run if they differ.
+2. Publish the source so the public tree carries the bump.
+3. Create the tag **on the published commit**, not a local one — our commits and the public ones have
+   different hashes, so a local tag cannot be pushed. Moving an existing tag means forcing the ref
+   (`gh api -X PATCH .../git/refs/tags/<tag> -F force=true`), which is safe only while no release has
+   succeeded from it.
+4. The tag's suffix is free-form and is stripped before the version comparison, because Windows
+   installers reject a pre-release suffix in an app version: `v0.2.0-alpha` declares `0.2.0`.
+   The release is created **without `--prerelease`**, so it becomes GitHub's "Latest" and the stale
+   `v0.1.0` stops being advertised.
+
 ### 2.3 Protocol features that are decoded-but-local or missing
 
 - [ ] **`SETLOC`/`SETPICLOC` never reach the server.** The non-local variants should broadcast so the
