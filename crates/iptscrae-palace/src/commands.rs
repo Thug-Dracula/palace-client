@@ -62,16 +62,15 @@ const STR: Push = Push::Str;
 /// Every Palace command whose stack effect the reference implementations
 /// document, grouped the way the language guide groups them.
 ///
-/// The three names the core engine also provides (`GREPSTR`, `ALARMEXEC`,
-/// `IPTVERSION`) are listed for completeness but lose to the core bindings when
-/// both are registered.
+/// Core bindings are preserved except for `IPTVERSION`, deliberately overridden
+/// to report the Palace version (2) rather than the generic engine version (1).
 ///
-/// The extended PalaceChat command set (175 names: `WEBEMBED`, `SETSPOTSCRIPT`,
-/// `DRAWTEXT`, …) is deliberately **not** listed. This crate has no source for
-/// their stack effects, and registering a guessed operand count would corrupt
-/// the stack. Left unregistered they lex as variables — which is exactly what
-/// the reference engine does, since it does not know them either. A later
-/// milestone adds them with signatures in hand.
+/// Extended signatures below cite `reference/repos/sparky/index.js` under the
+/// colosseum reference root: the `GS` command table and handler classes on line 7.
+/// The OpenPalace AS3Iptscrae and PalaceClient command directories have no classes
+/// for these additions. Names absent from both references remain unregistered:
+/// guessing their operand counts would corrupt the stack. In particular, `TEXT`
+/// is not `DRAWTEXT`, and the wire-protocol `PING` constant is not a command.
 pub const PALACE_COMMANDS: &[CommandSpec] = &[
     // ---- messaging --------------------------------------------------------
     spec("SAY", 1, 0, NONE),
@@ -184,6 +183,8 @@ pub const PALACE_COMMANDS: &[CommandSpec] = &[
     spec("LAUNCHEVENT", 1, 0, NONE),
     spec("LAUNCHPPA", 1, 0, NONE),
     spec("LOADJAVA", 1, 0, NONE),
+    // Shell command string; Sparky GS SHELLCMD:gb -> sn consumes one string (stub).
+    // Already dispatched through the host's default unsupported-command arm.
     spec("SHELLCMD", 1, 0, NONE),
     spec("TALKPPA", 1, 0, NONE),
     spec("MIDIPLAY", 1, 0, NONE),
@@ -201,6 +202,30 @@ pub const PALACE_COMMANDS: &[CommandSpec] = &[
     spec("PAINTCLEAR", 0, 0, NONE),
     spec("PAINTUNDO", 0, 0, NONE),
     // ---- web and misc extensions -----------------------------------------
+    // Automatic user-layer flag; Sparky GS AUTOUSERLAYER:kS consumes one int (stub).
+    spec("AUTOUSERLAYER", 1, 0, NONE),
+    // Set tooltip text; Sparky GS SETTOOLTIP:Rc pops one string.
+    spec("SETTOOLTIP", 1, 0, NONE),
+    // Clear the tooltip; Sparky GS CLEARTOOLTIP:Oc reads/writes no stack values.
+    spec("CLEARTOOLTIP", 0, 0, NONE),
+    // Set spot type, top-layer flag and flags; Sparky GS SETSPOTOPTIONS:vb pops four ints.
+    spec("SETSPOTOPTIONS", 4, 0, NONE),
+    // Append a picture to a spot; Sparky GS ADDPIC:C1 pops spot id and filename.
+    spec("ADDPIC", 2, 0, NONE),
+    // Remove a spot picture by index; Sparky GS REMOVEPIC:_1 pops two ints.
+    spec("REMOVEPIC", 2, 0, NONE),
+    // Add a polygon spot and return its id; Sparky GS ADDSPOT:k1 pops two ints and an array.
+    spec("ADDSPOT", 3, 1, INT),
+    // Set a spot event handler; Sparky GS SETSPOTSCRIPT:x1 pops id, event string and script.
+    spec("SETSPOTSCRIPT", 3, 0, NONE),
+    // Load a script source; Sparky GS LOADSCRIPT:HS -> sn consumes one string (stub).
+    spec("LOADSCRIPT", 1, 0, NONE),
+    // Request a URL for the current spot; Sparky GS HTTPGET:a1 pops one string, no result.
+    spec("HTTPGET", 1, 0, NONE),
+    // Send a ban request for a user; Sparky GS BAN:Dw pops one string.
+    spec("BAN", 1, 0, NONE),
+    // Send a kick request for a user; Sparky GS KICK:Uw pops one string.
+    spec("KICK", 1, 0, NONE),
 ];
 
 /// Register every Palace command name as a host command.
