@@ -25,12 +25,12 @@ pub use logon::{
 };
 pub use pictures::PictMove;
 pub use props::{PropDel, PropMove, PropNew};
-pub use room::{RoomDescription, RoomRec};
+pub use room::{NavError, RoomDescription, RoomRec};
 pub use server::{AltLogonReply, HttpServer, ServerInfo, ServerVersion, UserLog};
 pub use spots::{DoorLock, SpotDel, SpotMove, SpotNew, SpotState};
 pub use user::{
-    AssetSpec, Point, UserColor, UserDesc, UserExit, UserFace, UserMove, UserNew, UserProp,
-    UserRec, UserStatus,
+    AssetSpec, Point, UserColor, UserDesc, UserExit, UserFace, UserMove, UserName, UserNew,
+    UserProp, UserRec, UserStatus,
 };
 
 use crate::byteorder::{ByteOrder, Reader};
@@ -71,6 +71,8 @@ pub enum Message {
     UserFace(UserFace),
     /// `usrC` — a user's colour changed.
     UserColor(UserColor),
+    /// `usrN` — a user's name changed, or a failed rename reverted.
+    UserName(UserName),
     /// `usrP` — a user's complete worn prop list.
     UserProp(UserProp),
     /// `usrD` — a user's face, colour and props together.
@@ -110,6 +112,8 @@ pub enum Message {
     Ping(i32),
     /// `pong` — keepalive response.
     Pong(i32),
+    /// `sErr` — the server refused a room change; `refNum` is the reason.
+    NavError(NavError),
     /// `bye ` — logoff.
     Logoff,
     /// `tiyr` — server banner (normally consumed by
@@ -159,6 +163,7 @@ impl Message {
             opcode::USERMOVE => Message::UserMove(UserMove::decode(ref_num, r)?),
             opcode::USERFACE => Message::UserFace(UserFace::decode(ref_num, r)?),
             opcode::USERCOLOR => Message::UserColor(UserColor::decode(ref_num, r)?),
+            opcode::USERNAME => Message::UserName(UserName::decode(ref_num, r)?),
             opcode::USERPROP => Message::UserProp(UserProp::decode(ref_num, r)?),
             opcode::USERDESC => Message::UserDesc(UserDesc::decode(ref_num, r)?),
             opcode::USERSTATUS => Message::UserStatus(UserStatus::decode(ref_num, r)?),
@@ -181,6 +186,7 @@ impl Message {
             opcode::WHISPER => Message::Whisper(Whisper::decode(ref_num, r)?),
             opcode::PING => Message::Ping(ref_num),
             opcode::PONG => Message::Pong(ref_num),
+            opcode::NAVERROR => Message::NavError(NavError::from_ref_num(ref_num)),
             opcode::LOGOFF => Message::Logoff,
             opcode::AUTHENTICATE => {
                 Authenticate::decode(r)?;
@@ -236,6 +242,7 @@ impl Message {
             ),
             Message::UserFace(f) => format!("user face: id={} face={}", f.user_id, f.face_nbr),
             Message::UserColor(c) => format!("user color: id={} color={}", c.user_id, c.color_nbr),
+            Message::UserName(n) => format!("user name: id={} name={:?}", n.user_id, n.name),
             Message::UserProp(p) => format!(
                 "user props: id={} props={}",
                 p.user_id,
@@ -304,6 +311,7 @@ impl Message {
             ),
             Message::Ping(n) => format!("ping (refNum={n})"),
             Message::Pong(n) => format!("pong (refNum={n})"),
+            Message::NavError(e) => e.describe(),
             Message::Logoff => "bye (logoff)".to_string(),
             Message::TiyId => "handshake MSG_TIYID".to_string(),
             Message::Unknown { opcode, ref_num, payload_len } => format!(
@@ -409,8 +417,8 @@ mod tests {
     use super::*;
     use crate::byteorder::Writer;
     use crate::opcode::{
-        AUTHENTICATE, DOORLOCK, DOORUNLOCK, LISTOFALLROOMS, LOGOFF, PICTMOVE, PING, PROPMOVE,
-        SPOTDEL, SPOTMOVE, SPOTNEW, SPOTSTATE, TALK, USERFACE, USERPROP,
+        AUTHENTICATE, DOORLOCK, DOORUNLOCK, LISTOFALLROOMS, LOGOFF, NAVERROR, PICTMOVE, PING,
+        PROPMOVE, SPOTDEL, SPOTMOVE, SPOTNEW, SPOTSTATE, TALK, USERFACE, USERNAME, USERPROP,
     };
 
     #[test]
@@ -503,6 +511,30 @@ mod tests {
             })
         );
         assert!(mv.describe().contains("index=3"));
+    }
+
+    #[test]
+    fn the_username_message_reaches_its_arm() {
+        // A plain PString body: length byte + name, no alignment padding.
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_pstring("bob");
+        let msg = Message::decode(USERNAME, 42, &w.into_vec(), ByteOrder::Little).unwrap();
+        assert_eq!(
+            msg,
+            Message::UserName(UserName {
+                user_id: 42,
+                name: "bob".to_string()
+            })
+        );
+        assert!(msg.describe().contains("id=42"));
+        assert!(msg.describe().contains("bob"));
+
+        // A body with padding after the PString is a known message with a
+        // malformed body, so the strict decoder refuses it.
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_pstring("bob");
+        w.write_bytes(&[0, 0, 0]);
+        assert!(decode_exact(USERNAME, 42, &w.into_vec(), ByteOrder::Little).is_err());
     }
 
     #[test]
@@ -603,5 +635,54 @@ mod tests {
             })
         );
         assert!(pic.describe().contains("spot=33"));
+    }
+
+    #[test]
+    fn naverror_names_each_documented_reason_and_does_not_name_an_unknown_one() {
+        let documented = [
+            (0, "public error"),
+            (1, "unknown room"),
+            (2, "room full"),
+            (3, "room closed"),
+            (4, "author"),
+            (5, "palace full"),
+        ];
+        for (code, phrase) in documented {
+            let msg = Message::decode(NAVERROR, code, &[], ByteOrder::Little).unwrap();
+            let Message::NavError(err) = msg else {
+                panic!("code {code} must decode to NavError");
+            };
+            assert_eq!(
+                NavError::from_ref_num(code),
+                err,
+                "the refNum identifies the reason"
+            );
+            let text = err.describe();
+            assert!(
+                text.contains("room change failed"),
+                "the failure must say what happened: {text}"
+            );
+            assert!(
+                text.contains(phrase),
+                "code {code} should be reported as {phrase:?}, got {text:?}"
+            );
+        }
+
+        let Message::NavError(err) = Message::decode(NAVERROR, 77, &[], ByteOrder::Little).unwrap()
+        else {
+            panic!("an undocumented code must still decode to NavError");
+        };
+        let text = err.describe();
+        assert!(text.contains("77"), "the raw code must be reported: {text}");
+        assert!(
+            text.contains("undocumented"),
+            "an unknown code must be flagged, not named: {text}"
+        );
+        for (code, phrase) in documented {
+            assert!(
+                !text.contains(phrase),
+                "unknown code {code} must not borrow the name {phrase:?}: {text}"
+            );
+        }
     }
 }

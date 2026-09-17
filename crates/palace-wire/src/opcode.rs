@@ -106,6 +106,9 @@ pub const SPOTMOVE: Opcode = Opcode(0x636f_4c73);
 pub const PICTMOVE: Opcode = Opcode(0x704c_6f63);
 /// `0x61757468` — the server asking the client to authenticate; empty body.
 pub const AUTHENTICATE: Opcode = Opcode(0x6175_7468);
+/// `0x7345_7272` — the server refused a room change; the failure code is the
+/// frame's `refNum` and the body is empty (protocol reference :1371).
+pub const NAVERROR: Opcode = Opcode(0x7345_7272);
 
 /// Full opcode table: every message type we have a name for, taken from the
 /// official 1999 protocol reference, Taj's `MessageTypes.cs`, and QPalace's

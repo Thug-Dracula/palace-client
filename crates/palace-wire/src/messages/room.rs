@@ -179,6 +179,64 @@ impl RoomDescription {
     }
 }
 
+/// `MSG_NAVERROR` (`sErr`): the server refused a room change.
+///
+/// The body is empty; the failure code is the frame `refNum` (protocol
+/// reference :1371). The six documented codes are named; anything else is
+/// kept verbatim as [`NavError::Unknown`] rather than guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavError {
+    /// `SE_publicError` (0) — the generic server-side refusal.
+    PublicError,
+    /// `SE_RoomUnknown` (1) — the requested room does not exist.
+    RoomUnknown,
+    /// `SE_RoomFull` (2).
+    RoomFull,
+    /// `SE_RoomClosed` (3).
+    RoomClosed,
+    /// `SE_CantAuthor` (4) — the user may not author a room here.
+    CantAuthor,
+    /// `SE_PalaceFull` (5).
+    PalaceFull,
+    /// A code outside the six documented values, kept as sent.
+    Unknown(i32),
+}
+
+impl NavError {
+    /// Decode a `MSG_NAVERROR` `refNum`.
+    #[must_use]
+    pub const fn from_ref_num(ref_num: i32) -> Self {
+        match ref_num {
+            0 => NavError::PublicError,
+            1 => NavError::RoomUnknown,
+            2 => NavError::RoomFull,
+            3 => NavError::RoomClosed,
+            4 => NavError::CantAuthor,
+            5 => NavError::PalaceFull,
+            other => NavError::Unknown(other),
+        }
+    }
+
+    /// The user-visible failure, naming a documented code in words and refusing
+    /// to invent a name for one that is not documented.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            NavError::PublicError => "room change failed: public error".to_string(),
+            NavError::RoomUnknown => "room change failed: unknown room".to_string(),
+            NavError::RoomFull => "room change failed: room full".to_string(),
+            NavError::RoomClosed => "room change failed: room closed".to_string(),
+            NavError::CantAuthor => {
+                "room change failed: you are not allowed to author this room".to_string()
+            }
+            NavError::PalaceFull => "room change failed: palace full".to_string(),
+            NavError::Unknown(code) => {
+                format!("room change failed: undocumented server error code {code}")
+            }
+        }
+    }
+}
+
 fn string_at(var_data: &[u8], offset: i16, order: ByteOrder) -> String {
     if offset < 0 {
         return String::new();
