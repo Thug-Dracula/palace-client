@@ -176,6 +176,15 @@ Two traps worth keeping:
 - **`state` is overloaded.** Doors use one field for both "which picture" and "locked"; the spec's
   "among other things" is doing a lot of work. Read hotspot fields per type, never globally.
 
+**The room-id conclusion is verified, not assumed** (it was the one load-bearing guess here):
+`typedef sint16 RoomID` in the spec (:222), `UserListRec.room_id: i16` (spec §3.18), our own
+`RoomListRec` comment ("a 32-bit *field* even though room ids are 16-bit"), and — decisively —
+**pserver's own `typedef std::pair<int16_t, Room*> RoomID`** (`include/server.hpp:170`). The id space
+is 16-bit in the server, so no room can be `73251`; truncating to `7715` is what addresses the room the
+script means. The body is 2 bytes, which small-id navigation working live already proves. pserver's
+repo here is a stub (the opcode is defined, no handler), so this rests on the type plus the working
+behaviour, not on reading its parser.
+
 Also found (being fixed as this was written): **`SETUSERNAME` was local-only** — the rename never
 reached the server, so other players never saw a character change. `usrN` is bidirectional with a
 revert-on-failure path, and now has an encoder and decoder.
@@ -305,10 +314,13 @@ Both settle cheaply by reading how a reference client handles a click on those t
 - [ ] **Click the real zoom slider once.** The last visual pass went through the runtime command path,
   not a mouse drag, because the screen locked mid-QA. Everything is wired to the same `set_viewport`
   command and the numeric sweep matches the tested transform — but a human should click it.
-- [ ] **Open the new right-click menu and the avatar picker once.** Both are new UI (§1.9) and are
-  verified only by `svelte-check` (0 errors, 0 warnings) and a successful production build — that
-  proves they compile and type-check, **not** that they look right or that the sheet is sliced at the
-  right offsets. The 13×16 / 44 px cell maths is the thing to eyeball: a one-cell slip would still type-check.
+- [ ] **Open the new right-click menu and the avatar picker once.** Both are new UI (§1.9). The
+  *numeric* core is now verified objectively: the sheet is exactly `572×704 = 13×44 × 16×44` with no
+  padding, and the picker's `-(face*44)px -(color*44)px` addresses the same cell the renderer's
+  `smiley_cell` reads (`face → x/column`, `color → y/row`, `face.rs:63-64`), so a pick cannot land on
+  the wrong cell. What remains unverified is only *appearance* — that the menu and dialog look right,
+  sit inside the viewport, and read well. `svelte-check` cannot tell you that, and neither can I
+  without driving your desktop, which this project forbids.
 - [ ] **Walk somewhere on a live server.** Click-to-walk is tested against the mock harness only; the
   claim that the server does not echo your own `uLoc` back (so the client must apply it locally) is
   from the protocol reference, not from a real observation.
