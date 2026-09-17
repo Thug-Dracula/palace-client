@@ -668,6 +668,57 @@ and every one of those is unknowable here — `PICTDEL` could be a bare `Hotspot
 worse than an honest "ignored opcode" line. If a real capture ever shows one, that capture is the
 authority and the decoder should be written from its bytes.
 
+## Opcode coverage: what is left, and whether it matters (audited 2026-09-17)
+
+An audit of the **40 undecoded opcodes** (75 in the table, 35 decoded). Headline: **nothing still
+missing breaks using the client on a public server** — with one real exception, below.
+
+| Class | n | Meaning |
+|---|---|---|
+| Already handled elsewhere | 7 | no work: `qAst`, `rAst`, `sAst`, `navR`, `xtlk`, `xwis`, `ryit` |
+| Vestigial | 14 | no work; named below |
+| Unresolved | 1 | `durl` (DISPLAYURL): the spec documents a body, no server anywhere constructs it |
+| Real but non-blocking | 18 | ranked below |
+
+**The one hard blocker: authentication.** On a server configured to require it, the server sends
+`auth` (AUTHENTICATE) after logon and waits for `autr` (AUTHRESPONSE). We ignore the request and hang
+unauthenticated — no room, no user list. Worse, our own logon *advertises* the authenticate flag
+(`logon.rs`, `aux_flags = 0x8000_0008`), so we are asking for the one exchange we cannot complete.
+This is the only gap that stops a session.
+
+Ranked after that, all feedback or optional channels:
+
+| | Opcode | What it would fix |
+|---|---|---|
+| 2 | `down` SERVERDOWN | a forced disconnect (kick/ban/flood/full/shutdown) shows as a bare socket close with no reason given |
+| 3 | `sErr` NAVERROR | a failed room change (full/closed/pinned/password/kicked) is silently ignored |
+| 4 | `usrN` USERNAME | live renames are invisible, and there is no way to rename yourself |
+| 5 | `draw` DRAW (receive) | other people's paint is dropped at decode; rasterizing strokes stays the separate known gap |
+| 6 | `sRom` ROOMSETDESC | room edits made while you are inside are not reflected — and pserver does send this |
+| 7 | `blow` BLOWTHRU | the plugin-relay channel |
+| 8 | `sFil` / `fnfe` / `qFil` | legacy server-hosted file transfer, superseded by HTTP media |
+| 9 | `susr`, `kill`, `gmsg`, `smsg`, `rmsg`, `nRom`, `sInf` | send-side features: become wizard, kick, global shout/page, create room, server info |
+
+**Vestigial (14) — do not implement:** PICTDEL, PICTNEW, PICTSETDESC, SPOTSETDESC, PROPSETDESC,
+ASSETNEW, USERENTER, SERVERUP, WMSG, NOOP, TIMYID, RESPORT, TROPSER, INITCONNECTION. Each is absent
+from the original server's event switch and from every modern implementation's handlers; most appear
+only in the header where they are defined. `PROPSETDESC` is a fifth sibling of the four already
+recorded above. Details worth keeping: `NOOP`'s own documentation says "it is not actually used in
+the current Unix server"; `ASSETNEW`'s case in the original client is *commented out* ("not really
+needed anymore"); `INITCONNECTION` is used only by the classic Mac LocalTalk transport, never on TCP;
+`TROPSER` is the legacy HTTP-tunnel banner marker we already handle in `ByteOrder::from_banner`.
+
+**Two caveats about the evidence, so this is not re-derived badly:**
+
+1. **The protocol reference's usage column is corrupted in our copy.** All four legend glyphs and
+   every table row read literally `server ( client` — the arrows were lost in a conversion, so that
+   column cannot be read at all. Direction had to be reconstructed from Taj's transcription plus the
+   server source.
+2. **"No §4.3 section means unused" is a useful heuristic but has false positives.** `GMSG`,
+   `ASSETREGI` and `ASSETSEND` *do* have sections (indented, easy to miss), and DIYIT has none yet is
+   real. No classification above rests on section-presence alone: each was confirmed against a server
+   send or receive site.
+
 ## Running it
 
 ```bash
