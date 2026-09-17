@@ -221,6 +221,21 @@ mod tests {
         }
     }
 
+    /// A square part centred on the anchor, the shape a real 44×44 prop has:
+    /// its top-left sits at `(x - size/2, y - size/2)`.
+    fn centred_avatar(rgba: [u8; 4], size: u32, x: i32, y: i32) -> Avatar {
+        Avatar {
+            x,
+            y,
+            parts: vec![AvatarPart {
+                image: solid(size, size, rgba),
+                dx: -(size as i32) / 2,
+                dy: -(size as i32) / 2,
+                alpha: 1.0,
+            }],
+        }
+    }
+
     fn px(c: &Canvas, x: u32, y: u32) -> [u8; 4] {
         let at = ((y as usize) * (c.width() as usize) + x as usize) * 4;
         let s = &c.as_rgba()[at..at + 4];
@@ -290,6 +305,161 @@ mod tests {
         scene.avatars = vec![avatar(RED, 0, 0), avatar(GREEN, 0, 0)];
         let c = render(&scene, RenderOptions::at_dpr(1.0));
         assert_eq!(px(&c, 0, 0), GREEN, "later (equal-y) avatar on top");
+    }
+
+    fn push_band(scene: &mut Scene, band: usize, s: Sprite) {
+        match band {
+            0 => scene.overlays_above_nothing.push(s),
+            1 => scene.overlays_above_avatars.push(s),
+            2 => scene.overlays_above_name_tags.push(s),
+            _ => scene.overlays_above_everything.push(s),
+        }
+    }
+
+    #[test]
+    fn every_band_can_draw_on_its_own() {
+        let colors = [RED, GREEN, BLUE, [255, 255, 0, 255]];
+        for (band, color) in colors.iter().enumerate() {
+            let mut scene = Scene::new(6, 4);
+            // The band alone, away from the origin so the backdrop shows around it.
+            push_band(&mut scene, band, sprite(*color, 1 + band as i32, 1, 0));
+            let c = render(&scene, RenderOptions::at_dpr(1.0));
+            assert_eq!(
+                px(&c, 1 + band as u32, 1),
+                *color,
+                "band {band} must be drawn at all"
+            );
+        }
+    }
+
+    /// Every cross-band pair, not one hand-picked pair: an inverted comparison
+    /// only shows up on the pairs that do not happen to be adjacent.
+    #[test]
+    fn every_cross_band_overlap_resolves_to_the_higher_band() {
+        let colors = [RED, GREEN, BLUE, [255, 255, 0, 255]];
+        for low in 0..4usize {
+            for high in low + 1..4usize {
+                let mut scene = Scene::new(4, 4);
+                push_band(&mut scene, low, sprite(colors[low], 1, 1, 0));
+                push_band(&mut scene, high, sprite(colors[high], 1, 1, 0));
+                let c = render(&scene, RenderOptions::at_dpr(1.0));
+                assert_eq!(
+                    px(&c, 1, 1),
+                    colors[high],
+                    "band {high} must beat band {low} where they overlap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_lower_band_does_not_win_a_pixel_its_higher_band_also_covers() {
+        // The specifically reversed case: the lower band is drawn *after* the
+        // higher band in list order. If the two band comparisons were swapped,
+        // this is the frame where RED would win.
+        let mut scene = Scene::new(2, 1);
+        scene.overlays_above_everything = vec![sprite(RED, 0, 0, 0)];
+        scene.overlays_above_nothing = vec![sprite(GREEN, 0, 0, 0)];
+        let c = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(
+            px(&c, 0, 0),
+            RED,
+            "the above-everything band wins even when the lower band is listed second"
+        );
+    }
+
+    #[test]
+    fn a_still_lower_layer_does_not_win_either() {
+        // Loose props sit below every overlay band; the sprite list order must not
+        // change that.
+        let mut scene = Scene::new(2, 1);
+        scene.loose_props = vec![sprite(GREEN, 1, 0, 0)];
+        scene.overlays_above_nothing = vec![sprite(RED, 0, 0, 0)];
+        let c = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(px(&c, 0, 0), RED, "overlay over the prop");
+        assert_eq!(px(&c, 1, 0), GREEN, "prop where no overlay covers");
+    }
+
+    /// The two 44×44 bodies (78..=121 and 118..=161) overlap in x/y 118..=121. A
+    /// wrong sort order shows up as the wrong body's colour in that band, which is
+    /// exactly how the bug looks on screen.
+    #[test]
+    fn two_overlapping_avatars_draw_the_greater_y_on_top_whichever_way_they_arrive() {
+        let behind = centred_avatar(RED, 44, 100, 100);
+        let in_front = centred_avatar(GREEN, 44, 140, 140);
+        let mut scene = Scene::new(512, 384);
+        scene.avatars = vec![behind.clone(), in_front.clone()];
+        let c = render(&scene, RenderOptions::at_dpr(1.0));
+        for (x, y) in [(118, 118), (120, 120), (121, 121)] {
+            assert_eq!(
+                px(&c, x, y),
+                GREEN,
+                "greater y is nearer and must own the overlap at ({x},{y})"
+            );
+        }
+        assert_eq!(
+            px(&c, 100, 100),
+            RED,
+            "the farther avatar is only covered where they actually overlap"
+        );
+
+        // Same two avatars, listed the other way round: the sort, not the arrival
+        // order, must decide.
+        let mut scene = Scene::new(512, 384);
+        scene.avatars = vec![in_front, behind];
+        let c = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(px(&c, 120, 120), GREEN, "greater y still on top");
+    }
+
+    #[test]
+    fn avatars_at_the_same_y_draw_in_a_deterministic_order_with_the_second_on_top() {
+        // Equal y sorts by x, so the same inputs must yield the same frame no
+        // matter how many times it is rendered. If a HashMap ever leaked into the
+        // avatar ordering this is the case that flips between runs.
+        let left = avatar(RED, 100, 150);
+        let right = avatar(GREEN, 200, 150);
+        let mut scene = Scene::new(512, 384);
+        scene.avatars = vec![left.clone(), right.clone()];
+        let first = render(&scene, RenderOptions::at_dpr(1.0));
+        let second = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(
+            first.as_rgba(),
+            second.as_rgba(),
+            "re-rendering the same scene is byte-identical"
+        );
+        // The two parts do not overlap, so the tie-break is asserted directly.
+        let mut for_sort = vec![left, right];
+        sort_avatars(&mut for_sort);
+        assert_eq!(for_sort[0].x, 100, "smaller x first");
+        assert_eq!(for_sort[1].x, 200, "larger x later");
+    }
+
+    #[test]
+    fn permuting_the_avatar_input_order_produces_identical_frames() {
+        // Bodies centred at (120,160), (160,200) and (200,240) overlap pairwise,
+        // so the frame is only input-order-independent if the key sorts them.
+        let avatars = [
+            centred_avatar(RED, 44, 120, 160),
+            centred_avatar(GREEN, 44, 160, 200),
+            centred_avatar(BLUE, 44, 200, 240),
+        ];
+        let mut scene = Scene::new(512, 384);
+        scene.avatars = vec![avatars[0].clone(), avatars[1].clone(), avatars[2].clone()];
+        let forward = render(&scene, RenderOptions::at_dpr(1.0));
+
+        let mut scene = Scene::new(512, 384);
+        scene.avatars = vec![avatars[2].clone(), avatars[0].clone(), avatars[1].clone()];
+        let permuted = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(
+            px(&forward, 160, 200),
+            px(&permuted, 160, 200),
+            "a pixel where two avatars overlap must not follow the input order"
+        );
+        assert_eq!(
+            forward.as_rgba(),
+            permuted.as_rgba(),
+            "the y-sort must make the frame independent of the input order"
+        );
     }
 
     #[test]

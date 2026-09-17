@@ -1198,6 +1198,183 @@ fn a_ping_from_the_server_is_answered_with_a_matching_pong() {
 }
 
 #[test]
+fn a_click_at_a_viewport_pixel_lands_on_the_room_cell_the_frame_drew_there() {
+    let fixture = logon_fixture();
+    let room = room_desc(&fixture);
+    let server = MockServer::start(server_bytes(&fixture));
+    let cache = unique_temp_dir("click-mapping-cache");
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = *screens(&events)
+        .iter()
+        .find(|screen| screen.room_id == 901)
+        .expect("a frame was composed for the room");
+    assert_eq!(
+        (screen.geometry.room_w, screen.geometry.room_h),
+        (512.0, 384.0),
+        "the round trip is read against the room the background defines"
+    );
+
+    // Landmarks inside hotspot 2's box (an ON SELECT region around 465,26) and
+    // away from it, so a shifted click both moves where the cursor lands and can
+    // flip a hit into a miss.
+    let mut clicked = 0usize;
+    for zoom in [1.0, 1.5, 2.0] {
+        for dpr in [1.0, 1.25, 2.0] {
+            handle.set_viewport(1000.0, 700.0, dpr, zoom, false);
+            let events = collect_events(
+                &mut rx,
+                |collected| {
+                    screens(collected).iter().any(|screen| {
+                        screen.room_id == 901 && (screen.geometry.viewport_w - 1000.0).abs() < 1e-9
+                    })
+                },
+                Duration::from_secs(10),
+            );
+            let screen = *screens(&events)
+                .iter()
+                .find(|screen| (screen.geometry.viewport_w - 1000.0).abs() < 1e-9)
+                .expect("the requested viewport was composited");
+            let transform = screen.geometry.transform();
+            for (room_x, room_y) in [
+                (500, 50),
+                (480, 100),
+                (490, 300),
+                (300, 200),
+                (250, 250),
+                (505, 60),
+                (465, 40),
+                (10, 10),
+            ] {
+                let point = transform.room_to_viewport(palace_render::PointF::new(
+                    f64::from(room_x),
+                    f64::from(room_y),
+                ));
+                handle.click(point.x, point.y);
+                let events = collect_events(
+                    &mut rx,
+                    |collected| {
+                        notes(collected)
+                            .iter()
+                            .any(|text| text.starts_with("script: click at room"))
+                    },
+                    Duration::from_secs(10),
+                );
+                let note = *notes(&events)
+                    .iter()
+                    .find(|text| text.starts_with("script: click at room"))
+                    .expect("the click was reported");
+                assert_eq!(
+                    clicked_room_note(note),
+                    (room_x, room_y),
+                    "a click drawn at room ({room_x},{room_y}) resolves back to that cell \
+                     (zoom {zoom}, dpr {dpr}); note: {note}"
+                );
+                clicked += 1;
+            }
+        }
+    }
+    assert_eq!(
+        clicked, 72,
+        "every landmark in every combination was clicked"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_click_in_the_letterbox_is_not_clamped_onto_the_room_edge() {
+    let fixture = logon_fixture();
+    let room = room_desc(&fixture);
+    let server = MockServer::start(server_bytes(&fixture));
+    let cache = unique_temp_dir("letterbox-click-cache");
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
+        Duration::from_secs(20),
+    );
+    assert!(!screens(&events).is_empty(), "a frame was composed");
+
+    for (zoom, dpr) in [(1.0, 1.0), (1.0, 2.0)] {
+        handle.set_viewport(1000.0, 700.0, dpr, zoom, false);
+        let events = collect_events(
+            &mut rx,
+            |collected| {
+                notes(collected)
+                    .iter()
+                    .any(|text| text.starts_with("script: click"))
+            },
+            Duration::from_secs(10),
+        );
+        let screen = *screens(&events)
+            .iter()
+            .find(|screen| (screen.geometry.viewport_w - 1000.0).abs() < 1e-9)
+            .expect("the requested viewport was composited");
+        let bars = screen.geometry.transform().content_rect();
+        assert!(
+            bars.x > 5.0,
+            "the pillarbox is wide enough for the click to land inside it"
+        );
+        for (x, y) in [(5.0, 5.0), (5.0, 350.0), (995.0, 350.0)] {
+            handle.click(x, y);
+            let events = collect_events(
+                &mut rx,
+                |collected| {
+                    notes(collected)
+                        .iter()
+                        .any(|text| text.starts_with("script: click at room"))
+                },
+                Duration::from_secs(5),
+            );
+            let note = *notes(&events)
+                .iter()
+                .find(|text| text.starts_with("script: click at room"))
+                .expect("the click was reported");
+            let (rx, ry) = clicked_room_note(note);
+            let outside = rx < 0 || ry < 0 || rx >= 512 || ry >= 384;
+            assert!(
+                outside,
+                "a click in the letterbox at ({x},{y}) must stay outside the room \
+                 and be reported as a miss, not clamped onto an edge (zoom {zoom}, dpr {dpr}); note: {note}"
+            );
+            assert!(
+                note.contains("hit no hotspot"),
+                "an out-of-room click cannot be inside a hotspot; note: {note}"
+            );
+        }
+    }
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
 fn a_click_before_the_room_loads_is_ignored() {
     let fixture = logon_fixture();
     let mut frames = server_bytes(&fixture);
@@ -1502,6 +1679,22 @@ fn mean_luma(rgba: &[u8]) -> f64 {
 fn frame_luma(handle: &ClientHandle) -> f64 {
     let png = handle.frames().png().expect("the frame store holds a PNG");
     mean_luma(&frame_rgba(&png))
+}
+
+/// The integer room cell out of the runtime's own report, e.g.
+/// `script: click at room (465,26) hit hotspot 2`.
+fn clicked_room_note(note: &str) -> (i32, i32) {
+    let (_, rest) = note
+        .split_once("click at room (")
+        .expect("the note reports a room coordinate");
+    let (pair, _) = rest
+        .split_once(')')
+        .expect("the coordinate is parenthesised");
+    let (x, y) = pair.split_once(',').expect("the note is (x,y)");
+    (
+        x.parse().expect("an integer room x"),
+        y.parse().expect("an integer room y"),
+    )
 }
 
 /// The viewport point that hits the first hotspot whose script calls `DIMROOM`.
@@ -1903,6 +2096,130 @@ fn room_only_frames(fixture: &Fixture) -> Vec<Vec<u8>> {
             .encode(order)
             .expect("room descriptor encodes"),
     ]
+}
+
+/// The two users that make the determinism test meaningful: same y and
+/// overlapping x, so any order-dependent draw would be visible.
+const ORDER_USERS: [(i32, &str, i16, i16); 2] = [(101, "Alpha", 3, 5), (102, "Beta", 7, 2)];
+
+fn frames_with_users_in_order(fixture: &Fixture, forward: bool) -> Vec<Vec<u8>> {
+    let order = fixture.byte_order;
+    let mut frames = room_only_frames(fixture);
+    let indices: [usize; 2] = if forward { [0, 1] } else { [1, 0] };
+    for index in indices {
+        let (id, name, face, color) = ORDER_USERS[index];
+        frames.push(user_new_frame(
+            order,
+            id,
+            name,
+            face,
+            color,
+            &[],
+            Point::new(200 + 20 * index as i16, 200),
+        ));
+    }
+    frames
+}
+
+/// One run: serve `frames`, wait until every user is drawn, then capture the
+/// composited PNG. The frame is read after a viewport change forces a fresh
+/// composition, so the captured bytes are the same pipeline step in both runs.
+fn compose_and_capture(frames: Vec<Vec<u8>>, tag: &str) -> Vec<u8> {
+    let fixture = logon_fixture();
+    let room = room_desc(&fixture);
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir(&format!("determinism-{tag}-cache"));
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+                && user_lists(collected).iter().any(|users| {
+                    users.iter().any(|user| user.id == ORDER_USERS[0].0)
+                        && users.iter().any(|user| user.id == ORDER_USERS[1].0)
+                })
+        },
+        Duration::from_secs(20),
+    );
+    let baseline = screens(&events)
+        .iter()
+        .find(|screen| screen.room_id == 901)
+        .map(|screen| screen.version)
+        .expect("a frame was composed");
+    assert!(
+        user_lists(&events).iter().any(|users| {
+            users.iter().any(|user| user.id == ORDER_USERS[0].0)
+                && users.iter().any(|user| user.id == ORDER_USERS[1].0)
+        }),
+        "both users arrived before the frame was captured"
+    );
+    // The user list is emitted before the next composition, so wait for the
+    // frame that actually has both of them before capturing anything.
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901 && screen.version >= baseline + 2)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.room_id == 901 && screen.version >= baseline + 2),
+        "the frame with both users was composed"
+    );
+
+    handle.set_viewport(1000.0, 700.0, 1.0, 1.0, false);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901 && screen.version > baseline)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.room_id == 901 && screen.version > baseline),
+        "the settled frame was recomposed"
+    );
+    let png = handle.frames().png().expect("a frame was composited");
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+    png
+}
+
+/// Users are stored in a map and can arrive in any order; the composited frame
+/// must not depend on that order. This is the guard against a future change
+/// leaking iteration order into the frame.
+#[test]
+fn the_same_users_inserted_in_a_different_order_composite_byte_identical_frames() {
+    let fixture = logon_fixture();
+    let forward = compose_and_capture(frames_with_users_in_order(&fixture, true), "forward");
+    let reversed = compose_and_capture(frames_with_users_in_order(&fixture, false), "reversed");
+    assert_eq!(
+        forward, reversed,
+        "the same room and users in a different insertion order must produce byte-identical frames"
+    );
+    // 512x384 at dpr 1: the captured PNG is the room, not the viewport.
+    assert_eq!(
+        frame_rgba(&forward).len(),
+        512 * 384 * 4,
+        "the captured frame is the room at dpr 1"
+    );
 }
 
 #[test]
