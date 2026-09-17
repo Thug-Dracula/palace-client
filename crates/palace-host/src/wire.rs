@@ -70,17 +70,15 @@ pub fn effect_frame(effect: &Effect, ctx: &WireContext) -> Option<Frame> {
             Some(Frame::new(opcode::WHISPER, ctx.user_id, w.into_vec()))
         }
         Effect::GotoRoom { room } => {
-            let room = (*room).clamp(0, i32::from(u16::MAX)) as u16;
+            // RoomID is 16-bit on the wire (`typedef sint16 RoomID`), so an id
+            // above 65535 narrows to its low 16 bits. Truncate, never clamp:
+            // clamping would send a different, non-existent room (73251 would
+            // become 65535) instead of the room the script means (7715).
+            let room = *room as u16;
             Some(navr_frame(room, ctx.user_id, order))
         }
-        Effect::MoveUserAbs { x, y } => {
-            let (x, y) = clamp_position(*x, *y, ctx);
-            let mut w = Writer::new(order);
-            Point::new(y as i16, x as i16).encode(&mut w);
-            Some(Frame::new(opcode::USERMOVE, ctx.user_id, w.into_vec()))
-        }
-        Effect::MoveUserRel { dx, dy } => {
-            let (x, y) = clamp_position(ctx.self_pos.0 + *dx, ctx.self_pos.1 + *dy, ctx);
+        Effect::MoveUserAbs { .. } | Effect::MoveUserRel { .. } => {
+            let (x, y) = move_target(effect, ctx)?;
             let mut w = Writer::new(order);
             Point::new(y as i16, x as i16).encode(&mut w);
             Some(Frame::new(opcode::USERMOVE, ctx.user_id, w.into_vec()))
@@ -95,6 +93,11 @@ pub fn effect_frame(effect: &Effect, ctx: &WireContext) -> Option<Frame> {
             w.write_i16((*face).clamp(0, 15) as i16);
             Some(Frame::new(opcode::USERFACE, ctx.user_id, w.into_vec()))
         }
+        Effect::SetUserName { name } => Some(palace_wire::frame::user_name_frame(
+            name,
+            ctx.user_id,
+            order,
+        )),
         Effect::SetProps { props } => {
             let mut w = Writer::new(order);
             let worn: Vec<i64> = props.iter().copied().filter(|p| *p != 0).take(9).collect();
@@ -153,6 +156,35 @@ pub fn effect_frame(effect: &Effect, ctx: &WireContext) -> Option<Frame> {
             Some(Frame::new(opcode::DRAW, 0, body))
         }
         Effect::PaintClear => Some(Frame::new(opcode::DRAW, 0, draw_detonate(order))),
+        _ => None,
+    }
+}
+
+/// The room position a scripted user move comes to rest at.
+///
+/// `SETPOS` names the position outright; `MOVE` nudges from
+/// [`WireContext::self_pos`]. Both are clamped by the same rule
+/// [`effect_frame`] encodes, so the frame a script sends and the position the
+/// client applies locally are the same by construction — there is one
+/// computation, not two that can drift. `None` for every effect that is not a
+/// user move.
+///
+/// The clamp here is [`clamp_position`], which is *not* identical to
+/// `palace_render::clamp_avatar_position` for rooms at or below 44 px: this one
+/// lets the coordinate reach the room edge (and pins to the room size when it is
+/// under 22 px), while the renderer pins to the 22 px avatar margin. They agree
+/// for every room larger than 44 px, which is every real room; the divergence is
+/// left in place because the renderer's clamp is tied to how avatars are
+/// anchored.
+#[must_use]
+pub fn move_target(effect: &Effect, ctx: &WireContext) -> Option<(i32, i32)> {
+    match effect {
+        Effect::MoveUserAbs { x, y } => Some(clamp_position(*x, *y, ctx)),
+        Effect::MoveUserRel { dx, dy } => Some(clamp_position(
+            ctx.self_pos.0 + *dx,
+            ctx.self_pos.1 + *dy,
+            ctx,
+        )),
         _ => None,
     }
 }

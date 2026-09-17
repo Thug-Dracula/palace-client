@@ -49,6 +49,6 @@ pub use engine::{DispatchReport, HandlerRun, ScriptEngine, MAX_PENDING_ALARMS};
 pub use host::{AlarmKind, PenState, PendingAlarm, ScriptHost};
 pub use load::{cyborg_script, scripts_from_room, LoadProblem, LoadedScript};
 pub use view::{point_in_polygon, HostView, LoosePropView, SpotView, UserView};
-pub use wire::{effect_frame, WireContext};
+pub use wire::{effect_frame, move_target, WireContext};
 
 pub use iptscrae_palace::ScriptEvent;

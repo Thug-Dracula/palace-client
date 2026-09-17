@@ -115,6 +115,25 @@ fn dest_reads_the_executing_hotspot() {
 }
 
 #[test]
+fn a_clicked_doors_script_reaches_its_destination_room() {
+    let mut engine = ScriptEngine::with_palace_limits();
+    let mut room = room_with(&[(5, "ON SELECT { DEST GOTOROOM }")]);
+    room.hotspots[0].hotspot_type = 1;
+    room.hotspots[0].dest = 161;
+    engine.set_view(HostView {
+        room_id: 901,
+        ..HostView::default()
+    });
+    engine.load_room(&room);
+    let report = engine.fire_spot(ScriptEvent::Select, 5);
+    assert_eq!(
+        report.effects,
+        vec![Effect::GotoRoom { room: 161 }],
+        "the clicked door's DEST must be its destination room"
+    );
+}
+
+#[test]
 fn alarmexec_schedules_a_body_that_runs_later() {
     let mut engine = engine_for(&[(1, "ON ENTER { { \"later\" SAY } 30 ALARMEXEC }")]);
     let enter = engine.fire(ScriptEvent::Enter);
