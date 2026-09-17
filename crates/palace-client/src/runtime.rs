@@ -236,6 +236,7 @@ struct Shared {
 
 impl Shared {
     fn emit(&self, event: ClientEvent) {
+        crate::trace::client_event(&event);
         let _ = self.events.send(event);
     }
 
@@ -437,6 +438,7 @@ pub struct ClientRuntime;
 impl ClientRuntime {
     /// Start the runtime and return its handle and event stream.
     pub fn spawn(cfg: ClientConfig) -> (ClientHandle, ClientEventStream) {
+        crate::trace::start_from_env();
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (ev_tx, ev_rx) = unbounded_channel();
         let frames = Arc::new(FrameStore::new());
@@ -574,6 +576,7 @@ fn run_session(
     let handshake = conn.handshake(Duration::from_secs(12))?;
     let order = handshake.byte_order;
     let user_id = handshake.user_id();
+    crate::trace::frame_in(&handshake.frame, order);
     shared.note(format!(
         "connected to {}:{} ({}-endian, user id {user_id})",
         cfg.host,
@@ -751,6 +754,7 @@ fn run_session(
 
         if let Some(room_id) = goto {
             if occupied_room {
+                crate::trace::room_leave(state.current_room.as_ref().map(|room| room.id));
                 for event in run_dispatch(
                     &mut scripts,
                     ScriptEvent::Leave,
@@ -765,6 +769,7 @@ fn run_session(
                 occupied_room = false;
             }
             state.begin_room_change();
+            crate::trace::nav_request(room_id);
             conn.send(&state.navigate_frame(room_id))?;
             dirty_render = true;
         }
@@ -857,6 +862,7 @@ fn run_session(
                         "script: ran {} instruction(s) from the input box",
                         run.steps
                     ));
+                    crate::trace::script_effects("RUNSOURCE", &run.effects);
                     let context = wire_context(&state, shared, scripts.host().pen);
                     let mut follow = Vec::new();
                     for effect in &run.effects {
@@ -882,6 +888,7 @@ fn run_session(
 
         match conn.poll_frame(POLL_SLICE) {
             Ok(Some(frame)) => {
+                crate::trace::frame_in(&frame, order);
                 if shared.debug_frames {
                     shared.note(format!(
                         "<- {} ref={} len={} body={}",
@@ -937,6 +944,7 @@ fn run_session(
                 if applied.room_entered {
                     if let Some(room) = state.current_room.clone() {
                         shared.emit(ClientEvent::RoomEntered { room: room.clone() });
+                        crate::trace::room_arrived(room.id, &room.name);
                         if let Some(desc) = state.room_desc.clone() {
                             scripts.load_room(&desc);
                             for problem in &scripts.problems {
@@ -967,6 +975,7 @@ fn run_session(
                             if let Some(target) = wanted {
                                 if target != room.id {
                                     state.begin_room_change();
+                                    crate::trace::nav_request(target);
                                     conn.send(&state.navigate_frame(target))?;
                                     dirty_render = true;
                                 }
@@ -1058,6 +1067,7 @@ fn run_session(
         let ticks = (now * 60 / 1000) as i64;
         let alarm_effects = scripts.advance(ticks);
         if !alarm_effects.is_empty() {
+            crate::trace::script_effects("ALARM", &alarm_effects);
             let context = wire_context(&state, shared, scripts.host().pen);
             let mut follow = Vec::new();
             for effect in &alarm_effects {
@@ -1525,6 +1535,7 @@ fn run_event(
         Some(spot) => scripts.fire_spot(event, spot),
         None => scripts.fire(event),
     };
+    crate::trace::dispatch(&report, only);
     let mut out = Vec::new();
     for run in &report.runs {
         if let Some(error) = &run.error {
@@ -1590,6 +1601,7 @@ fn run_chat_dispatch(
     view.chat_string = text.to_string();
     scripts.set_view(view);
     let report = scripts.fire(event);
+    crate::trace::dispatch(&report, None);
     let mut out = Vec::new();
     let context = wire_context(state, shared, scripts.host().pen);
     let mut follow = Vec::new();
@@ -2175,6 +2187,7 @@ fn send_self_props(state: &SessionState, conn: &mut Connection) -> Result<()> {
             })
             .collect()
     });
+    crate::trace::worn_props(user_id, &props);
     let frame = UserProp { user_id, props }.frame(state.byte_order())?;
     conn.send(&frame)
 }

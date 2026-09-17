@@ -29,6 +29,7 @@ pub mod frame;
 pub mod runtime;
 pub mod session;
 pub mod state;
+pub mod trace;
 pub mod xtlk;
 
 pub use error::{ClientError, Result};
@@ -37,4 +38,5 @@ pub use runtime::{
     ClientCommand, ClientConfig, ClientEvent, ClientEventStream, ClientHandle, ClientRuntime,
 };
 pub use state::{ChatKind, ChatLine, ConnectionStatus, RoomInfo, ServerBanner, UserInfo};
+pub use trace::Tracer;
 pub use xtlk::{decrypt, encrypt};

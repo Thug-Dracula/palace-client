@@ -88,6 +88,7 @@ impl Connection {
 
     /// Write one frame.
     pub fn send(&mut self, frame: &Frame) -> Result<()> {
+        crate::trace::frame_out(frame, self.order);
         let bytes = frame.encode(self.order)?;
         self.stream.write_all(&bytes).map_err(ClientError::Io)?;
         self.stream.flush().map_err(ClientError::Io)?;
