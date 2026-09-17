@@ -591,8 +591,40 @@ four tests — the two door tests, plus `a_real_room_hotspot_script_dimroom_dark
 therefore never ran. Unrelated tests failing is the proof that this check sits on the real click
 path rather than in dead code.
 
-**Still undecoded in this family:** `SPOTNEW`/`SPOTDEL`/`SPOTMOVE`/`SPOTSETDESC`
-(`opSn`/`opSd`/`coLs`/`opSs`) — spots appearing, vanishing and moving mid-session — and `DRAW`.
+**Since closed:** `SPOTNEW`/`SPOTDEL`/`SPOTMOVE`/`PICTMOVE` are now decoded and applied
+(commit `6d24495`). The other four of that family turned out to be vestigial — see the section
+below before assuming they need implementing.
+
+## Vestigial opcodes: defined but unused (2026-09-17)
+
+Four opcodes from the room-mutation family have **no documented body anywhere** and no server
+that uses them:
+
+    opSs  SPOTSETDESC   0x6f705373
+    nPct  PICTNEW       0x6e506374
+    FPSq  PICTDEL       0x46505371
+    sPct  PICTSETDESC   0x73506374
+
+**The proof, so this is not re-investigated:** grepping the protocol reference for
+`struct ClientMsg_(pict|spot)` returns exactly five definitions — `pictMove`, `spotDel`,
+`spotMove`, `spotNew`, `spotState`. There is no `ClientMsg_pictNew`, `pictDel`, `pictSetDesc` or
+`spotSetDesc`. The reason is stated at :258-265: the opcode table's usage legend includes a glyph
+meaning *"According to source code, message is defined but unused"*, and the note says such
+messages *"will not appear in the individual message descriptions."* These four are precisely the
+ones with a table row and no section.
+
+Corroborated across every authority on disk — the original Palace SDK's `m-protocol.h` has no
+struct for them, the original server's `s-events.c` has no `case` for them, ThePalacev0 ships
+empty `Deserialize` stubs, Taj lists them only in its enum, QPalace annotates each `// ?`, the Go
+server has no build/parse function, and the PalaceChat 5 AppImage contains no constants for them
+in either byte order.
+
+**Conclusion: do not implement these.** A decoder needs width, field order and string encoding,
+and every one of those is unknowable here — `PICTDEL` could be a bare `HotspotID` (mirroring
+`SPOTDEL`, :1906) or `RoomID + HotspotID`; `PICTNEW` could be bodyless (mirroring `SPOTNEW`,
+:1938) or carry a `PictureRec`. Those are mutually exclusive guesses, and a wrong decoder is
+worse than an honest "ignored opcode" line. If a real capture ever shows one, that capture is the
+authority and the decoder should be written from its bytes.
 
 ## Running it
 
