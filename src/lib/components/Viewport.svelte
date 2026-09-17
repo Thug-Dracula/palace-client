@@ -2,9 +2,19 @@
   import { onMount } from "svelte";
   import * as api from "../api";
   import { store } from "../store.svelte";
+  import RoomMenu from "./RoomMenu.svelte";
+  import AvatarDialog from "./AvatarDialog.svelte";
 
   let element: HTMLDivElement | undefined = $state();
   const last = { width: 0, height: 0, dpr: 0, zoom: -1, native: false };
+
+  let menu = $state<{ x: number; y: number } | null>(null);
+  let avatarOpen = $state(false);
+
+  function onContextMenu(event: MouseEvent) {
+    event.preventDefault();
+    menu = { x: event.clientX, y: event.clientY };
+  }
 
   function push() {
     if (!element) {
@@ -112,7 +122,7 @@
     tabindex="0"
     onclick={onClick}
     onkeydown={() => {}}
-    oncontextmenu={(event) => event.preventDefault()}
+    oncontextmenu={onContextMenu}
   >
     {#if store.screen && geometry}
       <img
@@ -145,4 +155,17 @@
       </div>
     {/if}
   </div>
+
+  {#if menu}
+    <RoomMenu
+      x={menu.x}
+      y={menu.y}
+      onclose={() => (menu = null)}
+      onchooseavatar={() => (avatarOpen = true)}
+    />
+  {/if}
+
+  {#if avatarOpen}
+    <AvatarDialog onclose={() => (avatarOpen = false)} />
+  {/if}
 </div>

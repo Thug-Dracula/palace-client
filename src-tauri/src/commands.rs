@@ -82,6 +82,22 @@ pub fn click(state: State<'_, AppState>, x: f64, y: f64) -> Result<(), String> {
     with_client(&state, |client| client.click(x, y))
 }
 
+/// Show or hide name tags and avatars.
+#[tauri::command]
+pub fn set_visibility(
+    state: State<'_, AppState>,
+    names: bool,
+    avatars: bool,
+) -> Result<(), String> {
+    with_client(&state, |client| client.set_visibility(names, avatars))
+}
+
+/// Change the signed-in user's face and colour.
+#[tauri::command]
+pub fn set_avatar(state: State<'_, AppState>, face: i16, color: i16) -> Result<(), String> {
+    with_client(&state, |client| client.set_avatar(face, color))
+}
+
 /// Report the viewport size, device pixel ratio, zoom and scale mode.
 #[tauri::command]
 pub fn set_viewport(

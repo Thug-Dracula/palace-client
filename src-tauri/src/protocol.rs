@@ -38,10 +38,14 @@ impl FrameSlot {
 /// Route a `palace://localhost/<path>` request.
 pub fn handle(slot: &FrameSlot, request: &Request<Vec<u8>>, responder: UriSchemeResponder) {
     let path = request.uri().path().trim_start_matches('/').to_string();
-    if path != "frame" {
-        responder.respond(status(StatusCode::NOT_FOUND));
-        return;
+    match path.as_str() {
+        "frame" => handle_frame(slot, responder),
+        "faces" => responder.respond(png(palace_render::face_sheet_png().to_vec())),
+        _ => responder.respond(status(StatusCode::NOT_FOUND)),
     }
+}
+
+fn handle_frame(slot: &FrameSlot, responder: UriSchemeResponder) {
     let slot = slot.clone();
     std::thread::spawn(move || {
         let Some(store) = slot.get() else {

@@ -106,6 +106,8 @@ export type ClientEvent =
 
 export const frameUrl = (version: number): string => `palace://localhost/frame?v=${version}`;
 
+export const facesUrl = (): string => "palace://localhost/faces";
+
 export const getSettings = (): Promise<Settings> => invoke("get_settings");
 
 export const connect = (settings: Settings): Promise<void> =>
@@ -132,6 +134,12 @@ export const setViewport = (
 export const refresh = (): Promise<void> => invoke("refresh");
 
 export const click = (x: number, y: number): Promise<void> => invoke("click", { x, y });
+
+export const setVisibility = (names: boolean, avatars: boolean): Promise<void> =>
+  invoke("set_visibility", { names, avatars });
+
+export const setAvatar = (face: number, color: number): Promise<void> =>
+  invoke("set_avatar", { face, color });
 
 export const onEvent = (handler: (event: ClientEvent) => void): Promise<UnlistenFn> =>
   listen<ClientEvent>(EVENT_NAME, (message) => handler(message.payload));
