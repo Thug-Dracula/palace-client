@@ -337,6 +337,30 @@ Both settle cheaply by reading how a reference client handles a click on those t
 - [ ] `feat/palace-ui`, `feat/events`, `feat/iptscrae` branches are kept as a safety net (all
   contained in `master`). Delete once publication makes them redundant.
 
+### 2.11 Colosseum rooms load their logic from server-hosted scripts (`LOADSCRIPT`) — unimplemented
+
+Colosseum rooms call `"big-script.txt" LOADSCRIPT` on entry and define their important functions in
+that file, not in the room payload. Verified against room 31000 ("The Colosseum (5v5)"): the room
+payload defines `cdead`, but **`bouncedef`, `deader` and `pinchat` have zero definitions in it** — they
+come from `big-script.txt`. The same command appears in `Colosseum_Lobby`, `Battle_Prep_bp`,
+`Entrance_xlobby`, `Battle_Arena_blackroom` and room 31743.
+
+`LOADSCRIPT` is **not a command in any reference client** (OpenPalace/QPalace/Taj only have an unrelated
+internal `loadScripts()` method), so it is a pserver extension. Fetching the file requires the legacy
+server-hosted file transfer (`sFil` / `qFil` / `fnfe`), which §2.5 ranks as superseded by HTTP media and
+does not implement.
+
+**Consequence:** any room whose behaviour depends on an externally-loaded script will misbehave in ways
+that look like script bugs but are missing definitions. Before diagnosing a Colosseum room as broken,
+check whether the function it calls is defined in the room payload at all:
+
+```bash
+grep -c "bouncedef DEF" ~/palace-corpus/animanic_walk/room_31000.txt   # 0 = it lives in big-script.txt
+```
+
+- [ ] Implementing this means the legacy file-transfer path plus loading a fetched script into the VM.
+  Scope it deliberately; it is the difference between "Colosseum rooms mostly work" and "they work".
+
 ---
 
 ## Part 3 — How to verify
