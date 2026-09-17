@@ -540,6 +540,14 @@ impl Host for ScriptHost {
                 });
                 Ok(Vec::new())
             }
+            "LOADSCRIPT" | "HTTPGET" => {
+                let url = text_arg(args, 0)?;
+                self.effects.push(Effect::FetchScript {
+                    url,
+                    spot: self.current_spot,
+                });
+                Ok(Vec::new())
+            }
             "SETUSERNAME" => {
                 self.effects.push(Effect::SetUserName {
                     name: text_arg(args, 0)?,
@@ -694,13 +702,11 @@ impl Host for ScriptHost {
             })]),
             "HIDESMILEYS" | "LOCKUSERPROPS" | "AUTOUSERLAYER" | "SETTOOLTIP" | "CLEARTOOLTIP"
             | "SETSPOTOPTIONS" | "ADDPIC" | "REMOVEPIC" | "DELPIC" | "ADDSPOT"
-            | "SETSPOTSCRIPT" | "LOADSCRIPT" | "HTTPGET" | "ROOMZOOM" | "ROOMUNZOOM" | "CIRCLE"
-            | "FILL" | "PAINT" | "TEXT" | "PING" | "CLRPROPS" | "SHOWALLPROPS" | "HIDEPROPS"
-            | "SHOWPROPS" | "SETPROPSLOCAL" | "ADDPROP" | "PURGE" | "ROOMDESC" | "OFFLINE"
-            | "ONLINE" | "NBRUSERS" | "GETWHOTALKING" | "MSGTO" | "FLUSH" | "SETSPOTSTATEALL"
-            | "AWAY" | "TOGGLECTRL" | "SETDESC" | "BAN" | "KICK" => {
-                self.unimplemented(name, pushes, push)
-            }
+            | "SETSPOTSCRIPT" | "ROOMZOOM" | "ROOMUNZOOM" | "CIRCLE" | "FILL" | "PAINT"
+            | "TEXT" | "PING" | "CLRPROPS" | "SHOWALLPROPS" | "HIDEPROPS" | "SHOWPROPS"
+            | "SETPROPSLOCAL" | "ADDPROP" | "PURGE" | "ROOMDESC" | "OFFLINE" | "ONLINE"
+            | "NBRUSERS" | "GETWHOTALKING" | "MSGTO" | "FLUSH" | "SETSPOTSTATEALL" | "AWAY"
+            | "TOGGLECTRL" | "SETDESC" | "BAN" | "KICK" => self.unimplemented(name, pushes, push),
 
             _ => self.unimplemented(name, pushes, push),
         }

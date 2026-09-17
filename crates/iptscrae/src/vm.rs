@@ -975,6 +975,8 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
         let global = self.locals.get(name).map(|v| v.global).unwrap_or(false);
         if global {
             Ok(self.globals.get(name).cloned().unwrap_or(Value::Int(0)))
+        } else if let Some(stored) = self.globals.get(name).cloned() {
+            Ok(stored)
         } else {
             Ok(self
                 .locals

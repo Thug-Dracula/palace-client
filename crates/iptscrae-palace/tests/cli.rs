@@ -425,7 +425,7 @@ fn corpus_summarises_every_file_and_recurses_into_subdirectories() {
 #[test]
 fn corpus_reports_unregistered_command_spellings() {
     let dir = TempDir::new();
-    dir.write("unimpl.txt", "ON ENTER { HTTPGET 1 \"a\" & }\n");
+    dir.write("unimpl.txt", "ON ENTER { UNKNOWNCOMMAND 1 \"a\" & }\n");
     let output = run(&["corpus", dir.path().to_str().unwrap()]);
     assert!(output.status.success());
     let text = stdout(&output);
@@ -443,7 +443,7 @@ fn corpus_reports_unregistered_command_spellings() {
         "Unregistered symbols named by failing handlers",
         "the report lists the spelling seen",
     );
-    assert_contains(&text, "HTTPGET", "the source spelling is recovered");
+    assert_contains(&text, "UNKNOWNCOMMAND", "the source spelling is recovered");
     assert_contains(
         &text,
         "Concat: expected string, found number",

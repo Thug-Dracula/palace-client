@@ -191,6 +191,32 @@ impl ScriptEngine {
         }
     }
 
+    /// Parse and run a fetched script body in the sandboxed VM.
+    ///
+    /// This is the same engine room scripts run through: the step budget, the
+    /// variable caps and the command table all apply, so a hostile or malformed
+    /// body faults inside the run report instead of breaking the session.
+    /// Definitions land in the engine's shared globals, so the `HTTPRECEIVED`
+    /// dispatch that follows sees what the fetch defined — sparky's
+    /// `executeScriptSource` runs the body through the same runtime as room
+    /// scripts for exactly that reason. `spot` is the fetching hotspot; `0`
+    /// runs room-level.
+    pub fn execute_fetched_source(&mut self, source: &str, spot: i32) -> HandlerRun {
+        self.engine.host.current_spot = spot;
+        let run =
+            match iptscrae::lexer::parse_body(source, &self.engine.commands, &self.engine.limits) {
+                Ok(chunk) => self.run_handler(spot, &chunk, false),
+                Err(error) => HandlerRun {
+                    spot,
+                    steps: 0,
+                    error: Some(error.to_string()),
+                    effects: Vec::new(),
+                },
+            };
+        self.engine.reset_globals(); // CUT-MARKER
+        run
+    }
+
     /// Fire an event at every script that handles it.
     ///
     /// For `ON INCHAT` / `ON OUTCHAT` the incoming text is planted in

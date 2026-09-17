@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use palace_asset::ScriptFetch;
 use palace_host::ScriptEvent;
 use palace_render::{DrawList, RoomDesc};
 use palace_room::{LooseProp, LoosePropSpec};
@@ -147,6 +148,11 @@ pub struct SessionState {
     /// `DRAW` that has arrived since. Scoped to one room, so a `DRAW` for a room
     /// this session has left cannot appear on the new room's canvas.
     pub draw: DrawList,
+    /// `LOADSCRIPT`/`HTTPGET` jobs not yet handed to the fetch worker, and the
+    /// room they came from. Drained by the runtime each loop; cleared on room
+    /// change so a left room's late effects cannot fetch into the new room.
+    pub pending_fetches: Vec<ScriptFetch>,
+    pending_fetch_room: Option<i32>,
     pub chat: Vec<ChatLine>,
     chat_seq: u64,
     last_error: Option<String>,
@@ -172,6 +178,8 @@ impl SessionState {
             avatars_hidden: false,
             pic_opacity: BTreeMap::new(),
             draw: DrawList::new(),
+            pending_fetches: Vec::new(),
+            pending_fetch_room: None,
             chat: Vec::new(),
             chat_seq: 0,
             last_error: None,
@@ -239,6 +247,8 @@ impl SessionState {
         // Paint is room state: leaving must not leave another room's strokes on
         // the canvas. The arriving room seeds its own list instead.
         self.draw = DrawList::new();
+        self.pending_fetches.clear();
+        self.pending_fetch_room = None;
     }
 
     /// Start the draw list from a room's own stored commands.

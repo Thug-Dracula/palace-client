@@ -92,8 +92,9 @@ pub use error::{
     MAX_BLOCK_SIZE, NAME_FIELD_LEN,
 };
 pub use media::{
-    fallback_chain, media_url, HttpResponse, HttpTransport, MediaConfig, MediaFetch, MediaFetcher,
-    UreqTransport,
+    admits_in_flight, fallback_chain, media_url, run_script_worker, HttpResponse, HttpTransport,
+    MediaConfig, MediaFetch, MediaFetcher, ScriptFetch, ScriptOutcome, UreqTransport,
+    DEFAULT_MAX_HTTP_IN_FLIGHT,
 };
 pub use pipeline::{
     decode_query, is_retryable, owns, spec_of, AssetPipeline, PipelineConfig, PipelineEvent,

@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use palace_asset::{AssetPipeline, AssetType, PipelineEvent};
+use palace_asset::{
+    run_script_worker, AssetPipeline, AssetType, MediaConfig, PipelineEvent, ScriptFetch,
+    ScriptOutcome, UreqTransport,
+};
 use palace_host::{
     effect_frame, move_target, Effect, HostView, PenState, ScriptEngine, ScriptEvent, UserView,
     WireContext,
@@ -572,6 +575,27 @@ fn run_session(
         })
         .ok();
 
+    let (script_fetch_tx, script_fetch_rx) = mpsc::channel::<ScriptFetch>();
+    let (script_base_tx, script_base_rx) = mpsc::channel::<String>();
+    let (script_done_tx, script_done_rx) = mpsc::channel::<ScriptOutcome>();
+    let script_thread = thread::Builder::new()
+        .name("palace-script-http".to_string())
+        .spawn({
+            let config = MediaConfig {
+                user_agent: format!("palace-client/{}", env!("CARGO_PKG_VERSION")),
+                ..MediaConfig::default()
+            };
+            move || {
+                run_script_worker(
+                    UreqTransport::from_config(&config),
+                    script_base_rx,
+                    script_fetch_rx,
+                    script_done_tx,
+                )
+            }
+        })
+        .ok();
+
     let mut conn = Connection::connect(&cfg.host, cfg.port, Duration::from_secs(8))?;
     let handshake = conn.handshake(Duration::from_secs(12))?;
     let order = handshake.byte_order;
@@ -717,7 +741,11 @@ fn run_session(
             }
             let _ = conn.send(&Frame::empty(opcode::LOGOFF, 0));
             drop(media_tx);
+            drop(script_fetch_tx);
             if let Some(handle) = media_thread {
+                let _ = handle.join();
+            }
+            if let Some(handle) = script_thread {
                 let _ = handle.join();
             }
             return Ok(clean);
@@ -931,7 +959,8 @@ fn run_session(
                 }
                 if let Some(url) = state.banner.media_base.clone() {
                     if media_base.as_deref() != Some(url.as_str()) {
-                        media_base = Some(url);
+                        media_base = Some(url.clone());
+                        let _ = script_base_tx.send(url);
                         dirty_render = true;
                     }
                 }
@@ -1028,14 +1057,22 @@ fn run_session(
             Err(ClientError::Disconnected) => {
                 shared.chat(ChatKind::System, "the server closed the connection");
                 drop(media_tx);
+                drop(script_fetch_tx);
                 if let Some(handle) = media_thread {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = script_thread {
                     let _ = handle.join();
                 }
                 return Ok(false);
             }
             Err(e) => {
                 drop(media_tx);
+                drop(script_fetch_tx);
                 if let Some(handle) = media_thread {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = script_thread {
                     let _ = handle.join();
                 }
                 return Err(e);
@@ -1089,6 +1126,27 @@ fn run_session(
             }
             if !follow.is_empty() {
                 shared.note("script: an alarm asked to re-dispatch; it will not compound");
+            }
+        }
+
+        if !state.pending_fetches.is_empty() {
+            for fetch in std::mem::take(&mut state.pending_fetches) {
+                if script_fetch_tx.send(fetch).is_err() {
+                    shared.note("script: fetch worker is gone");
+                }
+            }
+        }
+
+        while let Ok(outcome) = script_done_rx.try_recv() {
+            for event in deliver_script_outcome(
+                &mut scripts,
+                &mut state,
+                outcome,
+                shared,
+                &mut conn,
+                &mut dirty_render,
+            ) {
+                shared.emit(event);
             }
         }
 
@@ -1632,6 +1690,97 @@ fn run_chat_dispatch(
 
 const MAX_SCRIPT_FOLLOW_DEPTH: u32 = 4;
 
+/// Hand one completed script fetch back to the scripts.
+///
+/// A `text/iptscrae` or `text/ipt` body is executed in the sandboxed engine and
+/// then dispatched as `HTTPRECEIVED` at the fetching hotspot (`0` = room-level);
+/// anything else, and any failure, dispatches `HTTPERROR` with the URL and
+/// reason. This mirrors sparky's `executeScriptSource` content-type branch and
+/// its `xr` failure dispatch.
+fn deliver_script_outcome(
+    scripts: &mut ScriptEngine,
+    state: &mut SessionState,
+    outcome: ScriptOutcome,
+    shared: &Arc<Shared>,
+    conn: &mut Connection,
+    dirty_render: &mut bool,
+) -> Vec<ClientEvent> {
+    let spot = outcome.spot();
+    let only = (spot != 0).then_some(spot);
+    let requested = outcome.requested().to_string();
+    match outcome {
+        ScriptOutcome::Response {
+            url,
+            body,
+            content_type,
+            ..
+        } => {
+            let probe = palace_asset::HttpResponse {
+                status: 200,
+                body,
+                content_type,
+            };
+            if probe.is_script() {
+                let source = String::from_utf8_lossy(&probe.body).into_owned();
+                crate::trace::script_effects("HTTPRECEIVED-source", &[]);
+                let run = scripts.execute_fetched_source(&source, spot);
+                if let Some(error) = &run.error {
+                    shared.note(format!(
+                        "script: fetched source from {url} failed to run: {error}"
+                    ));
+                }
+                if !run.effects.is_empty() {
+                    crate::trace::script_effects("HTTPRECEIVED", &run.effects);
+                    let context = wire_context(state, shared, scripts.host().pen);
+                    let mut follow = Vec::new();
+                    for effect in &run.effects {
+                        for event in apply_effect(
+                            effect,
+                            &context,
+                            state,
+                            shared,
+                            conn,
+                            dirty_render,
+                            &mut follow,
+                        ) {
+                            shared.emit(event);
+                        }
+                    }
+                }
+                let report = match only {
+                    Some(spot) => scripts.fire_spot(ScriptEvent::HttpReceived, spot),
+                    None => scripts.fire(ScriptEvent::HttpReceived),
+                };
+                crate::trace::dispatch(&report, only);
+                vec![report_event(&report)]
+            } else {
+                vec![ClientEvent::Note {
+                    text: format!(
+                        "script: fetched {url} ({} bytes, content type {:?}) is not IPTSCRAE; not executed",
+                        probe.body.len(),
+                        probe.content_type.as_deref().unwrap_or("none")
+                    ),
+                }]
+            }
+        }
+        ScriptOutcome::Failure { reason, .. } => {
+            let report = match only {
+                Some(spot) => scripts.fire_spot(ScriptEvent::HttpError, spot),
+                None => scripts.fire(ScriptEvent::HttpError),
+            };
+            crate::trace::dispatch(&report, only);
+            let mut out = Vec::new();
+            if !report.runs.is_empty() {
+                out.push(report_event(&report));
+            }
+            out.push(ClientEvent::Note {
+                text: format!("script: HTTP fetch of {requested} failed: {reason}"),
+            });
+            out
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_effect(
     effect: &Effect,
@@ -2063,8 +2212,18 @@ fn apply_effect(
         // The alarm is already scheduled: `ScriptHost` records it and the engine
         // runs the handler when it falls due.
         Effect::SetSpotAlarm { spot, ticks } => vec![ClientEvent::Note {
-            text: format!("script: SETALARM spot {spot} in {ticks} ticks"),
+            text: format!("script: SETALARM spot={spot} in {ticks} ticks"),
         }],
+        Effect::FetchScript { url, spot } => {
+            state.pending_fetches.push(ScriptFetch {
+                requested: url.clone(),
+                url: url.clone(),
+                spot: *spot,
+            });
+            vec![ClientEvent::Note {
+                text: format!("script: fetching {url} (hotspot {spot})"),
+            }]
+        }
     }
 }
 
@@ -4007,6 +4166,103 @@ mod tests {
             fired(&events, "ROOMREADY"),
             1,
             "the corpus handler runs on arrival"
+        );
+    }
+
+    // ---------------------------------------------- LOADSCRIPT / HTTPGET dispatch
+
+    fn fetch_outcome(
+        scripts: &mut ScriptEngine,
+        state: &mut SessionState,
+        outcome: ScriptOutcome,
+    ) -> Vec<ClientEvent> {
+        let mut harness = harness();
+        let mut dirty_render = false;
+        deliver_script_outcome(
+            scripts,
+            state,
+            outcome,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty_render,
+        )
+    }
+
+    #[test]
+    fn a_script_typed_response_is_executed_and_dispatched_at_its_spot() {
+        let room = scripted_room(&[(9, "ON HTTPRECEIVED { \"ran\" SAY }")]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        scripts.load_room(&room);
+        let mut state = state_in(&room);
+
+        let events = fetch_outcome(
+            &mut scripts,
+            &mut state,
+            ScriptOutcome::Response {
+                requested: "custo2.txt".to_string(),
+                url: "http://media.example/custo2.txt".to_string(),
+                spot: 9,
+                body: b"\"body\" SAY".to_vec(),
+                content_type: Some("text/iptscrae".to_string()),
+            },
+        );
+        assert_eq!(fired(&events, "HTTPRECEIVED"), 1);
+        assert_eq!(fired(&events, "HTTPERROR"), 0);
+    }
+
+    #[test]
+    fn a_non_script_response_is_not_executed() {
+        let room = scripted_room(&[(9, "ON HTTPRECEIVED { \"ran\" SAY }")]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        scripts.load_room(&room);
+        let mut state = state_in(&room);
+
+        let events = fetch_outcome(
+            &mut scripts,
+            &mut state,
+            ScriptOutcome::Response {
+                requested: "custo2.txt".to_string(),
+                url: "http://media.example/custo2.txt".to_string(),
+                spot: 9,
+                body: b"}{ hostile garbage {{".to_vec(),
+                content_type: Some("text/plain".to_string()),
+            },
+        );
+        assert_eq!(
+            fired(&events, "HTTPRECEIVED"),
+            0,
+            "a text/plain body is data, not a script"
+        );
+    }
+
+    #[test]
+    fn a_failed_fetch_is_reported_and_fires_httperror() {
+        let room = scripted_room(&[
+            (9, "ON HTTPERROR { \"error-path\" SAY }"),
+            (9, "ON HTTPRECEIVED { \"wrong-path\" SAY }"),
+        ]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        scripts.load_room(&room);
+        let mut state = state_in(&room);
+
+        let events = fetch_outcome(
+            &mut scripts,
+            &mut state,
+            ScriptOutcome::Failure {
+                requested: "custo2.txt".to_string(),
+                url: "http://media.example/custo2.txt".to_string(),
+                spot: 9,
+                reason: "HTTP 404".to_string(),
+            },
+        );
+        assert_eq!(fired(&events, "HTTPERROR"), 1, "the error handler runs");
+        assert_eq!(fired(&events, "HTTPRECEIVED"), 0, "no received dispatch");
+        let notes = note_texts(&events);
+        assert!(
+            notes
+                .iter()
+                .any(|text| text.contains("custo2.txt") && text.contains("404")),
+            "the failure is reported with the URL and reason: {notes:?}"
         );
     }
 }
