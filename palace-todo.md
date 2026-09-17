@@ -478,6 +478,58 @@ Consequences for the plan:
   (absolute URL, or relative joined to `state.banner.media_base`, scoped to the executing hotspot),
   then `CACHESCRIPT`/`HTTPCANCEL`.
 
+### 2.15 The prop bag
+
+Palace's "prop bag" (OpenPalace: `PropsWindow.mxml` + `model/PropBag.as`) is the user's **own collection
+of props**, plus **saved outfits**, with toggle-wear, delete, delete-all and "naked". It is not the same
+thing as `palace-prop`, which is the prop *file codec*; the bag is the collection on top of it.
+
+**There is a real bag on this machine.** `~/.local/share/PalaceChat/` is a live Palace client data
+directory, and `PropBag.bundle/` holds:
+
+| File | Meaning |
+|---|---|
+| `PalaceChat.pids` | the bag index — 61504 bytes |
+| `PalaceChat.props` | the props — 8939938 bytes |
+| `PalaceChat.favs`, `Trash.favs` | favourites and trash |
+| `Version`, `macro` | version byte, macros |
+
+**`PalaceChat.pids` format — confirmed, not inferred.** 3844 records of 16 bytes big-endian
+`(a: u32, b: u32, offset: u32, size: u32)`:
+
+- 61504 / 16 = 3844 with remainder 0; every record satisfies `offset + size <= 8939938` (0 violations);
+- offsets are non-decreasing and the blobs **tile `.props` contiguously — 3843/3843 adjacent pairs
+  satisfy `off[i] + size[i] == off[i+1]`**;
+- early records are `a = 0x80000000 + n, b = n + 1`; later ones carry CRC-like values;
+- **`(a, b)` is the prop's identity** — `BagThumbCache/*.png` is named `<a:08X>_<b:08X>.png` and
+  **11/11** of those keys are present in `.pids`. The client's own cache is keyed by the same pair;
+- each blob is a **32-byte zero prefix** followed by a normal prop at `blob + 0x20` (verified on
+  blobs 0 and 1, where the header reads `00 2c 00 2c` = 44x44).
+
+Also on disk: `~/Pictures/Prop Files/` holds the source rosters (`Palace1.prp`, `AshFile*.prp`,
+`idk.prp`) — the same `.prp` container `prop-tool` already parses, ~180k props. The *bag* is the curated
+subset; the rosters are everything.
+
+**Wearing a prop is two messages** (`OpenPalace/.../rpc/PalaceClient.as`):
+
+- `ASSET_REGI` = `0x72417374` — uploads the prop's asset bytes, guarded to 44x44 with offsets in
+  −44..88 ("web service big prop... ignore request").
+- `USER_PROP` = `0x75737250` — **the same opcode as our incoming `USERPROP`**; sets the worn list as
+  `(userId, count, (propId, crc=0)*)`, and the reference **caps the list at 9 worn props** while still
+  writing the untruncated `count * 8 + 4` size field.
+
+Our wire crate has only the incoming half, so both encoders are new work.
+
+Plan, in dependency order:
+
+- [ ] `palace-prop`: reader for `PropBag.bundle` (`.pids` index + `.props` blobs) + `prop-tool bag`.
+- [ ] `palace-wire`: `ASSET_REGI` and `USER_PROP` encoders.
+- [ ] A props panel: tile grid of the bag, toggle-wear, delete, save/restore outfit.
+- [ ] Wear wiring in the runtime (last — it needs `runtime.rs`, and it is the piece that actually
+  changes the session, so it waits until the reader and encoders are proven).
+
+The bag is **live data belonging to a running client** — read it read-only; never write there.
+
 ---
 
 ## Part 3 — How to verify
