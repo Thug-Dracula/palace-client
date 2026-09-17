@@ -789,6 +789,48 @@ Two implementation routes, neither chosen yet:
   and the browser handles formats, but it needs a command or route in `src-tauri/`, and that layer
   rebuilds slowly (it restarts the running app).
 
+### 2.23 The arena selection panel: ejection fixed, selection still not matching
+
+**Fixed.** The reported bounce was the client ejecting the player, and it is cured. The trace showed
+clicking hotspot 102 in room 7774 running `ON SELECT` with effects `[GOTOROOM 31743, SOUND
+"wrongo.wav"]` — the client sending the room change itself. That room hit-tests with `MOUSEPOS`, which
+nothing ever set, so it read `(0, 0)`; its handler ejects when x is below 78, and 0 was. The runtime now
+puts the pointer at the click's room position before the handler runs (`cbf7608`). After the fix the
+same clicks no longer eject.
+
+**Still open.** The panel does not navigate either now. The room's handler is a set of x-coordinate
+regions (from `pcap_extract/rooms2/009.scr.txt`, garbled):
+
+```text
+x GLOBAL MOUSEPOS SWAP x =
+{ 31743 GOTOROOM } x 78 < IF
+{ 31741 GOTOROOM } x 78 >  x 120 < AND IF    79-119   1v1
+{ 31746 GOTOROOM } x 120 > x 170 < AND IF    121-169  2v2
+{ 31747 GOTOROOM } x 179 > x 219 < AND IF    180-218  3v3
+{ 31748 GOTOROOM } x 219 > x 271 < AND IF    219-270  4v4
+{ 31000 GOTOROOM } x 271 > x 320 < AND IF    272-319  5v5
+{ 31001 GOTOROOM } x 320 > x 383 < AND IF    321-382
+```
+
+Live clicks and what the handler produced:
+
+| Click (room coords) | x lies in | Expected | Actual |
+|---|---|---|---|
+| (137,368), (140,368) | 121-169 | 31746 | `wrongo` only |
+| (211,308) | 180-218 | 31747 | `wrongo` only |
+| (366,367), (370,369) | 321-382 | 31001 | `wrongo` only |
+
+So **no region matches any click**, including clicks plainly inside one — the handler always falls
+through to its `wrongo` fallback. Either the value reaching the script is not in the room's coordinate
+space, or our VM mishandles the `x GLOBAL MOUSEPOS SWAP x =` assignment idiom, or the extracted script
+is too garbled to read. The live screen reported `buffer 1024x768 scale 1.073 dpr 2` for a 512x384 room,
+and device pixel ratio and zoom are exactly what the test fixtures never exercise — a constant ratio
+(2x, or 1.073x) explaining every click would settle it.
+
+Under investigation by comparing our reported click coordinates against hotspot 102's real geometry
+from the room descriptor. Do not special-case room 7774; whichever of these it is affects every room
+that hit-tests this way.
+
 ---
 
 ## Part 3 — How to verify
