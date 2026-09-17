@@ -23,6 +23,7 @@ use std::io::Read;
 
 use crate::byteorder::{ByteOrder, Reader, Writer};
 use crate::error::{Result, WireError, MAX_PAYLOAD_LEN};
+use crate::messages::Point;
 use crate::opcode::{Opcode, ROOMDESCEND, TIYID};
 
 /// Size of the fixed frame header: `eventType` + `length` + `refNum`.
@@ -234,6 +235,64 @@ pub fn navr_frame(room_id: u16, ref_num: i32, order: ByteOrder) -> Frame {
     Frame::new(crate::opcode::ROOMGOTO, ref_num, w.into_vec())
 }
 
+/// Convenience: build a `MSG_USERMOVE` (`uLoc`) frame moving user `ref_num` to
+/// `position`.
+///
+/// Body is `Point pos` = `sint16 v; sint16 h` (`v` first), 4 bytes, so the
+/// header length field is `4`. The `refNum` is the moving user's id. Protocol
+/// reference §3.51 (:2132-2134, body) and :193-196 (`Point`), cross-checked
+/// against Taj `Palace/Messages/MH_UserMove.cs` (`Reader.ReadStruct<Point>()`)
+/// and `ThePalace.Core.Server/Protocols/Users/MSG_USERMOVE.cs`
+/// (`pos.Serialize()`).
+pub fn user_move_frame(position: Point, ref_num: i32, order: ByteOrder) -> Frame {
+    let mut w = Writer::with_capacity(order, 4);
+    position.encode(&mut w);
+    Frame::new(crate::opcode::USERMOVE, ref_num, w.into_vec())
+}
+
+/// Convenience: build a `MSG_USERFACE` (`usrF`) frame setting user `ref_num`'s
+/// face to `face_nbr` (0-15).
+///
+/// Body is `sint16 faceNbr`, exactly 2 bytes, so the header length field is `2`.
+/// Protocol reference §3.48 (:2057-2059), cross-checked against
+/// `ThePalace.Core.Server/Protocols/Users/MSG_USERFACE.cs` (`WriteInt16`).
+pub fn user_face_frame(face_nbr: i16, ref_num: i32, order: ByteOrder) -> Frame {
+    let mut w = Writer::with_capacity(order, 2);
+    w.write_i16(face_nbr);
+    Frame::new(crate::opcode::USERFACE, ref_num, w.into_vec())
+}
+
+/// Convenience: build a `MSG_USERCOLOR` (`usrC`) frame setting user `ref_num`'s
+/// colour to `color_nbr` (0-15).
+///
+/// Body is `sint16 colorNbr` — confirmed as two bytes, not one, at
+/// `struct ClientMsg_userColor { sint16 colorNbr; }`. Protocol reference §3.45
+/// (:2009-2011), cross-checked against
+/// `ThePalace.Core.Server/Protocols/Users/MSG_USERCOLOR.cs` (`WriteInt16`).
+pub fn user_color_frame(color_nbr: i16, ref_num: i32, order: ByteOrder) -> Frame {
+    let mut w = Writer::with_capacity(order, 2);
+    w.write_i16(color_nbr);
+    Frame::new(crate::opcode::USERCOLOR, ref_num, w.into_vec())
+}
+
+/// Convenience: build a `MSG_USERNAME` (`usrN`) frame renaming user `ref_num`
+/// to `name`.
+///
+/// Body is a bare `PString` — one length byte then the name — exactly as the
+/// protocol reference defines it (`struct ClientMsg_userName { PString name; }`,
+/// §3.52 :2144-2146, with `PString` at :164-167). Unlike a name inside a
+/// `RoomListRec` (:1167) or `UserRec` (:1235), this one is **not** padded to a
+/// 4-byte boundary: the spec marks those fields `/* padded to align length */`
+/// and marks this one not, and the body is a standalone string rather than a
+/// field of a fixed record. The server uses the same message to broadcast a
+/// successful rename and to tell a client to revert a failed one, so the
+/// decoder reads the same form.
+pub fn user_name_frame(name: &str, ref_num: i32, order: ByteOrder) -> Frame {
+    let mut w = Writer::with_capacity(order, name.len() + 1);
+    w.write_pstring(name);
+    Frame::new(crate::opcode::USERNAME, ref_num, w.into_vec())
+}
+
 /// True when the opcode ends a room description stream.
 pub fn is_room_desc_end(opcode: Opcode) -> bool {
     opcode == ROOMDESCEND
@@ -242,7 +301,7 @@ pub fn is_room_desc_end(opcode: Opcode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opcode::{LOGON, PING, ROOMDESC};
+    use crate::opcode::{LOGON, PING, ROOMDESC, USERCOLOR, USERFACE, USERMOVE, USERNAME};
 
     fn sample(order: ByteOrder) -> Vec<u8> {
         let mut w = Writer::new(order);
@@ -381,5 +440,121 @@ mod tests {
         let hs = read_handshake(&mut w.as_slice()).unwrap();
         assert_eq!(hs.frame.payload, b"xyz");
         assert_eq!(hs.user_id(), 9);
+    }
+
+    #[test]
+    fn user_move_frame_body_is_v_then_h_in_both_orders() {
+        // Point = sint16 v; sint16 h. Protocol reference :193-196, :2132-2134.
+        let le = user_move_frame(Point::new(100, 200), 42, ByteOrder::Little)
+            .encode(ByteOrder::Little)
+            .unwrap();
+        #[rustfmt::skip]
+        let expected_le: Vec<u8> = vec![
+            0x63, 0x6f, 0x4c, 0x75, // "uLoc"
+            0x04, 0x00, 0x00, 0x00, // length = 4
+            0x2a, 0x00, 0x00, 0x00, // refNum = 42
+            0x64, 0x00,             // v = 100
+            0xc8, 0x00,             // h = 200
+        ];
+        assert_eq!(le, expected_le);
+        assert_eq!(
+            Frame::decode_from(&le, ByteOrder::Little).unwrap().opcode,
+            USERMOVE
+        );
+
+        let be = user_move_frame(Point::new(100, 200), 42, ByteOrder::Big)
+            .encode(ByteOrder::Big)
+            .unwrap();
+        assert_eq!(&be[..4], b"uLoc");
+        assert_eq!(&be[4..8], &4u32.to_be_bytes());
+        assert_eq!(&be[8..12], &42i32.to_be_bytes());
+        assert_eq!(&be[12..16], &[0x00, 0x64, 0x00, 0xc8]);
+    }
+
+    #[test]
+    fn user_face_frame_body_is_one_sint16_in_both_orders() {
+        // ClientMsg_userFace { sint16 faceNbr; }. Reference :2057-2059.
+        let le = user_face_frame(7, 21, ByteOrder::Little)
+            .encode(ByteOrder::Little)
+            .unwrap();
+        #[rustfmt::skip]
+        let expected_le: Vec<u8> = vec![
+            0x46, 0x72, 0x73, 0x75, // "usrF"
+            0x02, 0x00, 0x00, 0x00, // length = 2
+            0x15, 0x00, 0x00, 0x00, // refNum = 21
+            0x07, 0x00,             // faceNbr = 7
+        ];
+        assert_eq!(le, expected_le);
+        assert_eq!(
+            Frame::decode_from(&le, ByteOrder::Little).unwrap().opcode,
+            USERFACE
+        );
+
+        let be = user_face_frame(7, 21, ByteOrder::Big)
+            .encode(ByteOrder::Big)
+            .unwrap();
+        assert_eq!(&be[..4], b"usrF");
+        assert_eq!(&be[4..8], &2u32.to_be_bytes());
+        assert_eq!(&be[8..12], &21i32.to_be_bytes());
+        assert_eq!(&be[12..14], &[0x00, 0x07]);
+    }
+
+    #[test]
+    fn user_color_frame_body_is_one_sint16_in_both_orders() {
+        // ClientMsg_userColor { sint16 colorNbr; }. Reference :2009-2011.
+        let le = user_color_frame(9, 21, ByteOrder::Little)
+            .encode(ByteOrder::Little)
+            .unwrap();
+        #[rustfmt::skip]
+        let expected_le: Vec<u8> = vec![
+            0x43, 0x72, 0x73, 0x75, // "usrC"
+            0x02, 0x00, 0x00, 0x00, // length = 2
+            0x15, 0x00, 0x00, 0x00, // refNum = 21
+            0x09, 0x00,             // colorNbr = 9
+        ];
+        assert_eq!(le, expected_le);
+        assert_eq!(
+            Frame::decode_from(&le, ByteOrder::Little).unwrap().opcode,
+            USERCOLOR
+        );
+
+        let be = user_color_frame(9, 21, ByteOrder::Big)
+            .encode(ByteOrder::Big)
+            .unwrap();
+        assert_eq!(&be[..4], b"usrC");
+        assert_eq!(&be[4..8], &2u32.to_be_bytes());
+        assert_eq!(&be[8..12], &21i32.to_be_bytes());
+        assert_eq!(&be[12..14], &[0x00, 0x09]);
+    }
+
+    #[test]
+    fn user_name_frame_body_is_a_plain_pstring_in_both_orders() {
+        // ClientMsg_userName { PString name; }. Reference :2136-2146, PString
+        // :164-167. Pinned against the reference sender's bytes: length byte,
+        // name, and nothing else -- no 4-byte alignment padding.
+        let le = user_name_frame("Rico", 42, ByteOrder::Little)
+            .encode(ByteOrder::Little)
+            .unwrap();
+        #[rustfmt::skip]
+        let expected_le: Vec<u8> = vec![
+            0x4e, 0x72, 0x73, 0x75, // "usrN"
+            0x05, 0x00, 0x00, 0x00, // length = 5
+            0x2a, 0x00, 0x00, 0x00, // refNum = 42
+            0x04, b'R', b'i', b'c', b'o', // PString: len 4 then "Rico"
+        ];
+        assert_eq!(le, expected_le);
+        assert_eq!(le.len(), 17, "no alignment padding follows the name");
+        assert_eq!(
+            Frame::decode_from(&le, ByteOrder::Little).unwrap().opcode,
+            USERNAME
+        );
+
+        let be = user_name_frame("Rico", 42, ByteOrder::Big)
+            .encode(ByteOrder::Big)
+            .unwrap();
+        assert_eq!(&be[..4], b"usrN");
+        assert_eq!(&be[4..8], &5u32.to_be_bytes());
+        assert_eq!(&be[8..12], &42i32.to_be_bytes());
+        assert_eq!(&be[12..], &[0x04, b'R', b'i', b'c', b'o']);
     }
 }

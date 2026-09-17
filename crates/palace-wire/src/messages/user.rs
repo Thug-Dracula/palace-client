@@ -301,6 +301,44 @@ impl UserColor {
     }
 }
 
+/// `MSG_USERNAME` (`usrN`): `refNum` is the user id, body is a bare `PString`
+/// holding the new name. Protocol reference §3.52 (:2136-2146).
+///
+/// The body is a **plain** `PString` — one length byte then that many characters
+/// — and *not* the 4-byte-aligned form used for a name embedded in a fixed
+/// record (`RoomListRec` :1167, `UserRec` :1235). The reference defines
+/// `struct PString { uint8 length; char chars[length]; }` (:164-167) and only
+/// marks a field `/* padded to align length */` where alignment is required;
+/// `struct ClientMsg_userName { PString name; }` carries no such marker, so
+/// there is no padding to write or skip. The same body encodes the server's
+/// broadcast of a successful rename and its revert-on-failure reply, so a
+/// received message applies verbatim.
+///
+/// `refNum` is the id of the user being renamed: the server ignores it on a
+/// request but a client needs it to apply another user's rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserName {
+    /// The user whose name changed — the frame `refNum`.
+    pub user_id: i32,
+    /// The new name, decoded as Latin-1.
+    pub name: String,
+}
+
+impl UserName {
+    /// Decode a `usrN` body: a plain `PString`.
+    pub fn decode(ref_num: i32, r: &mut Reader<'_>) -> Result<Self> {
+        Ok(UserName {
+            user_id: ref_num,
+            name: r.read_pstring()?,
+        })
+    }
+
+    /// Encode a `usrN` body: a plain `PString`.
+    pub fn encode(&self, w: &mut Writer) {
+        w.write_pstring(&self.name);
+    }
+}
+
 /// `MSG_USERPROP` (`usrP`): `refNum` is the user id, body is the user's complete
 /// worn list — `sint32 nbrProps` then `AssetSpec[nbrProps]` (:2170-2177). The
 /// body always carries the whole list and omits unused slots, so it replaces the
@@ -458,6 +496,47 @@ mod tests {
             );
             assert!(r.is_empty());
         }
+    }
+
+    #[test]
+    fn user_name_reads_a_plain_pstring_and_uses_the_frame_ref_num() {
+        // `struct ClientMsg_userName { PString name; }` :2144-2146. A bare
+        // PString has no alignment padding, so the body is exactly
+        // `len + chars`; `decode_exact` in the parent module relies on that.
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut w = Writer::new(order);
+            w.write_pstring("Rico");
+            let bytes = w.into_vec();
+            assert_eq!(bytes, vec![4, b'R', b'i', b'c', b'o']);
+            let mut r = Reader::new(&bytes, order);
+            let msg = UserName::decode(42, &mut r).unwrap();
+            assert!(r.is_empty(), "a plain PString consumes the whole body");
+            assert_eq!(msg.user_id, 42, "the frame refNum is the renamed user");
+            assert_eq!(msg.name, "Rico");
+        }
+    }
+
+    #[test]
+    fn user_name_round_trips_in_both_orders() {
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let want = UserName {
+                user_id: 7,
+                name: "Balamb".to_string(),
+            };
+            let mut w = Writer::new(order);
+            want.encode(&mut w);
+            let bytes = w.into_vec();
+            let mut r = Reader::new(&bytes, order);
+            assert_eq!(UserName::decode(7, &mut r).unwrap(), want);
+            assert!(r.is_empty());
+        }
+    }
+
+    #[test]
+    fn user_name_is_latin1() {
+        let body = [4u8, b'c', b'a', b'f', 0xe9];
+        let mut r = Reader::new(&body, ByteOrder::Little);
+        assert_eq!(UserName::decode(1, &mut r).unwrap().name, "caf\u{e9}");
     }
 
     #[test]
