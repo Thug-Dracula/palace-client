@@ -655,6 +655,59 @@ way to see script behaviour live, because the runtime has no logging of its own.
 `PALACE_PORT` (9998), `PALACE_USER`, `PALACE_SMOKE_SECS`, `PALACE_SMOKE_ROOM`, `PALACE_CLICK_ROOM`.
 It logs in as a normal user, so pick a name that makes the test obvious to anyone in the room.
 
+### 2.20 IPTSCRAE coverage — what the audit found
+
+`crates/iptscrae-palace/src/commands.rs` defines **121** Palace commands. The VM language itself is in
+good shape (72 documented core words: arithmetic, comparison, logic, `IF`/`IFELSE`/`WHILE`/`FOREACH`/
+`EXEC`/`RETURN`/`BREAK`, strings, `SINE`/`COSINE`/`TANGENT`/`RANDOM`, stack ops, `GLOBAL`/`DEF`,
+arrays, `ALARMEXEC`). **The hole is the Palace command set.**
+
+Four distinct kinds of incompleteness, in descending order of how badly they hide:
+
+1. **Dispatched but effect-nothing (looks implemented, does nothing).** The worst kind:
+   - `LOADPROPS` returns `Ok(Vec::new())` — pushes *no effect at all*, not even an "unsupported" note.
+   - `PAINTUNDO` pushes an effect that the client only answers with a note and a redraw; nothing
+     undoes anything, and it is not a wire effect either.
+   - `SOUND`, `MIDIPLAY`/`MIDILOOP`/`MIDISTOP` push effects that only become **notes** — no audio is
+     ever played. (This is why `SOUND "wrongo.wav"` appears as text and is never heard.)
+   - `GOTOURL`/`LAUNCHAPP` likewise become "reported, not opened/launched" notes.
+   - `LINE`/`LINETO` and `PAINT*`/`PEN*` do reach the wire as draw frames, but **nothing rasterizes**
+     locally, so our own view never shows strokes the way other clients do.
+   - `ISLOCKED` always returns false (`fn is_locked`), `GETPICDIMENSIONS` always pushes `(0,0)`,
+     `PROPDIMENSIONS`/`PROPOFFSETS` always push zeros, `has_prop_by_name` always returns false.
+
+2. **Recognised-but-unimplemented, and worse — *not even registered*.** The large
+   `|`-pattern arm at `host.rs:695-703` (HIDESMILEYS, LOCKUSERPROPS, AUTOUSERLAYER, SETTOOLTIP,
+   CLEARTOOLTIP, SETSPOTOPTIONS, ADDPIC, REMOVEPIC, DELPIC, ADDSPOT, SETSPOTSCRIPT, LOADSCRIPT,
+   HTTPGET, ROOMZOOM, ROOMUNZOOM, CIRCLE, FILL, PAINT, TEXT, PING, CLRPROPS, SHOWALLPROPS, HIDEPROPS,
+   SHOWPROPS, SETPROPSLOCAL, ADDPROP, PURGE, ROOMDESC, OFFLINE, ONLINE, NBRUSERS, GETWHOTALKING,
+   MSGTO, FLUSH, SETSPOTSTATEALL, AWAY, TOGGLECTRL, SETDESC, BAN, KICK) is **dead code**: those names
+   are not in `PALACE_COMMANDS`, so the lexer never treats them as commands — they lex as *variables*.
+   So a room that calls `ADDPIC` doesn't get "unsupported", it silently does something different.
+   That is why the corpus counts for these (ADDPIC 115, SETSPOTSCRIPT 82, ADDSPOT 81, LOADSCRIPT 51,
+   HTTPGET 50, tooltips 88) hurt: those rooms are misbehaving, not erroring.
+
+3. **Genuinely absent from the table** though dispatched in `host.rs` (also dead arms):
+   `PALACECHAT`, `ISRIGHTCLICK`, `MOUSEX`/`MOUSEY`, `LASTNAME`, `HTTPRECEIVED`, `STR`, `SETPICDIM`.
+   Separately, `SHELLCMD` is **documented but never dispatched** — the only reverse mismatch found.
+
+4. **Dead effects**: `Effect::Beep` can never be pushed (`BEEP` is a core builtin, so `host.rs`'s
+   `BEEP` arm is unreachable), and `Effect::SetSpotAlarm` is never constructed (`SETALARM` schedules
+   directly). `is_wire_effect()` also claims `ClearLooseProps` is a wire effect, but `effect_frame`
+   has no encoder for it — that classification is test-only, so nothing breaks, but it is wrong.
+
+Work order for "fully implemented":
+
+- [ ] **Register** the dead-arm names in `commands.rs` with correct arity, so scripts at least
+  dispatch them, then implement them.
+- [ ] `SOUND`/`MIDI*` — actually play audio (the user sees these as notes today).
+- [ ] `ADDPIC`/`REMOVEPIC`/`DELPIC`, `ADDSPOT`/`SETSPOTSCRIPT`/`SETSPOTOPTIONS` — dynamic room content.
+- [ ] `LOADSCRIPT` + `HTTPGET` (+ `CACHESCRIPT`) — the §2.14 fetch-and-execute path.
+- [ ] `SETTOOLTIP`/`CLEARTOOLTIP`; `CIRCLE`/`FILL`/`PAINT`/`TEXT`; local rasterization for `LINE`.
+- [ ] The constant stubs: `ISLOCKED`, `GETPICDIMENSIONS`, `PROPDIMENSIONS`/`PROPOFFSETS`,
+  `has_prop_by_name`, `LOADPROPS`, `PAINTUNDO`.
+- [ ] Fix the `SHELLCMD` doc/dispatch mismatch and the `ClearLooseProps` wire classification.
+
 ---
 
 ## Part 3 — How to verify
