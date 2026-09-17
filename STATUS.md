@@ -594,6 +594,21 @@ dispatching `SELECT`. Decoded opcodes: 28 → 31.
 `HS_Bolt` (4) is deliberately excluded: a bolt locks the door named by its `dest` and is not
 itself a door, so clicking one is never refused.
 
+**`HS_ShutableDoor` (2) is excluded too, and that is a correction to the first version.** `state` is
+primarily a *picture selector* — the reference says it "selects which of the pictures associated with
+the hotspot should be displayed. Among other things, it encodes whether a door is locked or
+unlocked" (:1677) — so a shuttable door's two states are its **closed and open** pictures. Reading
+state 1 as "locked" would refuse the very click that closes an open door, breaking the one thing
+that type exists for ("a door that can be opened/closed (by clicking)", :1666). Refusal therefore
+covers `HS_Door` (1) and `HS_LockableDoor` (3) only.
+
+The failure modes are not symmetric, and that is why narrowing is the safe direction: refusing a
+legitimate door breaks it permanently for the user, while failing to refuse a locked one merely lets
+the server refuse the move. Guarded by
+`only_a_kind_of_door_that_can_be_locked_reads_state_one_as_locked`, which fails when type 2 is
+re-admitted — the integration test for refusal uses a type-1 door from the captured corpus and would
+*not* have caught this.
+
 **Verified by inversion:** flipping the state test so that an *unlocked* door read as locked broke
 four tests — the two door tests, plus `a_real_room_hotspot_script_dimroom_darkens_the_frame` and
 `entering_a_new_room_resets_the_dim`, because their hotspot click was refused and the script
