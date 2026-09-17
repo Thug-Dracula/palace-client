@@ -13,6 +13,7 @@ Props are a self-contained binary format, so there is no dependency on
 | Formats | 8-bit, 16-bit, 20-bit, S20-bit, 32-bit |
 | Encoder | S20-bit only (the only format the reference client emits) |
 | Corpus validation | 227,874 props, 227,867 decoded, 7 rejected (reference rejects them too) |
+| Prop bag | `.pids`/`.props` reader: 3,846 records, 3,569 decode, 277 rejected — exactly the non-CRC records (see §2.13) |
 | Differential | 227,874 props vs an ActionScript-reference port and `prop_decoder.py`: **0 disagreements** |
 | Panics on protocol data | none, by construction (`#![forbid(unsafe_code)]`-style discipline; every read is bounds-checked) |
 
@@ -21,7 +22,7 @@ Props are a self-contained binary format, so there is no dependency on
 ## 1. Quick start
 
 ```bash
-cargo test -p palace-prop                 # 87 tests, no corpus needed
+cargo test -p palace-prop                 # 162 tests, no corpus needed
 
 # Decode the whole local corpus (about 12 seconds):
 cargo run -p palace-prop --release --bin prop-tool -- \
@@ -268,6 +269,81 @@ for each byte: crc = rotate_left(crc, 1) ^ byte
 `crc::payload_crc(&blob) == Some(record.crc)` holds for all 180,661 props in
 `pserver.prp`. See `~/palace-corpus/PRP-FORMAT.md` §4 for the container context.
 
+### 2.13 The prop bag — `PropBag.bundle/`
+
+`src/bag.rs` reads the modern client's own prop collection, a directory such as
+`~/.local/share/PalaceChat/PropBag.bundle/` holding two flat files:
+
+| File | Meaning |
+|---|---|
+| `*.pids` | the index |
+| `*.props` | the blobs, concatenated |
+
+**Index — confirmed.** `.pids` is a flat array of 16-byte **big-endian** records
+`(a: u32, b: u32, offset: u32, size: u32)`. On a live snapshot frozen
+2026-09-17 (`.pids` 61,536 B, `.props` 9,361,440 B):
+
+- 61,536 / 16 = **3,846 records, remainder 0**; every `offset + size <= 9,361,440`
+  (**0** out-of-bounds);
+- offsets are non-decreasing and the blobs **tile the file: 3,845/3,845 adjacent
+  pairs satisfy `offset[i] + size[i] == offset[i+1]`**, so `.props` is a pure
+  concatenation.
+
+**The 32-byte prefix — verified, and *not* a zero pad.** Every blob is a fixed
+32-byte metadata prefix followed by a standard prop, so the prop header begins at
+`blob[32]`. The proof is uniform: **3,846/3,846 blobs begin with `00 2c 00 2c` at
+offset 32** (a big-endian 44×44 header), and no other offset is uniformly a
+header. The prefix bytes are *not* all zero — the early "zero prefix" reading came
+from the first two blobs only. On the original 3,844-blob snapshot, only **223**
+prefixes were all zero; the rest carry length-prefixed ASCII metadata, e.g.
+`07 4e 65 77 50 72 6f 70 00 00 16 54 68 65 20 43 6f 6c 6f 73 73 65 75 6d …`
+(`\x07NewProp\x00\x00\x16The Colosseum …`). **The interior layout of the 32 bytes
+is not decoded and its meaning is undetermined**; the reader relies only on the
+fixed length. Treat the prefix as opaque.
+
+**`(a, b)` identity.** The pair is the same key the client uses for
+`BagThumbCache/<a:08X>_<b:08X>.png`.
+
+- `a` is the **asset id**: a real entry has `a = 0x3a3ad1f7 = 976933367`, an id
+  that also exists in `pserver.prp`.
+- `b` is the **payload CRC** — `asset_crc` over `blob[44..]`, i.e. the prop
+  payload after its 12-byte header. It matched **3,569 of 3,846** records.
+
+**Decode rate.** `blob[32..]` decodes with `palace_prop::decode` for **3,569 of
+3,846** entries; **277 are rejected**. The rejected set is *exactly* the set where
+`b` is not the payload CRC — the two sets are identical, which is a strong
+consistency check on the whole reading. The 277 are two shapes:
+
+| Count | Shape | `blob[32]` header | Failure |
+|---|---|---|---|
+| 209 | built-ins, `a = 0x80000000 + n`, `b = n + 1` | `flags = 0x0100` (32-bit) | `zlib stream rejected` — the payload is not zlib and `b` is a sequence number, not a CRC |
+| 68 | large records, `flags` `0x0400`/`0x0800` set | `flags = 0x402`, `0x412`, `0xc02`, … | `RleRowOverflow`/`RleRunaway` — the payload is not a single 8-bit prop; almost certainly a multi-frame/"big prop" container. Structure undetermined. |
+
+The two exceptions do **not** weaken the ordinary reading: for every prop the
+decoder accepts, `b` is its payload CRC, and vice versa.
+
+**Independent oracle: the client's own thumbnails.** `BagThumbCache/*.png` is keyed
+by the same `(a, b)` pair. On the snapshot, **11/11** cache keys were present in
+`.pids`; **10/11 decoded to 44×44 images whose PNGs are pixel-for-pixel identical
+to the cached thumbnail** (0 differing pixels over 1,936 each). The 11th
+(`A8CD4152_A8CFD339`, 29,236 B, `flags = 0x402`) is one of the 68 multi-frame
+records and is rejected by the single-prop decoder; its cached thumbnail is
+176×176, exactly 4× the 44×44 grid size.
+
+> The bag is live data. It grew from 3,844 to 3,846 records *during* this analysis;
+> all numbers above are for the frozen `/tmp` snapshot named in §9. Never write to
+> `~/.local/share/PalaceChat/`.
+
+Confidence:
+
+| Aspect | Confidence | Evidence |
+|---|---|---|
+| 16-byte big-endian index | **Certain** | 3,846 records, 0 out-of-bounds, exact tiling |
+| 32-byte fixed prefix | **High** | 3,846/3,846 blobs have `00 2c 00 2c` at +32 |
+| `a` = asset id | **High** | matches a `.prp` record id |
+| `b` = payload CRC | **High** for ordinary props; undetermined for the 277 exceptions | 3,569 exact matches |
+| prefix interior | **Low** | opaque; not decoded |
+
 ---
 
 ## 3. Corpus validation
@@ -457,6 +533,7 @@ of them is covered by a test.
 
 ```text
 src/lib.rs           decode(), Prop, re-exports, crate-level format summary
+src/bag.rs           PropBag.bundle reader (.pids index + .props, 32-byte prefix)
 src/header.rs        12-byte header, endian sniff, flags, format selection
 src/palette.rs       256-entry M&M palette (generated, verified by gen_palette.py)
 src/crc.rs           asset CRC
@@ -469,11 +546,12 @@ src/codec/twenty.rs  20-bit 6-6-6-2
 src/codec/s20.rs     S20-bit 5-5-5-5
 src/codec/thirtytwo.rs 32-bit RGBA
 src/encode.rs        S20 encoder + quantisation
-src/bin/prop-tool.rs corpus tooling (inventory / rgba / rgba-batch / digests / extract)
+src/bin/prop-tool.rs corpus tooling (inventory / rgba / rgba-batch / digests / extract / bag)
 tests/fixtures.rs    real corpus blobs decoded to pinned pixels
 tests/roundtrip.rs   decode -> encode -> decode, including exact quantisation
 tests/malformed.rs   fuzz, truncation, mutation, bombs: no panics, always Result
 tests/corpus.rs      whole-corpus run, gated on PALACE_PROP_CORPUS
+tests/bag.rs         bag reader on synthetic fixtures + a gated real-bag run
 fixtures/            real prop blobs + provenance and SHA-256
 ```
 
@@ -508,7 +586,27 @@ python3 tools/diff_prerendered.py ~/palace-corpus/reference/PalacePalette.as \
     ~/palace-corpus/props_from_live ~/palace-corpus/props_recovered2 ~/palace-corpus/props_recovered3 \
     ~/palace-corpus/props_recovered4 ~/palace-corpus/props_recovered6 \
     ~/palace-corpus/props_from_capture ~/palace-corpus/props_harvest_final ~/palace-corpus/props_test
+
+# Bag section (§2.13). Copy the live bundle to /tmp first: never analyse the live
+# directory, and never write into it. Snapshot used above (frozen 2026-09-17):
+#   PropBag.bundle/PalaceChat.pids  md5 8540b5db339689e18c8704f1ff892f6d
+#   PropBag.bundle/PalaceChat.props md5 f3a8bc31142ea38a8546dbf399ceeb10
+cp -a ~/.local/share/PalaceChat/PropBag.bundle /tmp/propbag_frozen
+
+cargo run -p palace-prop --release --bin prop-tool -- \
+    bag list /tmp/propbag_frozen            # index metrics + one line per entry
+
+cargo run -p palace-prop --release --bin prop-tool -- \
+    bag extract /tmp/propbag_frozen /tmp/prop-bag-verify --limit 10
+
+PALACE_PROP_BAG=/tmp/palacechat_frozen/PropBag.bundle \
+PALACE_PROP_BAG_OUT=/tmp/prop-bag-verify \
+  cargo test -p palace-prop --test bag -- --ignored --nocapture
 ```
+
+The gated run needs the bundle and `BagThumbCache` side by side, so the frozen
+layout is `/tmp/palacechat_frozen/{PropBag.bundle,BagThumbCache}`:
+`cp -a ~/.local/share/PalaceChat/BagThumbCache /tmp/palacechat_frozen/`.
 
 ## 10. References
 

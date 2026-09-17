@@ -11,6 +11,10 @@
 //! prop-tool png        <prop.bin> <out> dump a PNG for eyeballing
 //! prop-tool extract    <file.prp> <dir> [--limit N] [--format NAME] [--stride N]
 //!                                       split a roster into per-prop blobs
+//! prop-tool bag list   <bundle> [--limit N] [--stride N]
+//!                                       list a PropBag.bundle's entries
+//! prop-tool bag extract <bundle> <dir> [--limit N] [--stride N] [--format NAME]
+//!                                       decode bag props to PNGs
 //! prop-tool encode     <in.png> <out.prop> [--head] [--ghost]
 //!                                       [--h-offset N] [--v-offset N]
 //! prop-tool encode-batch <in-dir> <out-dir> [--head] [--ghost]
@@ -33,7 +37,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 
 use palace_prop::{
-    decode, decode_header, encode_s20_blob, PropEndian, PropError, PropFormat, PropImage,
+    decode, decode_header, encode_s20_blob, PropBag, PropEndian, PropError, PropFormat, PropImage,
     FLAG_GHOST, FLAG_HEAD,
 };
 
@@ -50,6 +54,7 @@ fn main() -> ExitCode {
         "digests" => digests(&args[1..]),
         "png" => png(&args[1..]),
         "extract" => extract(&args[1..]),
+        "bag" => bag(&args[1..]),
         "encode" => encode(&args[1..]),
         "encode-batch" => encode_batch(&args[1..]),
         "help" | "--help" | "-h" => {
@@ -73,6 +78,8 @@ fn usage() {
          prop-tool digests <manifest> <outfile>\n  \
          prop-tool png <prop.bin> <out.png>\n  \
          prop-tool extract <file.prp> <outdir> [--limit N] [--format NAME] [--stride N]\n  \
+         prop-tool bag list <bundle> [--limit N] [--stride N]\n  \
+         prop-tool bag extract <bundle> <outdir> [--limit N] [--stride N] [--format NAME]\n  \
          prop-tool encode <in.png> <out.prop> [--head] [--ghost] [--h-offset N] [--v-offset N]\n  \
          prop-tool encode-batch <in-dir> <out-dir> [--head] [--ghost] [--h-offset N] [--v-offset N]"
     );
@@ -584,6 +591,168 @@ fn extract(args: &[String]) -> ExitCode {
     }
     println!("extracted {written} props to {outdir}");
     ExitCode::SUCCESS
+}
+
+/// The argument after `--name`, if present.
+fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a String> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+}
+
+/// The `usize` argument after `--name`, if present and parseable.
+fn flag_usize(args: &[String], name: &str) -> Option<usize> {
+    flag_value(args, name).and_then(|n| n.parse::<usize>().ok())
+}
+
+/// Resolve a `.bundle` directory or an explicit `.pids` path to an open bag.
+///
+/// A `.pids` path pairs with the `.props` file of the same stem, so callers can
+/// point at either the directory or the index.
+fn load_bag(raw: &str) -> Result<PropBag, String> {
+    let path = Path::new(raw);
+    if path.is_dir() {
+        return PropBag::open_dir(path).map_err(|e| e.to_string());
+    }
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pids"))
+    {
+        return PropBag::open(path, path.with_extension("props")).map_err(|e| e.to_string());
+    }
+    Err(format!("{raw}: not a .bundle directory or a .pids file"))
+}
+
+fn bag(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("list") => bag_list(&args[1..]),
+        Some("extract") => bag_extract(&args[1..]),
+        Some(other) => {
+            eprintln!("unknown bag subcommand {other:?}");
+            usage();
+            ExitCode::from(2)
+        }
+        None => {
+            usage();
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// One tab-separated line per bag entry: `a`, `b`, offset, size, format, dims.
+///
+/// Only the 12-byte header is parsed, so listing a 3844-entry bag is instant.
+/// An entry whose header will not parse prints `?` for its format and dims
+/// rather than stopping the listing.
+fn bag_list(args: &[String]) -> ExitCode {
+    let Some(raw) = args.first() else {
+        usage();
+        return ExitCode::from(2);
+    };
+    let bag = match load_bag(raw) {
+        Ok(bag) => bag,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let limit = flag_usize(args, "--limit").unwrap_or(usize::MAX);
+    let stride = flag_usize(args, "--stride").filter(|n| *n > 0).unwrap_or(1);
+    println!(
+        "bag {raw}: {} records, {} entries, out-of-bounds={}, tiling={}/{}, trailing={}",
+        bag.records(),
+        bag.len(),
+        bag.out_of_bounds(),
+        bag.tiled_pairs(),
+        bag.adjacent_pairs(),
+        bag.trailing_bytes()
+    );
+    println!("a\tb\toffset\tsize\tformat\tdims");
+    let mut shown = 0usize;
+    for (i, entry) in bag.entries().iter().enumerate() {
+        if i % stride != 0 || shown >= limit {
+            continue;
+        }
+        let (format, dims) = match entry.header() {
+            Ok(header) => (
+                header.format().name().to_string(),
+                format!("{}x{}", header.width, header.height),
+            ),
+            Err(_) => ("?".to_string(), "?".to_string()),
+        };
+        println!(
+            "{:08x}\t{:08x}\t{}\t{}\t{format}\t{dims}",
+            entry.a(),
+            entry.b(),
+            entry.offset(),
+            entry.size()
+        );
+        shown += 1;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Decode each bag entry to a PNG named `<format>_<a:08x>_<b:08x>.png`.
+///
+/// Undecodable entries are reported on stderr and counted, not fatal on their
+/// own: the real bag contains built-in and multi-frame records the single-prop
+/// decoder rejects by design. The exit status is a failure when any entry
+/// failed, mirroring `rgba-batch`.
+fn bag_extract(args: &[String]) -> ExitCode {
+    let (Some(raw), Some(outdir)) = (args.first(), args.get(1)) else {
+        usage();
+        return ExitCode::from(2);
+    };
+    let bag = match load_bag(raw) {
+        Ok(bag) => bag,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let limit = flag_usize(args, "--limit").unwrap_or(usize::MAX);
+    let stride = flag_usize(args, "--stride").filter(|n| *n > 0).unwrap_or(1);
+    let wanted = flag_value(args, "--format").map(String::as_str);
+    if let Err(e) = std::fs::create_dir_all(outdir) {
+        eprintln!("{outdir}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let (mut written, mut failed) = (0usize, 0usize);
+    for (i, entry) in bag.entries().iter().enumerate() {
+        if i % stride != 0 || written >= limit {
+            continue;
+        }
+        match entry.decode() {
+            Ok(prop) => {
+                let name = prop.format().name();
+                if wanted.is_some_and(|w| w != name) {
+                    continue;
+                }
+                let path = Path::new(outdir).join(format!(
+                    "{name}_{:08x}_{:08x}.png",
+                    entry.a(),
+                    entry.b()
+                ));
+                match prop.image.write_png(&path) {
+                    Ok(()) => written += 1,
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("{}: {e}", path.display());
+                    }
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("{:08x}_{:08x}: {e}", entry.a(), entry.b());
+            }
+        }
+    }
+    println!("bag extract: wrote {written}, failed {failed}, outdir {outdir}");
+    if failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// The head/ghost/offset flags shared by `encode` and `encode-batch`.

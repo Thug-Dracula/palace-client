@@ -56,6 +56,16 @@ pub enum PropError {
     UnencodableImage { width: u32, height: u32 },
     /// PNG writing failed (visual inspection only; never part of decoding).
     Png { detail: String },
+    /// A prop-bag (`*.pids` / `*.props`) file could not be read.
+    ///
+    /// The detail already names the offending path, so callers can print it
+    /// directly.
+    BagIo { detail: String },
+    /// A directory contained no matching `*.pids` / `*.props` pair.
+    BagNotABundle { path: String },
+    /// A prop-bag blob is shorter than the 32-byte per-blob prefix, so it has no
+    /// prop to decode.
+    BagBlobTooShort { available: usize },
 }
 
 /// Largest number of pixels we will decode into memory (16 MP RGBA = 64 MiB).
@@ -108,6 +118,15 @@ impl fmt::Display for PropError {
                 "cannot encode a {width}x{height} image (S20 props are 44x44)"
             ),
             PropError::Png { detail } => write!(f, "could not write PNG: {detail}"),
+            PropError::BagIo { detail } => write!(f, "prop bag: {detail}"),
+            PropError::BagNotABundle { path } => write!(
+                f,
+                "{path}: no matching .pids/.props pair found in this directory"
+            ),
+            PropError::BagBlobTooShort { available } => write!(
+                f,
+                "prop bag blob is {available} byte(s) long; at least 32 are required for the bag prefix"
+            ),
         }
     }
 }
