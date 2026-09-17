@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use palace_host::ScriptEvent;
-use palace_render::RoomDesc;
+use palace_render::{DrawList, RoomDesc};
 use palace_room::{LooseProp, LoosePropSpec};
 use palace_wire::byteorder::ByteOrder;
 use palace_wire::frame::{navr_frame, Frame};
@@ -143,6 +143,10 @@ pub struct SessionState {
     pub avatars_hidden: bool,
     /// Client-side `SETPICOPACITY`, keyed by hotspot id and state index.
     pub pic_opacity: BTreeMap<(i16, i16), f64>,
+    /// The current room's paint: the room's own stored draw commands plus every
+    /// `DRAW` that has arrived since. Scoped to one room, so a `DRAW` for a room
+    /// this session has left cannot appear on the new room's canvas.
+    pub draw: DrawList,
     pub chat: Vec<ChatLine>,
     chat_seq: u64,
     last_error: Option<String>,
@@ -167,6 +171,7 @@ impl SessionState {
             room_dim: 1.0,
             avatars_hidden: false,
             pic_opacity: BTreeMap::new(),
+            draw: DrawList::new(),
             chat: Vec::new(),
             chat_seq: 0,
             last_error: None,
@@ -231,6 +236,18 @@ impl SessionState {
         self.room_users.clear();
         self.room_desc = None;
         self.current_room = None;
+        // Paint is room state: leaving must not leave another room's strokes on
+        // the canvas. The arriving room seeds its own list instead.
+        self.draw = DrawList::new();
+    }
+
+    /// Start the draw list from a room's own stored commands.
+    ///
+    /// A room descriptor carries the commands painted when it is entered
+    /// (`firstDrawCmd` chain). Received `DRAW` messages append on top of these;
+    /// this is the base they append to.
+    pub fn load_room_draw(&mut self, room: &RoomDesc) {
+        self.draw = DrawList::from_commands(room.draw_cmds.iter().cloned());
     }
 
     /// Build a `navR` frame for a room id, carrying our user id as the ref.
@@ -555,6 +572,17 @@ impl SessionState {
                     "server announced a new hotspot without describing it; this room is stale",
                 ));
             }
+            // The record layout is `palace-room`'s model, so it is parsed where
+            // that model lives. A record with no complete header names no
+            // command: appending the parser's default would leave a phantom undo
+            // entry, so it is ignored. A full header always parses (the parser
+            // never panics) and its command is applied.
+            Message::Draw(draw) if draw.len() >= palace_room::DRAW_CMD_HEADER_LEN => {
+                let (cmd, _warnings) = palace_room::decode_draw_record(&draw.body, order);
+                self.draw.apply(cmd);
+                applied.render = true;
+            }
+            Message::Draw(_) => {}
             Message::Authenticate => {
                 applied.chat.push(self.system_line(
                     ChatKind::Error,
@@ -581,6 +609,9 @@ impl SessionState {
                             users: room.header.nbr_people.max(0) as u16,
                             flags: room.header.room_flags,
                         });
+                        if arrived {
+                            self.load_room_draw(&room);
+                        }
                         self.room_desc = Some(room);
                         self.room_dim = 1.0;
                         self.avatars_hidden = false;
@@ -950,6 +981,36 @@ mod tests {
         w.write_i32(index);
         loc.encode(&mut w);
         w.into_vec()
+    }
+
+    /// One raw `DRAW` record: the 10-byte header then a `PATH` operand with a
+    /// red PC5 tail. `points` are `(v, h)` = `(y, x)`, first absolute and the
+    /// rest deltas, exactly as the wire carries them.
+    fn draw_body(command: u8, flags: u8, points: &[(i16, i16)]) -> Vec<u8> {
+        let mut operand: Vec<u8> = Vec::new();
+        operand.extend_from_slice(&1i16.to_le_bytes());
+        operand.extend_from_slice(&(points.len().saturating_sub(1) as i16).to_le_bytes());
+        operand.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        for (v, h) in points {
+            operand.extend_from_slice(&v.to_le_bytes());
+            operand.extend_from_slice(&h.to_le_bytes());
+        }
+        // PC5 tail: line RGBA then fill RGBA, each `[a, r, g, b]`.
+        operand.extend_from_slice(&[255, 255, 0, 0]);
+        operand.extend_from_slice(&[255, 255, 0, 0]);
+
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        bytes.extend_from_slice(&(u16::from(command) | (u16::from(flags) << 8)).to_le_bytes());
+        bytes.extend_from_slice(&(operand.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&10i16.to_le_bytes());
+        bytes.extend_from_slice(&operand);
+        bytes
+    }
+
+    fn draw_frame(command: u8, flags: u8, points: &[(i16, i16)]) -> Frame {
+        Frame::new(opcode::DRAW, 0, draw_body(command, flags, points))
     }
 
     fn loose_ids(state: &SessionState) -> Vec<u32> {
@@ -1749,6 +1810,165 @@ mod tests {
         assert!(
             applied.chat.iter().any(|line| line.text.contains("stale")),
             "the stale room is reported instead of silently ignored"
+        );
+    }
+
+    #[test]
+    fn a_truncated_draw_record_is_ignored_without_desyncing_the_session() {
+        let mut state = room_state();
+
+        let empty = state.apply(&Frame::new(opcode::DRAW, 0, Vec::new()), ByteOrder::Little);
+        assert!(!empty.render, "a body with no command has nothing to paint");
+        assert!(
+            state.draw.is_empty(),
+            "an empty record must not leave a phantom command behind"
+        );
+
+        state.apply(
+            &Frame::new(opcode::DRAW, 0, vec![0u8; 4]),
+            ByteOrder::Little,
+        );
+        assert!(
+            state.draw.is_empty(),
+            "half a header names no command either"
+        );
+
+        state.apply(
+            &draw_frame(palace_room::draw_cmd::PATH, 0, &[(5, 5), (0, 10)]),
+            ByteOrder::Little,
+        );
+        assert_eq!(state.draw.back().len(), 1, "a formed record still lands");
+        state.apply(
+            &draw_frame(palace_room::draw_cmd::DELETE, 0, &[]),
+            ByteOrder::Little,
+        );
+        assert!(
+            state.draw.is_empty(),
+            "DELETE must pop the real stroke, not a phantom from a bad record"
+        );
+    }
+
+    #[test]
+    fn a_draw_message_appends_to_its_layer_and_delete_pops_that_layer() {
+        let mut state = room_state();
+
+        let back = state.apply(
+            &draw_frame(palace_room::draw_cmd::PATH, 0, &[(5, 5), (0, 10)]),
+            ByteOrder::Little,
+        );
+        assert!(back.render, "a received DRAW asks for a recompose");
+        assert_eq!(state.draw.back().len(), 1);
+        assert!(state.draw.front().is_empty());
+
+        state.apply(
+            &draw_frame(
+                palace_room::draw_cmd::PATH,
+                palace_room::draw_flags::LAYER_FRONT,
+                &[(40, 5), (0, 10)],
+            ),
+            ByteOrder::Little,
+        );
+        assert_eq!(state.draw.front().len(), 1, "the front flag selects front");
+        assert_eq!(state.draw.back().len(), 1, "and leaves the back list alone");
+
+        state.apply(
+            &draw_frame(palace_room::draw_cmd::DELETE, 0, &[]),
+            ByteOrder::Little,
+        );
+        assert!(
+            state.draw.front().is_empty(),
+            "DELETE pops the most recent command, which was on the front layer"
+        );
+        assert_eq!(state.draw.back().len(), 1, "the back layer is untouched");
+
+        state.apply(
+            &draw_frame(palace_room::draw_cmd::DETONATE, 0, &[]),
+            ByteOrder::Little,
+        );
+        assert!(state.draw.is_empty(), "DETONATE clears both layers");
+        assert!(state.draw.undo().is_none(), "and the history with them");
+    }
+
+    #[test]
+    fn a_stroke_does_not_survive_arrival_in_another_room() {
+        let mut state = room_state();
+        state.apply(&room_frame("887"), ByteOrder::Little);
+        assert_eq!(
+            state.current_room.as_ref().map(|room| room.id),
+            Some(887),
+            "a room description is an arrival"
+        );
+
+        state.apply(
+            &draw_frame(palace_room::draw_cmd::PATH, 0, &[(5, 5), (0, 10)]),
+            ByteOrder::Little,
+        );
+        assert_eq!(state.draw.len(), 1, "the stroke is on the current room");
+
+        let applied = state.apply(&room_frame("86"), ByteOrder::Little);
+        assert!(applied.room_entered, "the description is for another room");
+        assert!(applied.render, "the new room recomposes");
+        assert!(
+            state.draw.is_empty(),
+            "the previous room's stroke must not carry over: {:?}",
+            state.draw
+        );
+    }
+
+    #[test]
+    fn leaving_clears_the_draw_list() {
+        let mut state = room_state();
+        state.apply(
+            &draw_frame(palace_room::draw_cmd::PATH, 0, &[(5, 5), (0, 10)]),
+            ByteOrder::Little,
+        );
+        assert!(!state.draw.is_empty());
+
+        state.begin_room_change();
+
+        assert!(
+            state.draw.is_empty(),
+            "leaving drops the room's paint with the room itself"
+        );
+    }
+
+    #[test]
+    fn load_room_draw_seeds_the_list_from_the_rooms_own_commands() {
+        let mut state = room_state();
+        state.apply(
+            &draw_frame(palace_room::draw_cmd::PATH, 0, &[(5, 5), (0, 10)]),
+            ByteOrder::Little,
+        );
+        assert_eq!(state.draw.len(), 1);
+
+        let mut room = state.room_desc.clone().expect("a room");
+        room.draw_cmds = vec![
+            palace_room::decode_draw_record(
+                &draw_body(palace_room::draw_cmd::PATH, 0, &[(5, 5), (0, 10)]),
+                ByteOrder::Little,
+            )
+            .0,
+            palace_room::decode_draw_record(
+                &draw_body(
+                    palace_room::draw_cmd::PATH,
+                    palace_room::draw_flags::LAYER_FRONT,
+                    &[(40, 5), (0, 10)],
+                ),
+                ByteOrder::Little,
+            )
+            .0,
+        ];
+        state.load_room_draw(&room);
+
+        assert_eq!(
+            state.draw.back().len(),
+            1,
+            "the room's own back command seeds the back list"
+        );
+        assert_eq!(
+            state.draw.front().len(),
+            1,
+            "and its front command the front list"
         );
     }
 }

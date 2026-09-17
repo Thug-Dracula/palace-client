@@ -1274,6 +1274,10 @@ fn compose(
 
     let mut scene = builder.build_with(&room, &avatars, &[]);
     scene.dim_level = state.room_dim;
+    // The builder seeds `scene.draw` from the room descriptor alone; the session
+    // list is the room's own commands plus every `DRAW` received since, so it is
+    // authoritative. `compose` is the only path that turns state into pixels.
+    scene.draw = state.draw.clone();
     let (logical_w, logical_h) = scene.logical_size();
     let viewport = shared.viewport();
     let dpr = clamp_dpr(viewport.dpr);
@@ -1641,10 +1645,17 @@ fn apply_effect(
     // `effect_frame` also encodes `SETPROPS`, but the prop arms below send the
     // worn list through one shared path (`set_self_props`); skipping the generic
     // encoder for `SETPROPS` is what keeps it to a single `USERPROP`.
-    if !matches!(effect, Effect::SetProps { .. }) {
-        if let Some(frame) = effect_frame(effect, context) {
-            let _ = conn.send(&frame);
-        }
+    //
+    // The frame is kept, not just sent: a stroke is applied locally by decoding
+    // the *same bytes* that go on the wire, so our own view cannot drift from
+    // what the other clients are told.
+    let outbound = if !matches!(effect, Effect::SetProps { .. }) {
+        effect_frame(effect, context)
+    } else {
+        None
+    };
+    if let Some(frame) = &outbound {
+        let _ = conn.send(frame);
     }
     match effect {
         Effect::Say { text } | Effect::GlobalMessage { text } => {
@@ -1844,13 +1855,40 @@ fn apply_effect(
                 text: "script: CLEARLOOSEPROPS".to_string(),
             }]
         }
-        Effect::PaintClear | Effect::PaintUndo => {
+        Effect::PaintClear => {
+            state.draw.detonate();
             *dirty_render = true;
             vec![ClientEvent::Note {
                 text: format!("script: {}", effect.command()),
             }]
         }
-        Effect::DrawLine { .. } | Effect::DrawLineRel { .. } => Vec::new(),
+        Effect::PaintUndo => {
+            let undone = state.draw.undo();
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: {}{}",
+                    effect.command(),
+                    if undone.is_some() {
+                        ""
+                    } else {
+                        " (nothing to undo)"
+                    }
+                ),
+            }]
+        }
+        // The stroke was already sent above. Decoding that exact frame is what
+        // keeps the local list equal to the server's copy: the geometry is
+        // parsed once, from the wire form, not recomputed from the effect.
+        Effect::DrawLine { .. } | Effect::DrawLineRel { .. } => {
+            if let Some(frame) = &outbound {
+                let (cmd, _warnings) =
+                    palace_room::decode_draw_record(&frame.payload, context.byte_order);
+                state.draw.apply(cmd);
+                *dirty_render = true;
+            }
+            Vec::new()
+        }
         Effect::SetProps { props } => {
             let wanted: Vec<u32> = props
                 .iter()
@@ -1995,8 +2033,9 @@ fn apply_effect(
         // The pen belongs to the host: `ScriptHost::pen` owns the position, colour,
         // width and layer, and `wire_context` reads it when a stroke is encoded,
         // so these have already taken effect by the time the effect arrives.
-        // Nothing rasterizes a stroke yet (`LINE` and `LINETO` are dispatched and
-        // dropped), so there is no local pen state to keep in step with.
+        // The stroke itself is not pen state: `LINE`/`LINETO` decode their own
+        // outbound frame into the session's draw list, so nothing tracks a pen
+        // position here.
         Effect::MovePen { x, y } => vec![ClientEvent::Note {
             text: format!("script: PENPOS ({x},{y})"),
         }],
@@ -3213,8 +3252,16 @@ mod tests {
         });
         let conn = Connection::connect("127.0.0.1", port, Duration::from_secs(2))
             .expect("loopback connection");
+        Harness {
+            shared: test_shared(),
+            conn,
+            _drain: drain,
+        }
+    }
+
+    fn test_shared() -> Arc<Shared> {
         let (events, _rx) = unbounded_channel();
-        let shared = Arc::new(Shared {
+        Arc::new(Shared {
             cfg: ClientConfig::default(),
             frames: Arc::new(FrameStore::new()),
             events,
@@ -3226,12 +3273,7 @@ mod tests {
             transform: Mutex::new(None),
             mouse: Mutex::new((0, 0)),
             room_size: Mutex::new((512.0, 384.0)),
-        });
-        Harness {
-            shared,
-            conn,
-            _drain: drain,
-        }
+        })
     }
 
     fn dispatch_from_frame(
@@ -3293,6 +3335,304 @@ mod tests {
         let mut w = Writer::new(ByteOrder::Little);
         w.write_pstring(name);
         w.into_vec()
+    }
+
+    /// A loopback harness that keeps every byte the client sends.
+    fn harness_capturing() -> (Harness, Arc<Mutex<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener binds");
+        let port = listener.local_addr().expect("listener address").port();
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let capture = sink.clone();
+        let drain = thread::spawn(move || {
+            use std::io::Read as _;
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            if let Ok(mut guard) = capture.lock() {
+                                guard.extend_from_slice(&chunk[..read]);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let conn = Connection::connect("127.0.0.1", port, Duration::from_secs(2))
+            .expect("loopback connection");
+        (
+            Harness {
+                shared: test_shared(),
+                conn,
+                _drain: drain,
+            },
+            sink,
+        )
+    }
+
+    /// Wait until the captured byte stream contains `needle`.
+    fn captured_contains(sink: &Arc<Mutex<Vec<u8>>>, needle: &[u8]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(guard) = sink.lock() {
+                if guard.windows(needle.len()).any(|window| window == needle) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Compose the session's frame into raw RGBA plus its bitmap width.
+    fn composed_rgba(state: &SessionState, shared: &Arc<Shared>) -> (Vec<u8>, u32) {
+        let mut builder = SceneBuilder::new(MediaStore::new(&[]), PropStore::new());
+        let screen =
+            compose(state, &mut builder, shared, Instant::now()).expect("a frame composes");
+        let png = shared.frames.png().expect("the frame store holds a PNG");
+        let decoder = png::Decoder::new(std::io::Cursor::new(png));
+        let mut reader = decoder.read_info().expect("png info");
+        let mut buf = vec![0u8; reader.output_buffer_size().expect("png buffer size")];
+        reader.next_frame(&mut buf).expect("png frame");
+        (buf, screen.geometry.bitmap_w)
+    }
+
+    fn rgba_pixel(rgba: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let at = ((y as usize) * (width as usize) + x as usize) * 4;
+        [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]]
+    }
+
+    /// One raw `DRAW` record, the same layout the server sends: a 10-byte
+    /// header then a `PATH` operand with a red PC5 tail. `points` are `(v, h)` =
+    /// `(y, x)`, first absolute and the rest deltas.
+    fn draw_body(command: u8, flags: u8, points: &[(i16, i16)]) -> Vec<u8> {
+        let mut operand: Vec<u8> = Vec::new();
+        operand.extend_from_slice(&1i16.to_le_bytes());
+        operand.extend_from_slice(&(points.len().saturating_sub(1) as i16).to_le_bytes());
+        operand.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        for (v, h) in points {
+            operand.extend_from_slice(&v.to_le_bytes());
+            operand.extend_from_slice(&h.to_le_bytes());
+        }
+        operand.extend_from_slice(&[255, 255, 0, 0]);
+        operand.extend_from_slice(&[255, 255, 0, 0]);
+
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        bytes.extend_from_slice(&(u16::from(command) | (u16::from(flags) << 8)).to_le_bytes());
+        bytes.extend_from_slice(&(operand.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&10i16.to_le_bytes());
+        bytes.extend_from_slice(&operand);
+        bytes
+    }
+
+    fn draw_frame(command: u8, flags: u8, points: &[(i16, i16)]) -> Frame {
+        Frame::new(opcode::DRAW, 0, draw_body(command, flags, points))
+    }
+
+    /// A pen context with a red 1px pen on the back layer.
+    fn pen_context() -> WireContext {
+        WireContext {
+            byte_order: ByteOrder::Little,
+            user_id: HARNESS_SELF,
+            room_id: i32::from(HARNESS_ROOM),
+            room_width: 512,
+            room_height: 384,
+            self_pos: (0, 0),
+            pen: PenState {
+                pos: (0, 0),
+                rgb: (255, 0, 0),
+                size: 1,
+                front: false,
+            },
+        }
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+
+    #[test]
+    fn a_received_draw_message_paints_the_stroke_into_the_composed_frame() {
+        let mut state = state_in(&scripted_room(&[]));
+        // Move the self avatar out of the way: this stroke is a back-layer one,
+        // so an avatar over it would (correctly) hide it.
+        if let Some(me) = state.users.get_mut(&HARNESS_SELF) {
+            me.x = 400;
+            me.y = 300;
+        }
+        let harness = harness();
+        let (before, width) = composed_rgba(&state, &harness.shared);
+
+        let applied = state.apply(
+            &draw_frame(palace_room::draw_cmd::PATH, 0, &[(5, 5), (0, 10)]),
+            ByteOrder::Little,
+        );
+        assert!(
+            applied.render,
+            "a received DRAW asks the runtime to recompose"
+        );
+
+        let (after, _) = composed_rgba(&state, &harness.shared);
+        assert_eq!(
+            rgba_pixel(&after, width, 10, 5),
+            RED,
+            "the stroke lies on y=5, x in 5..=15"
+        );
+        assert_ne!(
+            rgba_pixel(&after, width, 10, 5),
+            rgba_pixel(&before, width, 10, 5),
+            "the composed frame changed where the stroke was painted"
+        );
+    }
+
+    #[test]
+    fn our_own_line_paints_our_frame_and_still_goes_on_the_wire() {
+        let mut state = state_in(&scripted_room(&[]));
+        if let Some(me) = state.users.get_mut(&HARNESS_SELF) {
+            me.x = 400;
+            me.y = 300;
+        }
+        let (mut harness, sink) = harness_capturing();
+        let context = pen_context();
+
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        let events = apply_effect(
+            &Effect::DrawLine {
+                x1: 5,
+                y1: 5,
+                x2: 10,
+                y2: 0,
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert!(events.is_empty(), "a stroke is not a reported event");
+        assert!(dirty, "our own LINE marks the frame dirty");
+        assert_eq!(state.draw.back().len(), 1, "it appends to the back layer");
+
+        assert!(
+            captured_contains(&sink, &opcode::DRAW.value().to_le_bytes()),
+            "the stroke must still reach the server as a DRAW frame"
+        );
+
+        let (rgba, width) = composed_rgba(&state, &harness.shared);
+        assert_eq!(
+            rgba_pixel(&rgba, width, 10, 5),
+            RED,
+            "the same stroke is on our own frame"
+        );
+    }
+
+    #[test]
+    fn a_front_layer_stroke_paints_over_an_avatar_while_a_back_layer_one_does_not() {
+        // The self avatar clamps to (22,22), so its 44x44 body covers (44,44).
+        let place_avatar = |state: &mut SessionState| {
+            if let Some(me) = state.users.get_mut(&HARNESS_SELF) {
+                me.x = 10;
+                me.y = 5;
+            }
+        };
+
+        let mut back = state_in(&scripted_room(&[]));
+        place_avatar(&mut back);
+        back.apply(
+            &draw_frame(palace_room::draw_cmd::PATH, 0, &[(44, 44)]),
+            ByteOrder::Little,
+        );
+        let harness = harness();
+        let (back_rgba, width) = composed_rgba(&back, &harness.shared);
+        assert_ne!(
+            rgba_pixel(&back_rgba, width, 44, 44),
+            RED,
+            "a back-layer stroke is painted under the avatars"
+        );
+
+        let mut front = state_in(&scripted_room(&[]));
+        place_avatar(&mut front);
+        front.apply(
+            &draw_frame(
+                palace_room::draw_cmd::PATH,
+                palace_room::draw_flags::LAYER_FRONT,
+                &[(44, 44)],
+            ),
+            ByteOrder::Little,
+        );
+        let (front_rgba, _) = composed_rgba(&front, &harness.shared);
+        assert_eq!(
+            rgba_pixel(&front_rgba, width, 44, 44),
+            RED,
+            "a front-layer stroke is painted over the avatars"
+        );
+    }
+
+    #[test]
+    fn paintundo_removes_the_last_stroke_from_the_frame() {
+        let mut state = state_in(&scripted_room(&[]));
+        if let Some(me) = state.users.get_mut(&HARNESS_SELF) {
+            me.x = 400;
+            me.y = 300;
+        }
+        let mut harness = harness();
+        let (blank, width) = composed_rgba(&state, &harness.shared);
+
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        apply_effect(
+            &Effect::DrawLine {
+                x1: 5,
+                y1: 5,
+                x2: 10,
+                y2: 0,
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        let (with_stroke, _) = composed_rgba(&state, &harness.shared);
+        assert_eq!(rgba_pixel(&with_stroke, width, 10, 5), RED);
+
+        dirty = false;
+        let events = apply_effect(
+            &Effect::PaintUndo,
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert!(dirty, "PAINTUNDO must mark the frame dirty, not no-op");
+        assert_eq!(state.draw.len(), 0, "the stroke was undone");
+        assert!(
+            events.iter().any(
+                |event| matches!(event, ClientEvent::Note { text } if text.contains("PAINTUNDO"))
+            ),
+            "the undo is still reported: {events:?}"
+        );
+
+        let (after, _) = composed_rgba(&state, &harness.shared);
+        assert_eq!(
+            rgba_pixel(&after, width, 10, 5),
+            rgba_pixel(&blank, width, 10, 5),
+            "the frame is back to the blank room"
+        );
+        assert_ne!(
+            rgba_pixel(&after, width, 10, 5),
+            RED,
+            "the undone stroke is gone from the frame"
+        );
     }
 
     #[test]
