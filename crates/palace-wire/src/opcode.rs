@@ -104,6 +104,8 @@ pub const SPOTDEL: Opcode = Opcode(0x6f70_5364);
 pub const SPOTMOVE: Opcode = Opcode(0x636f_4c73);
 /// `0x704c6f63` — a picture moved; a `RoomID`, `HotspotID` and `Point`.
 pub const PICTMOVE: Opcode = Opcode(0x704c_6f63);
+/// `0x61757468` — the server asking the client to authenticate; empty body.
+pub const AUTHENTICATE: Opcode = Opcode(0x6175_7468);
 
 /// Full opcode table: every message type we have a name for, taken from the
 /// official 1999 protocol reference, Taj's `MessageTypes.cs`, and QPalace's

@@ -680,11 +680,18 @@ missing breaks using the client on a public server** — with one real exception
 | Unresolved | 1 | `durl` (DISPLAYURL): the spec documents a body, no server anywhere constructs it |
 | Real but non-blocking | 18 | ranked below |
 
-**The one hard blocker: authentication.** On a server configured to require it, the server sends
-`auth` (AUTHENTICATE) after logon and waits for `autr` (AUTHRESPONSE). We ignore the request and hang
-unauthenticated — no room, no user list. Worse, our own logon *advertises* the authenticate flag
-(`logon.rs`, `aux_flags = 0x8000_0008`), so we are asking for the one exchange we cannot complete.
-This is the only gap that stops a session.
+**The one hard blocker: authentication — now reported honestly, still not solved.** On a server
+configured to require it, the server sends `auth` (AUTHENTICATE) after logon and waits for `autr`
+(AUTHRESPONSE). `AUTHENTICATE` is now decoded and the client says so in the transcript instead of
+stalling in silence. The exchange itself is still unimplemented, so **an auth-requiring server will
+not let this client in**. Completing it needs a credential source plus the reply — a PString of
+`user:password` (:750-754).
+
+Worth knowing *why* this bites: our own logon advertises the authenticate flag
+(`logon.rs`, `aux_flags = 0x8000_0008`, and a test pins it), so we actively ask the server to
+challenge us. The options are to implement the reply, or to stop advertising a capability we do not
+have — the latter is one line, but it deviates from the captured reference logon, so it stays a
+decision rather than a unilateral change.
 
 Ranked after that, all feedback or optional channels:
 

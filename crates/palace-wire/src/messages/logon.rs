@@ -1,4 +1,5 @@
-//! `MSG_LOGON` (`regi`) and the `AuxRegistrationRec` structure it carries.
+//! `MSG_LOGON` (`regi`), the `AuxRegistrationRec` structure it carries, and the
+//! `MSG_AUTHENTICATE` request that can follow it.
 
 use crate::byteorder::{ByteOrder, Reader, Writer};
 use crate::error::{Result, WireError};
@@ -249,6 +250,28 @@ impl ReferenceProfile {
 /// Build the default reference logon record for `user_name`.
 pub fn reference_logon_record(user_name: &str, desired_room: i16) -> AuxRegistrationRec {
     ReferenceProfile::default().to_record(user_name, desired_room)
+}
+
+/// `MSG_AUTHENTICATE` (`auth`): the server asking the client to authenticate.
+///
+/// The body is empty — "there are no parameters in this message, so the length
+/// field should be 0 and the msg field should be empty" (:739-742). The reply is
+/// `MSG_AUTHRESPONSE` (:744), a PString of `user:password`, which this client does
+/// not send; knowing the request arrived is what lets it say so instead of stalling
+/// in silence. The frame `refNum` is unused (:737).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Authenticate;
+
+impl Authenticate {
+    /// Decode an `auth` body, which must be empty.
+    pub fn decode(r: &mut Reader<'_>) -> Result<Self> {
+        if !r.is_empty() {
+            return Err(WireError::TrailingBytes {
+                remaining: r.remaining(),
+            });
+        }
+        Ok(Authenticate)
+    }
 }
 
 #[cfg(test)]

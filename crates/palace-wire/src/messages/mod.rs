@@ -20,7 +20,9 @@ mod user;
 
 pub use chat::{Talk, Whisper};
 pub use lists::{RoomList, RoomListRec, UserList, UserListRec};
-pub use logon::{aux_flags, reference_logon_record, AuxRegistrationRec, ReferenceProfile};
+pub use logon::{
+    aux_flags, reference_logon_record, Authenticate, AuxRegistrationRec, ReferenceProfile,
+};
 pub use pictures::PictMove;
 pub use props::{PropDel, PropMove, PropNew};
 pub use room::{RoomDescription, RoomRec};
@@ -91,6 +93,7 @@ pub enum Message {
     SpotState(SpotState),
     /// `opSn` — a hotspot was created; the body is empty.
     SpotNew,
+    Authenticate,
     /// `opSd` — a hotspot was deleted.
     SpotDel(SpotDel),
     /// `coLs` — a hotspot moved to an absolute position.
@@ -179,6 +182,10 @@ impl Message {
             opcode::PING => Message::Ping(ref_num),
             opcode::PONG => Message::Pong(ref_num),
             opcode::LOGOFF => Message::Logoff,
+            opcode::AUTHENTICATE => {
+                Authenticate::decode(r)?;
+                Message::Authenticate
+            }
             _ => Message::Unknown {
                 opcode,
                 ref_num,
@@ -280,6 +287,7 @@ impl Message {
                 s.room_id, s.spot_id, s.state
             ),
             Message::SpotNew => "new spot (no body)".to_string(),
+            Message::Authenticate => "authenticate request (no body)".to_string(),
             Message::SpotDel(d) => format!("delete spot: spot={}", d.spot_id),
             Message::SpotMove(m) => format!(
                 "move spot: room={} spot={} v={} h={}",
@@ -401,8 +409,8 @@ mod tests {
     use super::*;
     use crate::byteorder::Writer;
     use crate::opcode::{
-        DOORLOCK, DOORUNLOCK, LISTOFALLROOMS, LOGOFF, PICTMOVE, PING, PROPMOVE, SPOTDEL, SPOTMOVE,
-        SPOTNEW, SPOTSTATE, TALK, USERFACE, USERPROP,
+        AUTHENTICATE, DOORLOCK, DOORUNLOCK, LISTOFALLROOMS, LOGOFF, PICTMOVE, PING, PROPMOVE,
+        SPOTDEL, SPOTMOVE, SPOTNEW, SPOTSTATE, TALK, USERFACE, USERPROP,
     };
 
     #[test]
@@ -538,6 +546,19 @@ mod tests {
             })
         );
         assert!(spot.describe().contains("state=1"));
+    }
+
+    #[test]
+    fn an_authenticate_request_is_bodyless() {
+        assert_eq!(
+            Message::decode(AUTHENTICATE, 0, &[], ByteOrder::Little).unwrap(),
+            Message::Authenticate
+        );
+        assert!(
+            Message::decode(AUTHENTICATE, 0, &[0u8; 2], ByteOrder::Little).is_err(),
+            "a body here would mean the layout is wrong, so it must be refused"
+        );
+        assert!(Message::Authenticate.describe().contains("authenticate"));
     }
 
     #[test]
