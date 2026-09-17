@@ -1968,6 +1968,18 @@ fn move_spot_to(state: &mut SessionState, spot: i32, x: i32, y: i32) -> bool {
     let Some(room_id) = current_room_id(state) else {
         return false;
     };
+    move_spot_in_room(state, room_id, spot, x, y)
+}
+
+/// The same move for a room named by the wire: `MSG_SPOTMOVE` carries a
+/// `RoomID`, and a move aimed at another room must not touch this one.
+pub(crate) fn move_spot_in_room(
+    state: &mut SessionState,
+    room_id: i16,
+    spot: i32,
+    x: i32,
+    y: i32,
+) -> bool {
     let Some(hotspot) = hotspot_mut(state, room_id, spot) else {
         return false;
     };
@@ -1982,6 +1994,20 @@ fn set_pic_offset(state: &mut SessionState, spot: i32, index: Option<i32>, x: i3
     let Some(room_id) = current_room_id(state) else {
         return false;
     };
+    set_pic_offset_in_room(state, room_id, spot, index, x, y)
+}
+
+/// The same offset assignment for a room named by the wire: `MSG_PICTMOVE`
+/// carries a `RoomID` and moves the hotspot's *current* state picture, which is
+/// exactly what `SETPICLOC` does.
+pub(crate) fn set_pic_offset_in_room(
+    state: &mut SessionState,
+    room_id: i16,
+    spot: i32,
+    index: Option<i32>,
+    x: i32,
+    y: i32,
+) -> bool {
     let Some(hotspot) = hotspot_mut(state, room_id, spot) else {
         return false;
     };
@@ -1994,6 +2020,20 @@ fn set_pic_offset(state: &mut SessionState, spot: i32, index: Option<i32>, x: i3
     };
     target.pic_loc = point(x, y);
     true
+}
+
+/// `MSG_SPOTDEL` removes a hotspot "from the current room" (:1900) and carries
+/// no `RoomID`, so the room it names is the one already being shown.
+pub(crate) fn remove_local_hotspot(state: &mut SessionState, spot: i32) -> bool {
+    let Some(room) = state.room_desc.as_mut() else {
+        return false;
+    };
+    let Ok(spot) = i16::try_from(spot) else {
+        return false;
+    };
+    let before = room.hotspots.len();
+    room.hotspots.retain(|hotspot| hotspot.id != spot);
+    room.hotspots.len() != before
 }
 
 fn set_pic_opacity(state: &mut SessionState, spot: i32, index: i32, opacity: f64) -> bool {

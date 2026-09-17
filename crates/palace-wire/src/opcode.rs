@@ -96,6 +96,14 @@ pub const PROPNEW: Opcode = Opcode(0x6e50_7270);
 pub const PROPDEL: Opcode = Opcode(0x6450_7270);
 pub const PROPMOVE: Opcode = Opcode(0x6d50_7270);
 pub const SPOTSTATE: Opcode = Opcode(0x7353_7461);
+/// `0x6f70536e` — a hotspot was created; empty body.
+pub const SPOTNEW: Opcode = Opcode(0x6f70_536e);
+/// `0x6f705364` — a hotspot was deleted; one `HotspotID`.
+pub const SPOTDEL: Opcode = Opcode(0x6f70_5364);
+/// `0x636f4c73` — a hotspot moved; a `RoomID`, `HotspotID` and `Point`.
+pub const SPOTMOVE: Opcode = Opcode(0x636f_4c73);
+/// `0x704c6f63` — a picture moved; a `RoomID`, `HotspotID` and `Point`.
+pub const PICTMOVE: Opcode = Opcode(0x704c_6f63);
 
 /// Full opcode table: every message type we have a name for, taken from the
 /// official 1999 protocol reference, Taj's `MessageTypes.cs`, and QPalace's

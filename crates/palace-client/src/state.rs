@@ -16,7 +16,9 @@ use palace_wire::messages::{self, AssetSpec, Message, Point};
 use palace_wire::opcode;
 use serde::Serialize;
 
-use crate::runtime::set_local_spot_state;
+use crate::runtime::{
+    move_spot_in_room, remove_local_hotspot, set_local_spot_state, set_pic_offset_in_room,
+};
 use crate::xtlk;
 
 /// A door hotspot's `state` field is its lock: `HS_Unlock` is 0 and `HS_Lock`
@@ -478,6 +480,34 @@ impl SessionState {
                     i32::from(spot.spot_id),
                     i32::from(spot.state),
                 );
+            }
+            Message::SpotDel(del) => {
+                applied.render = remove_local_hotspot(self, i32::from(del.spot_id));
+            }
+            Message::SpotMove(mv) => {
+                applied.render = move_spot_in_room(
+                    self,
+                    mv.room_id,
+                    i32::from(mv.spot_id),
+                    i32::from(mv.position.h),
+                    i32::from(mv.position.v),
+                );
+            }
+            Message::PictMove(pm) => {
+                applied.render = set_pic_offset_in_room(
+                    self,
+                    pm.room_id,
+                    i32::from(pm.spot_id),
+                    None,
+                    i32::from(pm.position.h),
+                    i32::from(pm.position.v),
+                );
+            }
+            Message::SpotNew => {
+                applied.chat.push(self.system_line(
+                    ChatKind::System,
+                    "server announced a new hotspot without describing it; this room is stale",
+                ));
             }
             Message::RoomDescription(_) => {
                 match palace_room::decode_payload(&frame.payload, order) {
@@ -1122,5 +1152,200 @@ mod tests {
             ByteOrder::Little,
         );
         assert!(!applied.render);
+    }
+
+    fn room_spot_point_body(room_id: i16, spot_id: i16, point: Point) -> Vec<u8> {
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(room_id);
+        w.write_i16(spot_id);
+        point.encode(&mut w);
+        w.into_vec()
+    }
+
+    fn hotspot_loc(state: &SessionState, id: i16) -> Point {
+        state
+            .room_desc
+            .as_ref()
+            .expect("a room")
+            .hotspots
+            .iter()
+            .find(|hotspot| hotspot.id == id)
+            .expect("the hotspot is in the room")
+            .loc
+    }
+
+    fn pic_loc(state: &SessionState, id: i16, index: usize) -> Point {
+        state
+            .room_desc
+            .as_ref()
+            .expect("a room")
+            .hotspots
+            .iter()
+            .find(|hotspot| hotspot.id == id)
+            .expect("the hotspot is in the room")
+            .states[index]
+            .pic_loc
+    }
+
+    #[test]
+    fn spot_move_sets_the_absolute_location_in_this_room_only() {
+        let mut state = room_state();
+        let before = hotspot_loc(&state, 105);
+
+        let applied = state.apply(
+            &Frame::new(
+                opcode::SPOTMOVE,
+                0,
+                room_spot_point_body(999, 105, Point::new(1, 2)),
+            ),
+            ByteOrder::Little,
+        );
+        assert!(
+            !applied.render,
+            "a foreign room's move changes nothing here"
+        );
+        assert_eq!(hotspot_loc(&state, 105), before);
+
+        let applied = state.apply(
+            &Frame::new(
+                opcode::SPOTMOVE,
+                0,
+                room_spot_point_body(86, 105, Point::new(240, 120)),
+            ),
+            ByteOrder::Little,
+        );
+        assert!(applied.render);
+        assert_eq!(
+            hotspot_loc(&state, 105),
+            Point::new(240, 120),
+            "v is y, h is x, and the position is the whole new location"
+        );
+
+        let applied = state.apply(
+            &Frame::new(
+                opcode::SPOTMOVE,
+                0,
+                room_spot_point_body(86, 32000, Point::new(1, 2)),
+            ),
+            ByteOrder::Little,
+        );
+        assert!(!applied.render, "a hotspot this room lacks cannot move");
+    }
+
+    #[test]
+    fn pict_move_sets_the_current_states_picture_offset_in_this_room_only() {
+        let mut state = room_state();
+        {
+            let room = state.room_desc.as_mut().expect("a room");
+            let hotspot = room
+                .hotspots
+                .iter_mut()
+                .find(|hotspot| hotspot.id == 105)
+                .expect("the fixture hotspot");
+            hotspot.state = 0;
+            hotspot.states = vec![palace_room::HotspotState::default()];
+        }
+
+        let applied = state.apply(
+            &Frame::new(
+                opcode::PICTMOVE,
+                0,
+                room_spot_point_body(999, 105, Point::new(1, 2)),
+            ),
+            ByteOrder::Little,
+        );
+        assert!(
+            !applied.render,
+            "a foreign room's picture move changes nothing here"
+        );
+
+        let applied = state.apply(
+            &Frame::new(
+                opcode::PICTMOVE,
+                0,
+                room_spot_point_body(86, 105, Point::new(300, 400)),
+            ),
+            ByteOrder::Little,
+        );
+        assert!(applied.render);
+        assert_eq!(
+            pic_loc(&state, 105, 0),
+            Point::new(300, 400),
+            "the hotspot's current state picture offset is set absolutely"
+        );
+
+        {
+            let room = state.room_desc.as_mut().expect("a room");
+            let door = room
+                .hotspots
+                .iter_mut()
+                .find(|hotspot| hotspot.id == 7)
+                .expect("the fixture door");
+            door.state = 0;
+            door.states.clear();
+        }
+        let applied = state.apply(
+            &Frame::new(
+                opcode::PICTMOVE,
+                0,
+                room_spot_point_body(86, 7, Point::new(1, 2)),
+            ),
+            ByteOrder::Little,
+        );
+        assert!(
+            !applied.render,
+            "a hotspot with no state picture has nowhere to put the offset"
+        );
+    }
+
+    #[test]
+    fn spot_del_removes_the_hotspot_from_this_room() {
+        let mut state = room_state();
+        let before = state.room_desc.as_ref().expect("a room").hotspots.len();
+
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(105);
+        let applied = state.apply(
+            &Frame::new(opcode::SPOTDEL, 0, w.into_vec()),
+            ByteOrder::Little,
+        );
+        assert!(applied.render);
+        let hotspots = &state.room_desc.as_ref().expect("a room").hotspots;
+        assert_eq!(hotspots.len(), before - 1);
+        assert!(!hotspots.iter().any(|hotspot| hotspot.id == 105));
+
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(105);
+        let applied = state.apply(
+            &Frame::new(opcode::SPOTDEL, 0, w.into_vec()),
+            ByteOrder::Little,
+        );
+        assert!(
+            !applied.render,
+            "deleting an absent hotspot changes nothing"
+        );
+    }
+
+    #[test]
+    fn spot_new_carries_no_geometry_and_leaves_the_room_alone() {
+        let mut state = room_state();
+        let before = state.room_desc.as_ref().expect("a room").hotspots.len();
+
+        let applied = state.apply(
+            &Frame::new(opcode::SPOTNEW, 0, Vec::new()),
+            ByteOrder::Little,
+        );
+        assert!(
+            !applied.render,
+            "an empty body describes nothing to add to the room"
+        );
+        assert_eq!(
+            state.room_desc.as_ref().expect("a room").hotspots.len(),
+            before
+        );
+        assert!(
+            applied.chat.iter().any(|line| line.text.contains("stale")),
+            "the stale room is reported instead of silently ignored"
+        );
     }
 }
