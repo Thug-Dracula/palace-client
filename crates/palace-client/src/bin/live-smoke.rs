@@ -28,7 +28,7 @@ fn report(event: &ClientEvent) -> bool {
         ),
         ClientEvent::Rooms { rooms } => {
             println!("[rooms] {}", rooms.len());
-            for room in rooms.iter().take(6) {
+            for room in rooms.iter().take(100) {
                 println!("        #{} {:?} users={}", room.id, room.name, room.users);
             }
         }
