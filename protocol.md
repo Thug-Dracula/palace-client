@@ -396,6 +396,53 @@ These are recorded as raw bytes rather than guessed at:
 
 ---
 
+## Faces and avatars
+
+Every user record carries two small fields that together decide what the user
+looks like when they are not wearing any props:
+
+| Field | Meaning |
+|---|---|
+| `face` | which face, 0..=12 |
+| `color` | which colour variant, 0..=15 |
+
+They index a built-in sprite sheet that every Palace client ships — the green
+smileys in the "Choose an Avatar" dialog. The layout is a grid where **`face` is
+the column and `color` is the row**. The reference draws it directly:
+
+```actionscript
+<s:Group horizontalScrollPosition="{user.face * 45}" verticalScrollPosition="{user.color * 45}">
+  <s:BitmapImage source="@Embed(source='assets/faces/defaultsmileys.png')" />
+```
+
+**Cell geometry.** In the reference `defaultsmileys.png` the cells are 45px, but
+the face art inside each one is 42×42 at offset (1,1), with a transparent border
+around it. The reference compensates by drawing the 45px cell as a 44×44 bitmap at
+`(-1,-1)`, so the art lands at the avatar's origin.
+
+This client ships a **repacked** sheet, `crates/palace-render/assets/smileys.png`:
+13 columns × 16 rows of 42×42 with the border trimmed, so a cell address is simply
+`(color * 42, face * 42)` and it is drawn at offset `(0, 0)` with no fudge.
+`tools/extract-smileys.py` regenerates it from the reference sheet.
+
+**When the built-in face is hidden.** If a user wears a prop whose header carries
+the `head` flag, the face is not drawn — the worn head replaces it. The reference
+makes this explicit:
+
+```actionscript
+private function checkFaceProps():void {
+    var showFace:Boolean = true;
+    for each prop: if (prop.head) showFace = false;
+    this.showFace = showFace;
+}
+```
+
+Our equivalent is `PropHeader::is_head` in `palace-prop`. A user's other props
+(hands, bodies, accessories) do not suppress the face.
+
+**These values are not trustworthy.** They come from the server, so a client must
+clamp them rather than index a sheet with whatever arrived.
+
 ## Opcodes discovered
 
 75 opcodes are named, taken from the 1999 protocol reference, Taj's
