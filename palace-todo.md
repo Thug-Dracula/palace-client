@@ -361,6 +361,44 @@ grep -c "bouncedef DEF" ~/palace-corpus/animanic_walk/room_31000.txt   # 0 = it 
 - [ ] Implementing this means the legacy file-transfer path plus loading a fetched script into the VM.
   Scope it deliberately; it is the difference between "Colosseum rooms mostly work" and "they work".
 
+### 2.12 Colosseum rooms fetch their logic over HTTP, after a room lifecycle we never fire
+
+The other half of §2.11, and larger. Counted across `~/palace-corpus/scripts/` and
+`~/palace-corpus/animanic_walk/`:
+
+| | Uses | Implemented |
+|---|---|---|
+| `HTTPGET` in room scripts | **50** | ❌ — our own classifier lists it as an *unregistered* name |
+| `ON HTTPRECEIVED` handlers | 7 | ❌ (the event is defined, never fired) |
+| `ON ROOMREADY` / `ON ROOMLOAD` | 8 / 8 | ❌ (events defined, never fired) |
+
+Real examples: `"http://api.animanic.de/deviantart/" HTTPGET`, and `"ludo/" HTTPGET` — a **relative**
+URL, so it resolves against the server's HTTP origin. We already have that origin:
+`state.banner.media_base`, used by the media fetcher.
+
+**The room lifecycle order is now known exactly**, taken from a reference call site
+(`~/palace-corpus/reference/repos/sparky/index.js`):
+
+```js
+ri(), Si(), C2(), e.setRoom(payload), Bc(payload.spots), w2(), Ze("ENTER", spots), y2()
+//                                                          ROOMLOAD   ENTER        ROOMREADY
+```
+
+So it is **ROOMLOAD → ENTER → ROOMREADY**. We fire only `ENTER`. Rooms put their fetches in
+`ON ROOMREADY {"ludo/" HTTPGET`, which is why they never run for us.
+
+`sparky` also gives the argument semantics, which are easy to get wrong:
+- `STATECHANGE` is **spot-scoped** and receives the **previous** state as `lastState`.
+- `NAMECHANGE` is room-level with `whoChangeId` + `lastName`; `USERLEAVE`/`USERENTER` are room-level
+  with `whoLeaveId`/`whoEnterId`; `SERVERMSG` with `chatStr`.
+- `HTTPRECEIVED` is **spot-scoped when the `HTTPGET` came from a spot's handler**, room-level
+  otherwise, and carries `httpContents`, `httpHeaders`, `httpContentType`, `httpFilename`, `httpUrl`.
+- Events the reference has that our enum lacks entirely: `USERENTER`, `FACECHANGE`, `COLORCHANGE`,
+  `USERMOVE`, `PROPCHANGE`, `IDLE`, `LOOSEPROPADDED`/`LOOSEPROPMOVED`/`LOOSEPROPDELETED`.
+
+- [ ] Implement in this order: the room lifecycle events, then `HTTPGET` + `HTTPRECEIVED`/`HTTPERROR`.
+  With those, `LOADSCRIPT` (§2.11) is plausibly just "fetch, then execute" on the same mechanism.
+
 ---
 
 ## Part 3 — How to verify
