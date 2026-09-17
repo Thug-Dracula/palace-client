@@ -23,3 +23,5 @@ palace-prop = { workspace = true }
 image = { workspace = true }
 # Frame output. The compositor only ever encodes RGBA8.
 png = { workspace = true }
+# Name-tag text: parse and rasterize the embedded Liberation Sans Bold face.
+fontdue = { workspace = true }

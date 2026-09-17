@@ -39,6 +39,9 @@ OUTPUT:
     --out <FILE>           PNG path to write (required)
     --dpr <FLOAT>          device-pixel ratio, clamped to [1,2] (default 1)
     --clock-ms <UINT>      injected animation clock (default 0; deterministic)
+    --repeat <N>           load once, then run build+render+encode N times on
+                           warm stores, printing per-iteration timings
+                           (default 1 = existing single-shot behaviour)
 
 ROOM SOURCE / ASSETS:
     --rooms-dir <DIR>      room payload directory (default $CORPUS/payloads_all)
@@ -49,7 +52,7 @@ ROOM SOURCE / ASSETS:
     --roster <FILE>        .prp prop roster (default $CORPUS/pserver.prp if present)
 
 AVATARS:
-    --avatar <X>,<Y>[,<PROP_ID>...]   place an avatar (repeatable)
+    --avatar <X>,<Y>[,<PROP_ID>...][;<NAME>]   place an avatar (repeatable)
     --loose-prop <PROP_ID>@<X>,<Y>    place an extra loose prop (repeatable)
 
 PREVIEW (no file written):
@@ -85,6 +88,7 @@ struct Args {
     extra_props: Vec<PlacedProp>,
     viewport: Option<(f64, f64)>,
     zoom: f64,
+    repeat: usize,
 }
 
 fn run(argv: Vec<String>) -> Result<(), String> {
@@ -117,13 +121,17 @@ fn run(argv: Vec<String>) -> Result<(), String> {
     );
 
     let builder = SceneBuilder::new(media, props);
-    let scene = builder.build_with(&room, &args.avatars, &args.extra_props);
-    report(&room, &scene, &args);
-
     let options = RenderOptions {
         dpr: args.dpr,
         clock: AnimationClock::at(args.clock_ms),
     };
+
+    if args.repeat > 1 {
+        return run_repeat(&builder, &room, options, &args, &out);
+    }
+
+    let scene = builder.build_with(&room, &args.avatars, &args.extra_props);
+    report(&room, &scene, &args);
     let canvas = render(&scene, options);
     write_png(&canvas, &out)?;
     eprintln!(
@@ -134,6 +142,101 @@ fn run(argv: Vec<String>) -> Result<(), String> {
         canvas.dpr()
     );
     Ok(())
+}
+
+/// `--repeat N`: everything is loaded once, then build → render → PNG encode
+/// runs `N` times with warm in-memory stores, timing each stage. Iteration 0 is
+/// reported but excluded from the warm mean/max because it pays first-touch
+/// allocation and page faults.
+fn run_repeat(
+    builder: &SceneBuilder,
+    room: &palace_render::RoomDesc,
+    options: RenderOptions,
+    args: &Args,
+    out: &PathBuf,
+) -> Result<(), String> {
+    let n = args.repeat;
+    let mut times: Vec<[f64; 3]> = Vec::with_capacity(n);
+    let mut last: Option<Canvas> = None;
+    for i in 0..n {
+        let t0 = std::time::Instant::now();
+        let scene = builder.build_with(room, &args.avatars, &args.extra_props);
+        let t1 = std::time::Instant::now();
+        if i == 0 {
+            report(room, &scene, args);
+        }
+        let canvas = render(&scene, options);
+        let t2 = std::time::Instant::now();
+        let _bytes = canvas.to_png_bytes().map_err(|e| e.to_string())?;
+        let t3 = std::time::Instant::now();
+
+        let build_ms = t1.duration_since(t0).as_secs_f64() * 1000.0;
+        let render_ms = t2.duration_since(t1).as_secs_f64() * 1000.0;
+        let png_ms = t3.duration_since(t2).as_secs_f64() * 1000.0;
+        let total_ms = build_ms + render_ms + png_ms;
+        times.push([build_ms, render_ms, png_ms]);
+        let cold = if i == 0 && n > 1 {
+            " (cold, excluded from warm stats)"
+        } else {
+            ""
+        };
+        println!(
+            "iter {i}: build_with {build_ms:.3} ms, render {render_ms:.3} ms, \
+             to_png_bytes {png_ms:.3} ms, total {total_ms:.3} ms{cold}"
+        );
+        last = Some(canvas);
+    }
+
+    // Iteration 0 pays first-touch cost; the warm stats start at 1.
+    let warm = &times[1..];
+    let builds: Vec<f64> = warm.iter().map(|r| r[0]).collect();
+    let renders: Vec<f64> = warm.iter().map(|r| r[1]).collect();
+    let pngs: Vec<f64> = warm.iter().map(|r| r[2]).collect();
+    let totals: Vec<f64> = warm.iter().map(|r| r[0] + r[1] + r[2]).collect();
+    println!(
+        "repeat {n}: warm stats over {} iteration(s) (iter 0 cold, excluded; \
+         cold total {:.3} ms)",
+        warm.len(),
+        times[0].iter().sum::<f64>()
+    );
+    for (label, values) in [
+        ("build_with", &builds),
+        ("render", &renders),
+        ("to_png_bytes", &pngs),
+        ("total", &totals),
+    ] {
+        let (mean, max) = stats(values);
+        println!("  {label:<13} mean {mean:.3} ms  max {max:.3} ms");
+    }
+
+    if let Some(canvas) = last {
+        write_png(&canvas, out)?;
+        println!(
+            "wrote {} ({}x{} device px, dpr {})",
+            out.display(),
+            canvas.width(),
+            canvas.height(),
+            canvas.dpr()
+        );
+    }
+    Ok(())
+}
+
+fn stats(values: &[f64]) -> (f64, f64) {
+    let mut sum = 0.0f64;
+    let mut max = 0.0f64;
+    for value in values {
+        sum += value;
+        if *value > max {
+            max = *value;
+        }
+    }
+    let mean = if values.is_empty() {
+        0.0
+    } else {
+        sum / values.len() as f64
+    };
+    (mean, max)
 }
 
 fn write_png(canvas: &Canvas, out: &PathBuf) -> Result<(), String> {
@@ -245,6 +348,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut args = Args {
         dpr: 1.0,
         zoom: 1.0,
+        repeat: 1,
         ..Args::default()
     };
     let mut i = 0;
@@ -274,6 +378,10 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--props-dir" => args.props_dirs.push(PathBuf::from(value()?)),
             "--roster" => args.roster = Some(PathBuf::from(value()?)),
             "--zoom" => args.zoom = value()?.parse().map_err(|e| format!("--zoom: {e}"))?,
+            "--repeat" => {
+                let n: usize = value()?.parse().map_err(|e| format!("--repeat: {e}"))?;
+                args.repeat = n.max(1);
+            }
             "--avatar" => args.avatars.push(parse_avatar(&value()?)?),
             "--loose-prop" => args.extra_props.push(parse_placed_prop(&value()?)?),
             "--viewport" => args.viewport = Some(parse_viewport(&value()?)?),
@@ -286,7 +394,11 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 }
 
 fn parse_avatar(spec: &str) -> Result<AvatarSpec, String> {
-    let mut parts = spec.split(',');
+    let (geometry, name) = match spec.split_once(';') {
+        Some((geometry, name)) => (geometry, Some(name.to_string())),
+        None => (spec, None),
+    };
+    let mut parts = geometry.split(',');
     let x = parts
         .next()
         .ok_or_else(|| "--avatar needs X,Y".to_string())?
@@ -307,7 +419,9 @@ fn parse_avatar(spec: &str) -> Result<AvatarSpec, String> {
             .map_err(|e| format!("--avatar prop id {part:?}: {e}"))?;
         props.push(id);
     }
-    Ok(AvatarSpec::new(x, y, props))
+    let mut avatar = AvatarSpec::new(x, y, props);
+    avatar.name = name;
+    Ok(avatar)
 }
 
 fn parse_placed_prop(spec: &str) -> Result<PlacedProp, String> {

@@ -156,6 +156,13 @@ pub fn draw_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationClock) {
     }
 
     blit_layer(canvas, &scene.overlays_above_avatars);
+    if scene.name_tags_visible {
+        for avatar in &avatars {
+            if let Some(name) = avatar.name.as_deref() {
+                crate::nametag::draw_name_tag(canvas, avatar.x, avatar.y, name);
+            }
+        }
+    }
     blit_layer(canvas, &scene.overlays_above_name_tags);
     blit_layer(canvas, &scene.overlays_above_everything);
 }
@@ -218,6 +225,14 @@ mod tests {
                 dy: 0,
                 alpha: 1.0,
             }],
+            name: None,
+        }
+    }
+
+    fn named_avatar(name: &str, x: i32, y: i32) -> Avatar {
+        Avatar {
+            name: Some(name.to_string()),
+            ..avatar(GREEN, x, y)
         }
     }
 
@@ -233,6 +248,7 @@ mod tests {
                 dy: -(size as i32) / 2,
                 alpha: 1.0,
             }],
+            name: None,
         }
     }
 
@@ -503,5 +519,96 @@ mod tests {
         assert_eq!(AnimationClock::at(99).frame_index(10, 4), 1);
         assert_eq!(AnimationClock::at(99).frame_index(0, 4), 0);
         assert_eq!(AnimationClock::zero().millis(), 0);
+    }
+
+    /// A frame coordinate that the name tag of `name` on an avatar at
+    /// `(ax, ay)` paints, derived from the tag image and its placement.
+    fn tag_pixel_frame_position(name: &str, ax: i32, ay: i32) -> (i32, i32) {
+        let tag = crate::nametag::name_tag(name).expect("the tag renders");
+        for y in 0..tag.image.height() {
+            for x in 0..tag.image.width() {
+                let opaque = tag.image.pixel(x, y).is_some_and(|p| p[3] == 255);
+                if !opaque {
+                    continue;
+                }
+                let (text_x, text_y) = crate::nametag::name_tag_position(ax, ay, tag.text_width);
+                let fx = (text_x - f64::from(tag.origin_x) + f64::from(x)).floor() as i32;
+                let fy = (text_y - f64::from(tag.origin_y) + f64::from(y)).floor() as i32;
+                return (fx, fy);
+            }
+        }
+        panic!("a rendered tag always has an opaque pixel");
+    }
+
+    #[test]
+    fn a_named_avatar_renders_a_tag_an_unnamed_one_does_not() {
+        let mut named = Scene::new(128, 96);
+        named.avatars = vec![named_avatar("Bob", 64, 40)];
+        let mut unnamed = Scene::new(128, 96);
+        unnamed.avatars = vec![avatar(GREEN, 64, 40)];
+        let a = render(&named, RenderOptions::at_dpr(1.0));
+        let b = render(&unnamed, RenderOptions::at_dpr(1.0));
+        assert_ne!(
+            a.as_rgba(),
+            b.as_rgba(),
+            "a name must paint pixels the unnamed avatar does not"
+        );
+    }
+
+    #[test]
+    fn clearing_name_tags_visible_removes_the_tag_without_touching_the_avatar() {
+        let mut shown = Scene::new(128, 96);
+        shown.avatars = vec![named_avatar("Bob", 64, 40)];
+        let mut hidden = Scene::new(128, 96);
+        hidden.avatars = vec![named_avatar("Bob", 64, 40)];
+        hidden.name_tags_visible = false;
+
+        let with_tag = render(&shown, RenderOptions::at_dpr(1.0));
+        let without_tag = render(&hidden, RenderOptions::at_dpr(1.0));
+        assert_ne!(with_tag.as_rgba(), without_tag.as_rgba());
+
+        let mut plain = Scene::new(128, 96);
+        plain.avatars = vec![avatar(GREEN, 64, 40)];
+        let nameless = render(&plain, RenderOptions::at_dpr(1.0));
+        assert_eq!(
+            without_tag.as_rgba(),
+            nameless.as_rgba(),
+            "hiding the tag must leave exactly the nameless frame"
+        );
+        assert_eq!(
+            hidden.avatars[0].name.as_deref(),
+            Some("Bob"),
+            "hiding is a draw switch, not data loss"
+        );
+    }
+
+    /// Layer 9 is above the `AboveAvatars` band and below the
+    /// `AboveNameTags` band. Both halves are asserted at one shared pixel.
+    #[test]
+    fn name_tags_draw_above_avatars_and_below_the_above_name_tags_band() {
+        let name = "M";
+        let (ax, ay) = (64, 40);
+        let (fx, fy) = tag_pixel_frame_position(name, ax, ay);
+        let (ux, uy) = (fx as u32, fy as u32);
+
+        let mut scene = Scene::new(128, 96);
+        scene.avatars = vec![named_avatar(name, ax, ay)];
+        scene.overlays_above_avatars = vec![sprite(RED, fx, fy, 0)];
+        let c = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_ne!(
+            px(&c, ux, uy),
+            RED,
+            "the name tag must cover an AboveAvatars sprite at the same pixel"
+        );
+
+        let mut scene = Scene::new(128, 96);
+        scene.avatars = vec![named_avatar(name, ax, ay)];
+        scene.overlays_above_name_tags = vec![sprite(GREEN, fx, fy, 0)];
+        let c = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(
+            px(&c, ux, uy),
+            GREEN,
+            "an AboveNameTags sprite must cover the name tag at the same pixel"
+        );
     }
 }

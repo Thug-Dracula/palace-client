@@ -60,6 +60,7 @@ pub mod corpus;
 pub mod error;
 pub mod face;
 pub mod image_clut;
+pub mod nametag;
 pub mod scene;
 pub mod viewport;
 
@@ -72,7 +73,11 @@ pub use canvas::Canvas;
 pub use compositor::{draw_into, render, sort_avatars, AnimationClock, RenderOptions};
 pub use corpus::RoomSource;
 pub use error::{AssetNote, RenderError};
-pub use face::{smiley_cell, COLOR_VARIANTS, FACE_CELL, FACE_VARIANTS};
+pub use face::{face_sheet_png, smiley_cell, COLOR_VARIANTS, FACE_CELL, FACE_VARIANTS};
+pub use nametag::{
+    draw_name_tag, measure_text, name_tag, name_tag_position, NameTag, MAX_NAME_TAG_CHARS,
+    NAME_TAG_FONT_PX, NAME_TAG_GLOW_RADIUS, NAME_TAG_X_FUDGE, NAME_TAG_Y_OFFSET,
+};
 pub use scene::{
     layer_for_hotspot_flags, Avatar, AvatarPart, Layer, Scene, Sprite, FLAG_PICTURES_ABOVE_ALL,
     FLAG_PICTURES_ABOVE_NAME_TAGS, FLAG_PICTURES_ABOVE_PROPS,

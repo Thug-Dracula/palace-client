@@ -45,6 +45,25 @@ impl Dpr {
     }
 }
 
+/// Deflate mode for the frame PNG.
+///
+/// The frame is re-encoded on every click and served to a webview, so encoding
+/// latency dominates the compose path. The `png` crate default (deflate level 6
+/// with adaptive row filtering) costs ~160 ms per frame in release and over a
+/// second in a debug build; fdeflate does the same job in ~4 ms and ~120 ms.
+const FRAME_COMPRESSION: png::Compression = png::Compression::Fastest;
+
+/// Row filter for the frame PNG. A fixed `Up` filter is what makes
+/// [`FRAME_COMPRESSION`] fast: adaptive filtering re-scores every row.
+const FRAME_FILTER: png::Filter = png::Filter::Up;
+
+/// Apply the frame-PNG encoder settings, shared by [`Canvas::to_png_bytes`] and
+/// [`Canvas::write_png`] so the in-memory and file paths can never drift apart.
+fn configure_encoder<W: std::io::Write>(encoder: &mut png::Encoder<'_, W>) {
+    encoder.set_compression(FRAME_COMPRESSION);
+    encoder.set_filter(FRAME_FILTER);
+}
+
 impl Canvas {
     /// Allocate a frame buffer for a room of `room_width × room_height` logical
     /// pixels at the given device-pixel ratio.
@@ -240,6 +259,7 @@ impl Canvas {
         let mut encoder = png::Encoder::new(&mut out, self.width, self.height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
+        configure_encoder(&mut encoder);
         let mut writer = encoder
             .write_header()
             .map_err(|e| RenderError::Png(e.to_string()))?;
@@ -256,6 +276,7 @@ impl Canvas {
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), self.width, self.height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
+        configure_encoder(&mut encoder);
         let mut writer = encoder
             .write_header()
             .map_err(|e| RenderError::Png(e.to_string()))?;
@@ -401,5 +422,23 @@ mod tests {
         c.fill_rect(RectF::new(0.0, 0.0, 1.0, 1.0), [200, 100, 50, 255]);
         c.apply_dim(1.0);
         assert_eq!(c.device_pixel(0, 0), Some([200, 100, 50, 255]));
+    }
+
+    #[test]
+    fn png_roundtrip_preserves_every_rgba_byte() {
+        let mut c = Canvas::for_room(17.0, 9.0, 2.0);
+        c.fill_rect(RectF::new(0.0, 0.0, 17.0, 9.0), [12, 200, 7, 255]);
+        c.blit(&solid(5, 5, [255, 0, 0, 128]), 3.0, 2.0, 0.5);
+        c.blit(&solid(2, 2, [0, 0, 255, 255]), 15.0, 7.0, 1.0);
+
+        let png = c.to_png_bytes().expect("encode");
+        let mut reader = png::Decoder::new(std::io::Cursor::new(&png))
+            .read_info()
+            .expect("decode header");
+        let mut buf = vec![0; reader.output_buffer_size().expect("buffer size")];
+        let info = reader.next_frame(&mut buf).expect("decode frame");
+        assert_eq!((info.width, info.height), (c.width(), c.height()));
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(&buf[..info.buffer_size()], c.as_rgba());
     }
 }

@@ -26,6 +26,16 @@ const SMILEYS_PNG: &[u8] = include_bytes!("../assets/smileys.png");
 
 /// Width and height of one face cell, in pixels.
 pub const FACE_CELL: u32 = 44;
+
+/// The embedded smiley sheet as PNG bytes.
+///
+/// The presentation layer fetches this over its URI scheme to draw a face
+/// picker. It is the same asset [`smiley_cell`] crops from, so the picker and
+/// the composited frame can never disagree about the sheet.
+#[must_use]
+pub fn face_sheet_png() -> &'static [u8] {
+    SMILEYS_PNG
+}
 /// Number of face variants. Valid `face` values are `0..FACE_VARIANTS`.
 pub const FACE_VARIANTS: i16 = 13;
 /// Number of colour variants. Valid `color` values are `0..COLOR_VARIANTS`.
@@ -89,6 +99,17 @@ mod tests {
                 FACE_CELL * COLOR_VARIANTS as u32
             )
         );
+    }
+
+    #[test]
+    fn the_face_sheet_is_served_as_png_bytes() {
+        let bytes = face_sheet_png();
+        assert_eq!(
+            &bytes[..8],
+            b"\x89PNG\r\n\x1a\n",
+            "the URI route must serve a real PNG"
+        );
+        assert_eq!(bytes, SMILEYS_PNG, "the accessor serves the embedded sheet");
     }
 
     #[test]
