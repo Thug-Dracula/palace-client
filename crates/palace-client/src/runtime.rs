@@ -40,12 +40,15 @@ use crate::state::{
 const MEDIA_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const PROP_REQUEST_BUDGET: usize = 80;
 
-/// The `HS_*` types that are doors and can carry a lock on their `state`:
-/// `HS_Door`, `HS_ShutableDoor`, `HS_LockableDoor` (protocol reference
-/// :1664-1668). `HS_Bolt` (4) is not a door — it locks the door named by its
-/// `dest` — so it is never treated as one here.
+/// The `HS_*` types whose `state` may mean locked: `HS_Door` and
+/// `HS_LockableDoor` (protocol reference :1664-1668).
+///
+/// `HS_ShutableDoor` (2) is deliberately absent. Its two states are the pictures
+/// of a door that is opened and closed *by clicking*, so reading state 1 as
+/// "locked" would refuse the click that closes an open door — breaking the one
+/// thing that type exists for. `HS_Bolt` (4) is not a door either: it locks the
+/// door named by its `dest`.
 const HS_DOOR: i16 = 1;
-const HS_SHUTABLE_DOOR: i16 = 2;
 const HS_LOCKABLE_DOOR: i16 = 3;
 
 /// How to reach a server and what to draw with.
@@ -1946,18 +1949,16 @@ fn current_room_id(state: &SessionState) -> Option<i16> {
     state.room_desc.as_ref().map(|room| room.header.room_id)
 }
 
-/// True when `spot` is a door (`HS_Door`, `HS_ShutableDoor`, `HS_LockableDoor`)
-/// whose `state` is `HS_Lock`. A bolt (`HS_Bolt`, 4) locks the door named by its
-/// `dest` and is not itself a door, so a click on a bolt is never refused here.
+fn state_means_locked(hotspot_type: i16, state: i16) -> bool {
+    matches!(hotspot_type, HS_DOOR | HS_LOCKABLE_DOOR) && state == HS_LOCK
+}
+
 fn is_locked_door(state: &mut SessionState, spot: i32) -> bool {
     let Some(room_id) = current_room_id(state) else {
         return false;
     };
-    let info =
-        hotspot_mut(state, room_id, spot).map(|hotspot| (hotspot.hotspot_type, hotspot.state));
-    info.is_some_and(|(kind, value)| {
-        matches!(kind, HS_DOOR | HS_SHUTABLE_DOOR | HS_LOCKABLE_DOOR) && value == HS_LOCK
-    })
+    hotspot_mut(state, room_id, spot)
+        .is_some_and(|hotspot| state_means_locked(hotspot.hotspot_type, hotspot.state))
 }
 
 /// `SETLOC` / `SETLOCLOCAL`: `x y` are the spot's new absolute position, so this
@@ -2050,6 +2051,24 @@ fn set_pic_opacity(state: &mut SessionState, spot: i32, index: i32, opacity: f64
 mod tests {
     use super::*;
     use palace_wire::byteorder::ByteOrder;
+
+    #[test]
+    fn only_a_kind_of_door_that_can_be_locked_reads_state_one_as_locked() {
+        for door in [1_i16, 3] {
+            assert!(state_means_locked(door, 1), "type {door} state 1 is locked");
+            assert!(
+                !state_means_locked(door, 0),
+                "type {door} state 0 is unlocked"
+            );
+        }
+        assert!(
+            !state_means_locked(2, 1),
+            "a shuttable door's states are closed and open, so state 1 must not refuse its click"
+        );
+        for other in [0_i16, 4, 5] {
+            assert!(!state_means_locked(other, 1), "type {other} is not a door");
+        }
+    }
 
     #[test]
     fn a_session_cache_directory_is_legal_on_windows() {
