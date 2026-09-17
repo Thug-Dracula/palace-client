@@ -23,6 +23,7 @@
 
 use palace_prop::PropImage;
 
+use crate::draw::DrawList;
 use crate::error::AssetNote;
 
 /// Which "pictures above…" band a hotspot-state image overlay belongs to.
@@ -164,6 +165,10 @@ pub struct Scene {
     pub loose_props: Vec<Sprite>,
     /// Avatars, y-sorted by the compositor.
     pub avatars: Vec<Avatar>,
+    /// The room's draw commands, split into the back and front paint layers
+    /// with their undo history. Rasterized by the compositor at the reference
+    /// z-order (back under loose props, front over avatars).
+    pub draw: DrawList,
     /// Non-fatal asset problems worth reporting.
     pub notes: Vec<AssetNote>,
     /// Whether the compositor draws name tags. Defaults to `true`; a UI toggle
@@ -184,6 +189,7 @@ impl Default for Scene {
             overlays_above_everything: Vec::new(),
             loose_props: Vec::new(),
             avatars: Vec::new(),
+            draw: DrawList::new(),
             notes: Vec::new(),
             name_tags_visible: true,
         }
@@ -205,6 +211,7 @@ impl Scene {
             overlays_above_everything: Vec::new(),
             loose_props: Vec::new(),
             avatars: Vec::new(),
+            draw: DrawList::new(),
             notes: Vec::new(),
             name_tags_visible: true,
         }

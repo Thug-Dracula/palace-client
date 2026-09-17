@@ -10,6 +10,7 @@
 
 mod asset;
 mod chat;
+mod draw;
 mod lists;
 mod logon;
 mod pictures;
@@ -21,6 +22,7 @@ mod user;
 
 pub use asset::PropUpload;
 pub use chat::{Talk, Whisper};
+pub use draw::Draw;
 pub use lists::{RoomList, RoomListRec, UserList, UserListRec};
 pub use logon::{
     aux_flags, reference_logon_record, Authenticate, AuxRegistrationRec, ReferenceProfile,
@@ -104,6 +106,9 @@ pub enum Message {
     SpotMove(SpotMove),
     /// `pLoc` — a picture moved to an absolute position.
     PictMove(PictMove),
+    /// `draw` — one draw record for the current room. The record body is kept
+    /// raw; `palace_room::decode_draw_record` parses it.
+    Draw(Draw),
     /// `endr` — end of room description.
     RoomDescEnd,
     /// `talk` — public chat.
@@ -183,6 +188,7 @@ impl Message {
             opcode::SPOTDEL => Message::SpotDel(SpotDel::decode(r)?),
             opcode::SPOTMOVE => Message::SpotMove(SpotMove::decode(r)?),
             opcode::PICTMOVE => Message::PictMove(PictMove::decode(r)?),
+            opcode::DRAW => Message::Draw(Draw::decode(r)?),
             opcode::ROOMDESCEND => Message::RoomDescEnd,
             opcode::TALK => Message::Talk(Talk::decode(ref_num, r)?),
             opcode::WHISPER => Message::Whisper(Whisper::decode(ref_num, r)?),
@@ -306,6 +312,7 @@ impl Message {
                 "move picture: room={} spot={} v={} h={}",
                 m.room_id, m.spot_id, m.position.v, m.position.h
             ),
+            Message::Draw(d) => format!("draw record: {} raw byte(s)", d.len()),
             Message::Talk(t) => format!("talk: user_id={} {:?}", t.user_id, t.text),
             Message::Whisper(w) => format!(
                 "whisper: from={} to={} {:?}",
@@ -419,7 +426,7 @@ mod tests {
     use super::*;
     use crate::byteorder::Writer;
     use crate::opcode::{
-        AUTHENTICATE, DOORLOCK, DOORUNLOCK, LISTOFALLROOMS, LOGOFF, NAVERROR, PICTMOVE, PING,
+        AUTHENTICATE, DOORLOCK, DOORUNLOCK, DRAW, LISTOFALLROOMS, LOGOFF, NAVERROR, PICTMOVE, PING,
         PROPMOVE, SPOTDEL, SPOTMOVE, SPOTNEW, SPOTSTATE, TALK, USERFACE, USERNAME, USERPROP,
     };
 
@@ -580,6 +587,31 @@ mod tests {
             })
         );
         assert!(spot.describe().contains("state=1"));
+    }
+
+    #[test]
+    fn the_draw_message_reaches_its_arm_with_the_record_verbatim() {
+        // A 16-byte record: enough for the 10-byte header plus a stub operand.
+        let body: Vec<u8> = (0..16).collect();
+        let msg = Message::decode(DRAW, 0, &body, ByteOrder::Little).unwrap();
+        assert_eq!(
+            msg,
+            Message::Draw(Draw { body: body.clone() }),
+            "the record body is carried unchanged"
+        );
+        assert!(
+            !matches!(msg, Message::Unknown { .. }),
+            "draw must no longer fall through to Unknown"
+        );
+        let text = msg.describe();
+        assert!(
+            text.contains("draw"),
+            "the summary names the message: {text}"
+        );
+        assert!(
+            text.contains("16"),
+            "the summary reports the record size: {text}"
+        );
     }
 
     #[test]

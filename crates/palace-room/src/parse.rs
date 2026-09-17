@@ -572,6 +572,85 @@ fn parse_loose_props(
     out
 }
 
+/// Decode exactly one draw record from `bytes` at offset 0.
+///
+/// The live `MSG_DRAW` body is a **single** record in the same layout as one
+/// entry of a room's linked draw list, so this is the same reader run once at
+/// offset 0 rather than a second parser. The returned warnings are the record's
+/// recoverable problems; a slice shorter than the 10-byte header yields
+/// [`DrawCmd::default`] plus [`RoomWarning::DrawHeaderTruncated`]. It never
+/// panics and never reads past the slice.
+pub fn decode_draw_record(bytes: &[u8], order: ByteOrder) -> (DrawCmd, Vec<RoomWarning>) {
+    let mut warn = Vec::new();
+    let var = Var { buf: bytes, order };
+    let cmd = if var.bytes_at(0, DRAW_CMD_HEADER_LEN).is_none() {
+        warn.push(RoomWarning::DrawHeaderTruncated {
+            available: var.len(),
+        });
+        DrawCmd::default()
+    } else {
+        parse_draw_record_at(&var, 0, 0, &mut warn)
+    };
+    (cmd, warn)
+}
+
+/// Read the 10-byte header at `cursor` and its operand, bounds-checked.
+///
+/// The caller has already verified that the header fits. The operand always
+/// follows the header, whatever `data_ofst` says (see
+/// [`DRAW_CMD_DATA_OFFSET`](crate::DRAW_CMD_DATA_OFFSET)).
+fn parse_draw_record_at(
+    var: &Var<'_>,
+    cursor: usize,
+    index: usize,
+    warn: &mut Vec<RoomWarning>,
+) -> DrawCmd {
+    let next_ofst = var.i16_at(cursor).unwrap_or_default();
+    let reserved = var.i16_at(cursor + 2).unwrap_or_default();
+    let encoded = var.u16_at(cursor + 4).unwrap_or_default();
+    let cmd_length = var.u16_at(cursor + 6).unwrap_or_default();
+    let data_ofst = var.i16_at(cursor + 8).unwrap_or_default();
+    if reserved != 0 {
+        warn.push(RoomWarning::ReservedNonZero {
+            field: "DrawRecord.link.reserved",
+            value: reserved,
+        });
+    }
+    let command = (encoded & 0xFF) as u8;
+    let flags = (encoded >> 8) as u8;
+
+    let data_start = cursor.saturating_add(DRAW_CMD_HEADER_LEN);
+    let data = match var.bytes_at(data_start, cmd_length as usize) {
+        Some(slice) => slice.to_vec(),
+        None => {
+            warn.push(RoomWarning::DrawDataOutOfRange {
+                index,
+                record_ofst: to_i16(cursor),
+                data_ofst,
+                cmd_length,
+                available: var.len().saturating_sub(data_start),
+            });
+            vec![]
+        }
+    };
+    let payload = match command {
+        draw_cmd::PATH | draw_cmd::SHAPE | draw_cmd::ELLIPSE => {
+            decode_draw_payload(index, &data, var.order, warn)
+        }
+        _ => None,
+    };
+    DrawCmd {
+        next_ofst,
+        reserved,
+        command,
+        flags,
+        cmd_length,
+        data_ofst,
+        data,
+        payload,
+    }
+}
+
 fn parse_draw_cmds(var: &Var<'_>, header: &RoomRec, warn: &mut Vec<RoomWarning>) -> Vec<DrawCmd> {
     let declared = header.nbr_draw_cmds.max(0) as usize;
     if declared == 0 {
@@ -607,51 +686,10 @@ fn parse_draw_cmds(var: &Var<'_>, header: &RoomRec, warn: &mut Vec<RoomWarning>)
         }
         visited.push(cursor);
 
-        let next_ofst = var.i16_at(cursor).unwrap_or_default();
-        let reserved = var.i16_at(cursor + 2).unwrap_or_default();
-        let encoded = var.u16_at(cursor + 4).unwrap_or_default();
-        let cmd_length = var.u16_at(cursor + 6).unwrap_or_default();
-        let data_ofst = var.i16_at(cursor + 8).unwrap_or_default();
-        if reserved != 0 {
-            warn.push(RoomWarning::ReservedNonZero {
-                field: "DrawRecord.link.reserved",
-                value: reserved,
-            });
-        }
-        let command = (encoded & 0xFF) as u8;
-        let flags = (encoded >> 8) as u8;
-
-        // The operand always follows the header, whatever `data_ofst` says.
-        let data_start = cursor.saturating_add(DRAW_CMD_HEADER_LEN);
-        let data = match var.bytes_at(data_start, cmd_length as usize) {
-            Some(slice) => slice.to_vec(),
-            None => {
-                warn.push(RoomWarning::DrawDataOutOfRange {
-                    index,
-                    record_ofst: to_i16(cursor),
-                    data_ofst,
-                    cmd_length,
-                    available: var.len().saturating_sub(data_start),
-                });
-                vec![]
-            }
-        };
-        let payload = match command {
-            draw_cmd::PATH | draw_cmd::SHAPE | draw_cmd::ELLIPSE => {
-                decode_draw_payload(index, &data, var.order, warn)
-            }
-            _ => None,
-        };
-        out.push(DrawCmd {
-            next_ofst,
-            reserved,
-            command,
-            flags,
-            cmd_length,
-            data_ofst,
-            data,
-            payload,
-        });
+        let cmd = parse_draw_record_at(var, cursor, index, warn);
+        let next_ofst = cmd.next_ofst;
+        let cmd_length = cmd.cmd_length;
+        out.push(cmd);
 
         if next_ofst > 0 {
             cursor = next_ofst as usize;
