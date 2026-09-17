@@ -609,6 +609,24 @@ the server refuse the move. Guarded by
 re-admitted — the integration test for refusal uses a type-1 door from the captured corpus and would
 *not* have caught this.
 
+### Open questions the door work raised (questions, not answers)
+
+Two hotspot types exist whose *purpose* is a click action the client may be expected to send itself.
+We currently only run the hotspot's `ON SELECT` script on a click. That may be sufficient if the
+room's own script does the work — but neither of these has been checked against a reference client,
+so they are open rather than settled:
+
+- **`HS_Bolt` (4)** — "bolt that locks or unlocks door pointed to by `dest`" (:1668). If a client is
+  meant to send `DOORLOCK`/`DOORUNLOCK` for the door at `dest` when the bolt is clicked, we do not,
+  and clicking a bolt would do nothing unless the room's script covers it.
+- **`HS_ShutableDoor` (2)** — "a door that can be opened/closed (by clicking)" (:1666). Closing
+  implies something advances the door's state. Today that is whatever the room's script does; if the
+  client is meant to send `SPOTSTATE` itself, we do not.
+
+Both would be settled cheaply by reading how a reference client handles a click on those types.
+Neither is known to be broken — they are *unchecked*, which is a different thing, and the difference
+is worth keeping.
+
 **Verified by inversion:** flipping the state test so that an *unlocked* door read as locked broke
 four tests — the two door tests, plus `a_real_room_hotspot_script_dimroom_darkens_the_frame` and
 `entering_a_new_room_resets_the_dim`, because their hotspot click was refused and the script
