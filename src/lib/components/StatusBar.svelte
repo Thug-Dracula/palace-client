@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { store } from "../store.svelte";
+  import { faceColor, store } from "../store.svelte";
 
   const LABELS: Record<string, string> = {
     connecting: "connecting",
@@ -7,9 +7,24 @@
     disconnected: "disconnected",
     error: "error",
   };
+
+  // The server-assigned name is authoritative; the typed connect name is only
+  // a fallback for when the runtime has not listed us yet.
+  const self = $derived(store.users.find((user) => user.is_self) ?? null);
+  const who = $derived(self?.name || store.settings.username || "—");
 </script>
 
 <footer class="statusbar">
+  <span
+    class="whoami"
+    title={store.banner?.user_id != null ? `signed in as user id ${store.banner.user_id}` : "signed in"}
+  >
+    <span class="face" style="color:{faceColor(self?.color ?? 0)}"></span>
+    <span class="you-label">you</span>
+    <b>{who}</b>
+  </span>
+  <span class="sep"></span>
+
   <span class="dot {store.status}"></span>
   <span>{LABELS[store.status] ?? store.status}{store.statusMessage ? ` — ${store.statusMessage}` : ""}</span>
 

@@ -112,12 +112,14 @@
     tabindex="0"
     onclick={onClick}
     onkeydown={() => {}}
+    oncontextmenu={(event) => event.preventDefault()}
   >
     {#if store.screen && geometry}
       <img
         class="frame"
         src={api.frameUrl(store.screen.version)}
         alt={`Room ${store.screen.room_name}`}
+        draggable="false"
         style="left:{geometry.content_x}px; top:{geometry.content_y}px; width:{geometry.content_w}px; height:{geometry.content_h}px;"
       />
       <div class="badge">

@@ -167,9 +167,33 @@ input {
   font-variant-numeric: tabular-nums;
 }
 
-.row.self .name::after {
-  content: " (you)";
-  color: var(--text-3);
+.row.self {
+  background: var(--cyan-soft);
+  border-left-color: var(--cyan);
+  color: var(--text-0);
+}
+
+.row.self:hover {
+  background: var(--cyan-soft);
+  border-left-color: var(--cyan);
+  color: var(--text-0);
+}
+
+.row.self .name {
+  color: var(--cyan);
+  font-weight: 700;
+}
+
+.row .you-tag {
+  flex: none;
+  padding: 1px 5px;
+  font-size: var(--fs-xs);
+  line-height: 1.3;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--bg-void);
+  background: var(--cyan);
+  border-radius: var(--r-xs);
 }
 
 .face {
@@ -514,6 +538,43 @@ input[type="range"]::-webkit-slider-thumb {
   flex: 1;
 }
 
+.statusbar .sep {
+  width: 1px;
+  height: 16px;
+  flex: none;
+  background: var(--line-strong);
+}
+
+.statusbar .whoami {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: none;
+  padding: 2px var(--sp-3) 2px var(--sp-2);
+  background: var(--surface-3);
+  border: 1px solid var(--line-strong);
+  border-left: 2px solid var(--amber);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow-inset);
+}
+
+.statusbar .whoami .you-label {
+  font-size: var(--fs-xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.statusbar .whoami b {
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  color: var(--amber);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .statusbar .kv {
   display: inline-flex;
   gap: 6px;
@@ -548,6 +609,12 @@ input[type="range"]::-webkit-slider-thumb {
   image-rendering: crisp-edges;
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.7), 0 12px 40px rgba(0, 0, 0, 0.55);
   background: #000;
+  /* The frame is presentation only: let clicks/drag/selection fall through to
+     .viewport so the runtime still receives them through the click handler. */
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
 }
 
 .viewport .empty {
