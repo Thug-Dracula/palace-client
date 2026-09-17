@@ -708,6 +708,49 @@ Work order for "fully implemented":
   `has_prop_by_name`, `LOADPROPS`, `PAINTUNDO`.
 - [ ] Fix the `SHELLCMD` doc/dispatch mismatch and the `ClearLooseProps` wire classification.
 
+### 2.21 Live diagnosis: the trace log
+
+`PALACE_TRACE=<file>` makes the runtime write every frame received and sent (opcode,
+length, ref, decoded meaning), every script event with its scope, handler count, effects and
+problems, every `ClientEvent`, and the state transitions that matter. Off unless set, standard
+library only, never able to fail a session. `live-smoke` honours it too.
+
+It exists because the runtime previously had **no logging at all**, so live behaviour could only
+be inferred from static scripts and from the four lines the interface happens to show — which is
+how a live bug was mis-diagnosed three times in a row.
+
+**What the first real session showed.** Entering Colosseum 5v5 (`31749`):
+
+```text
+send   opcode=navR(ROOMGOTO) ref=730 room=31749
+recv   opcode=room(ROOMDESC) id=31749 name="The Colosseum (5 vs 5)" hotspots=23 pictures=9 draws=0
+script event=ENTER fired=16 effects=[SETPROPS [976933367], STATUSMSG "Colosseum ...", SETSPOTSTATELOCAL spot=730 state=0]
+send   opcode=usrP(USERPROP) ref=730 len=12 msg=user props: id=730 props=976933367
+```
+
+The room hands the player the pass prop and the client sends it (§2.16). **No ejection, and no
+`GOTOROOM 31743` anywhere in the session.** So direct entry to the arena is clean; a bounce must
+come from a different route, and the trace will name the handler responsible.
+
+**The recurring disconnects are the server, not us:**
+
+```text
+recv opcode=bye (LOGOFF) ref=729 len=4
+recv opcode=down(SERVERDOWN) ref=10 len=0      <- the server announcing it is going down
+event [status] Error io: Connection reset by peer
+```
+
+`SERVERDOWN` appears in probes from **before** the prop work, so it is not something we send. The
+Colosseum server appears to be cycling; a restart mid-session drops the client out of its room and
+reconnects it elsewhere, which is an independent candidate for "booted back to the menu".
+
+**Still dropped on receive:** `draw(DRAW)` (five times in one short session) — the peer-drawing
+message. Its body is a **single draw record** in the same layout as one entry of the room's linked
+list (`OpenPalace` `handleDrawCommand` reads `size` bytes into `PalaceDrawRecord.readData`), where
+`DC_Delete` undoes the last command of the layer it was added to and `DC_Detonate` clears
+everything. `palace-room` already models these records; the live message and the rasterizer are a
+separate task.
+
 ---
 
 ## Part 3 — How to verify
