@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use palace_host::ScriptEvent;
 use palace_render::RoomDesc;
 use palace_room::{LooseProp, LoosePropSpec};
 use palace_wire::byteorder::ByteOrder;
@@ -93,6 +94,21 @@ pub struct ChatLine {
     pub kind: ChatKind,
 }
 
+/// A script event a decoded frame asks the host to run.
+///
+/// [`SessionState::apply`] is the only place a frame's meaning is known, so it
+/// records each event here and the runtime dispatches it after the model is
+/// updated. `spot` names the hotspot the handler is scoped to (LOCK, UNLOCK,
+/// STATECHANGE); `None` runs the room-level handlers, exactly as
+/// `Enter`/`InChat` do through `run_dispatch(..., only)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScriptStimulus {
+    /// The event to run.
+    pub event: ScriptEvent,
+    /// The hotspot the event is scoped to, or `None` for a room-level event.
+    pub spot: Option<i32>,
+}
+
 /// What one frame changed, so the runtime knows what to re-emit or re-render.
 #[derive(Debug, Default, Clone)]
 pub struct Applied {
@@ -104,6 +120,11 @@ pub struct Applied {
     pub render: bool,
     pub media_base: bool,
     pub outbound: Vec<Frame>,
+    /// Script events this frame asks the host to run, in decode order.
+    ///
+    /// The runtime dispatches each exactly once, after the model has taken the
+    /// frame's change, so a handler sees the state the frame produced.
+    pub scripts: Vec<ScriptStimulus>,
 }
 
 /// The live model of one session.
@@ -401,10 +422,16 @@ impl SessionState {
                 applied.render = true;
             }
             Message::UserExit(exit) => {
-                self.users.remove(&exit.user_id);
+                let was_known = self.users.remove(&exit.user_id).is_some();
                 self.room_users.retain(|id| *id != exit.user_id);
                 applied.users = true;
                 applied.render = true;
+                if was_known && exit.user_id != self.banner.user_id {
+                    applied.scripts.push(ScriptStimulus {
+                        event: ScriptEvent::UserLeave,
+                        spot: None,
+                    });
+                }
             }
             Message::UserStatus(_) => {}
             Message::UserFace(face) => {
@@ -421,6 +448,12 @@ impl SessionState {
                 let changed = self.set_user_name(name.user_id, &name.name);
                 applied.users = changed;
                 applied.render = changed;
+                if changed {
+                    applied.scripts.push(ScriptStimulus {
+                        event: ScriptEvent::NameChange,
+                        spot: None,
+                    });
+                }
             }
             Message::UserProp(prop) => {
                 let changed = self.set_user_props(prop.user_id, &prop.props);
@@ -462,28 +495,37 @@ impl SessionState {
                 }
             }
             Message::DoorLock(lock) => {
-                applied.render = set_local_spot_state(
-                    self,
-                    lock.room_id,
-                    i32::from(lock.door_id),
-                    i32::from(HS_LOCK),
-                );
+                let door = i32::from(lock.door_id);
+                applied.render = set_local_spot_state(self, lock.room_id, door, i32::from(HS_LOCK));
+                if applied.render {
+                    applied.scripts.push(ScriptStimulus {
+                        event: ScriptEvent::Lock,
+                        spot: Some(door),
+                    });
+                }
             }
             Message::DoorUnlock(lock) => {
-                applied.render = set_local_spot_state(
-                    self,
-                    lock.room_id,
-                    i32::from(lock.door_id),
-                    i32::from(HS_UNLOCK),
-                );
+                let door = i32::from(lock.door_id);
+                applied.render =
+                    set_local_spot_state(self, lock.room_id, door, i32::from(HS_UNLOCK));
+                if applied.render {
+                    applied.scripts.push(ScriptStimulus {
+                        event: ScriptEvent::Unlock,
+                        spot: Some(door),
+                    });
+                }
             }
             Message::SpotState(spot) => {
-                applied.render = set_local_spot_state(
-                    self,
-                    spot.room_id,
-                    i32::from(spot.spot_id),
-                    i32::from(spot.state),
-                );
+                let spot_id = i32::from(spot.spot_id);
+                let previous = self.spot_state_in_room(spot.room_id, spot_id);
+                applied.render =
+                    set_local_spot_state(self, spot.room_id, spot_id, i32::from(spot.state));
+                if previous.is_some_and(|previous| previous != spot.state) {
+                    applied.scripts.push(ScriptStimulus {
+                        event: ScriptEvent::StateChange,
+                        spot: Some(spot_id),
+                    });
+                }
             }
             Message::SpotDel(del) => {
                 applied.render = remove_local_hotspot(self, i32::from(del.spot_id));
@@ -584,6 +626,21 @@ impl SessionState {
         }
 
         applied
+    }
+
+    /// The `state` field of a hotspot in `room_id`, when that room is the one
+    /// being shown and the hotspot exists. `None` otherwise, which is how a
+    /// `SPOTSTATE` for another room (or an absent spot) avoids a change event.
+    fn spot_state_in_room(&self, room_id: i16, spot: i32) -> Option<i16> {
+        let room = self.room_desc.as_ref()?;
+        if room.header.room_id != room_id {
+            return None;
+        }
+        let spot = i16::try_from(spot).ok()?;
+        room.hotspots
+            .iter()
+            .find(|hotspot| hotspot.id == spot)
+            .map(|hotspot| hotspot.state)
     }
 
     /// A user the session knows about, or `None` for an id that cannot name one.
@@ -1179,6 +1236,14 @@ mod tests {
         );
         assert!(applied.render, "the lock recomposes the room");
         assert_eq!(hotspot_state(&state, 7), HS_LOCK);
+        assert_eq!(
+            applied.scripts,
+            vec![ScriptStimulus {
+                event: ScriptEvent::Lock,
+                spot: Some(7),
+            }],
+            "a lock runs the door's ON LOCK"
+        );
 
         let applied = state.apply(
             &Frame::new(opcode::DOORUNLOCK, 0, door_body(86, 7)),
@@ -1186,6 +1251,14 @@ mod tests {
         );
         assert!(applied.render);
         assert_eq!(hotspot_state(&state, 7), HS_UNLOCK);
+        assert_eq!(
+            applied.scripts,
+            vec![ScriptStimulus {
+                event: ScriptEvent::Unlock,
+                spot: Some(7),
+            }],
+            "an unlock runs the door's ON UNLOCK"
+        );
     }
 
     #[test]
@@ -1197,6 +1270,130 @@ mod tests {
         );
         assert!(applied.render);
         assert_eq!(hotspot_state(&state, 105), 1);
+        assert_eq!(
+            applied.scripts,
+            vec![ScriptStimulus {
+                event: ScriptEvent::StateChange,
+                spot: Some(105),
+            }],
+            "a changed spot runs that hotspot's ON STATECHANGE"
+        );
+
+        let applied = state.apply(
+            &Frame::new(opcode::SPOTSTATE, 0, spot_state_body(86, 105, 1)),
+            ByteOrder::Little,
+        );
+        assert!(
+            applied.scripts.is_empty(),
+            "the same value is not a state change"
+        );
+    }
+
+    #[test]
+    fn a_foreign_room_spot_message_records_no_script_event() {
+        let mut state = room_state();
+        for (opcode, body) in [
+            (opcode::DOORLOCK, door_body(999, 7)),
+            (opcode::DOORUNLOCK, door_body(999, 7)),
+            (opcode::SPOTSTATE, spot_state_body(999, 105, 1)),
+        ] {
+            let applied = state.apply(&Frame::new(opcode, 0, body), ByteOrder::Little);
+            assert!(
+                applied.scripts.is_empty(),
+                "{} for another room must run nothing here",
+                opcode.describe()
+            );
+        }
+        let applied = state.apply(
+            &Frame::new(opcode::DOORLOCK, 0, door_body(86, 32000)),
+            ByteOrder::Little,
+        );
+        assert!(
+            applied.scripts.is_empty(),
+            "a lock for a hotspot this room lacks runs nothing"
+        );
+    }
+
+    #[test]
+    fn a_name_change_records_a_room_level_namechange_once() {
+        let mut state = room_state();
+        add_user(&mut state, 21);
+
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_pstring("Rico");
+        let applied = state.apply(
+            &Frame::new(opcode::USERNAME, 21, w.into_vec()),
+            ByteOrder::Little,
+        );
+        assert_eq!(state.users[&21].name, "Rico");
+        assert_eq!(
+            applied.scripts,
+            vec![ScriptStimulus {
+                event: ScriptEvent::NameChange,
+                spot: None,
+            }],
+            "usrN runs the room's ON NAMECHANGE"
+        );
+
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_pstring("Rico");
+        let applied = state.apply(
+            &Frame::new(opcode::USERNAME, 21, w.into_vec()),
+            ByteOrder::Little,
+        );
+        assert!(
+            applied.scripts.is_empty(),
+            "a usrN that does not change the name runs nothing"
+        );
+
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_pstring("Ghost");
+        let applied = state.apply(
+            &Frame::new(opcode::USERNAME, 99, w.into_vec()),
+            ByteOrder::Little,
+        );
+        assert!(
+            applied.scripts.is_empty(),
+            "usrN renames a known user, it does not introduce one"
+        );
+    }
+
+    #[test]
+    fn only_a_non_self_exit_records_a_room_level_userleave() {
+        let mut state = room_state();
+        add_user(&mut state, 21);
+
+        let applied = state.apply(
+            &Frame::new(opcode::USEREXIT, 21, Vec::new()),
+            ByteOrder::Little,
+        );
+        assert_eq!(
+            applied.scripts,
+            vec![ScriptStimulus {
+                event: ScriptEvent::UserLeave,
+                spot: None,
+            }],
+            "another user's exit runs the room's ON USERLEAVE"
+        );
+
+        add_user(&mut state, SELF);
+        let applied = state.apply(
+            &Frame::new(opcode::USEREXIT, SELF, Vec::new()),
+            ByteOrder::Little,
+        );
+        assert!(
+            applied.scripts.is_empty(),
+            "our own exit must not run ON USERLEAVE"
+        );
+
+        let applied = state.apply(
+            &Frame::new(opcode::USEREXIT, 99, Vec::new()),
+            ByteOrder::Little,
+        );
+        assert!(
+            applied.scripts.is_empty(),
+            "an exit for an unknown user runs nothing"
+        );
     }
 
     #[test]

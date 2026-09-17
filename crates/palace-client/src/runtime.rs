@@ -35,7 +35,8 @@ use crate::error::{ClientError, Result};
 use crate::frame::{FrameStore, ScreenState, ViewGeometry};
 use crate::session::{Connection, POLL_SLICE};
 use crate::state::{
-    ChatKind, ChatLine, ConnectionStatus, RoomInfo, ServerBanner, SessionState, UserInfo, HS_LOCK,
+    ChatKind, ChatLine, ConnectionStatus, RoomInfo, ScriptStimulus, ServerBanner, SessionState,
+    UserInfo, HS_LOCK,
 };
 
 const MEDIA_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
@@ -955,6 +956,16 @@ fn run_session(
                         }
                     }
                 }
+                for event in dispatch_scripts(
+                    &mut scripts,
+                    &applied.scripts,
+                    &mut state,
+                    shared,
+                    &mut conn,
+                    &mut dirty_render,
+                ) {
+                    shared.emit(event);
+                }
                 for mut line in applied.chat {
                     if matches!(line.kind, ChatKind::Talk | ChatKind::Whisper)
                         && scripts.has_handler(ScriptEvent::InChat)
@@ -1436,6 +1447,35 @@ fn report_event(report: &palace_host::DispatchReport) -> ClientEvent {
             .filter_map(|run| run.error.clone())
             .collect(),
     }
+}
+
+/// Dispatch every script event a decoded frame recorded.
+///
+/// Each entry is fired exactly once, in decode order, after `state.apply` has
+/// taken the frame's change. Nothing here synthesises a follow-up stimulus from
+/// a handler's effects, so a handler that sets spot state cannot re-enter this
+/// loop; the alarm path's "will not compound" note is its equivalent.
+fn dispatch_scripts(
+    scripts: &mut ScriptEngine,
+    stimuli: &[ScriptStimulus],
+    state: &mut SessionState,
+    shared: &Arc<Shared>,
+    conn: &mut Connection,
+    dirty_render: &mut bool,
+) -> Vec<ClientEvent> {
+    let mut out = Vec::new();
+    for stimulus in stimuli {
+        out.extend(run_dispatch(
+            scripts,
+            stimulus.event,
+            state,
+            shared,
+            conn,
+            dirty_render,
+            stimulus.spot,
+        ));
+    }
+    out
 }
 
 /// Dispatch one event and apply everything it asked for.
@@ -2818,5 +2858,364 @@ mod tests {
             "past the last colour clamps to the last"
         );
         assert_eq!(normalize_color(9_999), 15);
+    }
+
+    use std::net::TcpListener;
+
+    use palace_room::{Hotspot, RoomDesc};
+    use palace_wire::messages::RoomRec;
+
+    const HARNESS_SELF: i32 = 13;
+    const HARNESS_ROOM: i16 = 901;
+
+    fn scripted_room(scripts: &[(i16, &str)]) -> RoomDesc {
+        let hotspots: Vec<Hotspot> = scripts
+            .iter()
+            .map(|(id, source)| Hotspot {
+                id: *id,
+                state: 0,
+                script: Some((*source).to_string()),
+                ..Hotspot::default()
+            })
+            .collect();
+        RoomDesc {
+            header: RoomRec {
+                room_id: HARNESS_ROOM,
+                nbr_hotspots: hotspots.len() as i16,
+                ..RoomRec::default()
+            },
+            name: "Scripted".to_string(),
+            picture: String::new(),
+            artist: String::new(),
+            password: String::new(),
+            pictures: Vec::new(),
+            hotspots,
+            loose_props: Vec::new(),
+            draw_cmds: Vec::new(),
+            var_data: Vec::new(),
+            trailing_len: 0,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn state_in(room: &RoomDesc) -> SessionState {
+        let mut state = SessionState::new("test", 1);
+        state.status = ConnectionStatus::Connected;
+        state.banner.user_id = HARNESS_SELF;
+        state.current_room = Some(RoomInfo {
+            id: i32::from(HARNESS_ROOM),
+            name: room.name.clone(),
+            users: 1,
+            flags: 0,
+        });
+        state.room_desc = Some(room.clone());
+        state.users.insert(
+            HARNESS_SELF,
+            UserInfo {
+                id: HARNESS_SELF,
+                name: "Self".to_string(),
+                face: 0,
+                color: 0,
+                room_id: HARNESS_ROOM,
+                x: 0,
+                y: 0,
+                props: Vec::new(),
+                away: false,
+                is_self: true,
+            },
+        );
+        state
+    }
+
+    fn add_other_user(state: &mut SessionState, id: i32) {
+        state.users.insert(
+            id,
+            UserInfo {
+                id,
+                name: format!("user-{id}"),
+                face: 0,
+                color: 0,
+                room_id: HARNESS_ROOM,
+                x: 0,
+                y: 0,
+                props: Vec::new(),
+                away: false,
+                is_self: false,
+            },
+        );
+    }
+
+    struct Harness {
+        shared: Arc<Shared>,
+        conn: Connection,
+        _drain: thread::JoinHandle<()>,
+    }
+
+    fn harness() -> Harness {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener binds");
+        let port = listener.local_addr().expect("listener address").port();
+        let drain = thread::spawn(move || {
+            use std::io::Read;
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut sink = [0u8; 256];
+                while stream.read(&mut sink).is_ok_and(|read| read > 0) {}
+            }
+        });
+        let conn = Connection::connect("127.0.0.1", port, Duration::from_secs(2))
+            .expect("loopback connection");
+        let (events, _rx) = unbounded_channel();
+        let shared = Arc::new(Shared {
+            cfg: ClientConfig::default(),
+            frames: Arc::new(FrameStore::new()),
+            events,
+            viewport: Mutex::new(ViewportSpec::default()),
+            running: AtomicBool::new(true),
+            chat_seq: AtomicU64::new(0),
+            debug_frames: false,
+            last_room: Mutex::new(None),
+            transform: Mutex::new(None),
+            mouse: Mutex::new((0, 0)),
+            room_size: Mutex::new((512.0, 384.0)),
+        });
+        Harness {
+            shared,
+            conn,
+            _drain: drain,
+        }
+    }
+
+    fn dispatch_from_frame(
+        scripts: &mut ScriptEngine,
+        state: &mut SessionState,
+        harness: &mut Harness,
+        frame: &Frame,
+    ) -> Vec<ClientEvent> {
+        let applied = state.apply(frame, ByteOrder::Little);
+        let mut dirty_render = false;
+        dispatch_scripts(
+            scripts,
+            &applied.scripts,
+            state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty_render,
+        )
+    }
+
+    fn note_texts(events: &[ClientEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ClientEvent::Note { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fired(events: &[ClientEvent], event: &str) -> usize {
+        events
+            .iter()
+            .filter_map(|item| match item {
+                ClientEvent::Script {
+                    event: name, fired, ..
+                } if name == event => Some(*fired),
+                _ => None,
+            })
+            .sum()
+    }
+
+    fn door_body(room: i16, door: i16) -> Vec<u8> {
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(room);
+        w.write_i16(door);
+        w.into_vec()
+    }
+
+    fn spot_state_body(room: i16, spot: i16, state: i16) -> Vec<u8> {
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(room);
+        w.write_i16(spot);
+        w.write_i16(state);
+        w.into_vec()
+    }
+
+    fn name_body(name: &str) -> Vec<u8> {
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_pstring(name);
+        w.into_vec()
+    }
+
+    #[test]
+    fn a_door_lock_frame_runs_only_the_named_hotspots_lock_handler() {
+        let room = scripted_room(&[
+            (7, "ON LOCK { \"lock-7\" STATUSMSG }"),
+            (8, "ON LOCK { \"lock-8\" STATUSMSG }"),
+        ]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        scripts.load_room(&room);
+        let mut state = state_in(&room);
+        let mut harness = harness();
+
+        let events = dispatch_from_frame(
+            &mut scripts,
+            &mut state,
+            &mut harness,
+            &Frame::new(opcode::DOORLOCK, 0, door_body(HARNESS_ROOM, 7)),
+        );
+
+        let notes = note_texts(&events);
+        assert_eq!(fired(&events, "LOCK"), 1, "one ON LOCK ran: {notes:?}");
+        assert!(
+            notes.iter().any(|note| note.contains("lock-7")),
+            "the handler for hotspot 7 ran: {notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("lock-8")),
+            "hotspot 8's handler is out of scope: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_door_unlock_frame_runs_only_the_named_hotspots_unlock_handler() {
+        let room = scripted_room(&[
+            (7, "ON UNLOCK { \"unlock-7\" STATUSMSG }"),
+            (8, "ON UNLOCK { \"unlock-8\" STATUSMSG }"),
+        ]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        scripts.load_room(&room);
+        let mut state = state_in(&room);
+        let mut harness = harness();
+
+        let events = dispatch_from_frame(
+            &mut scripts,
+            &mut state,
+            &mut harness,
+            &Frame::new(opcode::DOORUNLOCK, 0, door_body(HARNESS_ROOM, 7)),
+        );
+
+        let notes = note_texts(&events);
+        assert_eq!(fired(&events, "UNLOCK"), 1, "one ON UNLOCK ran: {notes:?}");
+        assert!(
+            notes.iter().any(|note| note.contains("unlock-7")),
+            "the handler for hotspot 7 ran: {notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("unlock-8")),
+            "hotspot 8's handler is out of scope: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_spot_state_frame_runs_only_the_changed_hotspots_statechange_handler() {
+        let room = scripted_room(&[
+            (7, "ON STATECHANGE { \"state-7\" STATUSMSG }"),
+            (8, "ON STATECHANGE { \"state-8\" STATUSMSG }"),
+        ]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        scripts.load_room(&room);
+        let mut state = state_in(&room);
+        let mut harness = harness();
+
+        let events = dispatch_from_frame(
+            &mut scripts,
+            &mut state,
+            &mut harness,
+            &Frame::new(opcode::SPOTSTATE, 0, spot_state_body(HARNESS_ROOM, 7, 1)),
+        );
+
+        let notes = note_texts(&events);
+        assert_eq!(
+            fired(&events, "STATECHANGE"),
+            1,
+            "one ON STATECHANGE ran: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("state-7")),
+            "the handler for hotspot 7 ran: {notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|note| note.contains("state-8")),
+            "hotspot 8's handler is out of scope: {notes:?}"
+        );
+        let hotspot = state
+            .room_desc
+            .as_ref()
+            .expect("a room")
+            .hotspots
+            .iter()
+            .find(|hotspot| hotspot.id == 7)
+            .expect("hotspot 7");
+        assert_eq!(
+            hotspot.state, 1,
+            "the handler ran after the model took the new state"
+        );
+    }
+
+    #[test]
+    fn a_name_change_runs_the_rooms_namechange_handler() {
+        let room = scripted_room(&[(7, "ON NAMECHANGE { \"namechange-ran\" STATUSMSG }")]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        scripts.load_room(&room);
+        let mut state = state_in(&room);
+        add_other_user(&mut state, 21);
+        let mut harness = harness();
+
+        let events = dispatch_from_frame(
+            &mut scripts,
+            &mut state,
+            &mut harness,
+            &Frame::new(opcode::USERNAME, 21, name_body("Rico")),
+        );
+
+        let notes = note_texts(&events);
+        assert_eq!(
+            fired(&events, "NAMECHANGE"),
+            1,
+            "the room's ON NAMECHANGE ran: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("namechange-ran")),
+            "the handler body ran: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_user_exit_runs_the_rooms_userleave_handler_but_not_for_us() {
+        let room = scripted_room(&[(7, "ON USERLEAVE { \"userleave-ran\" STATUSMSG }")]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        scripts.load_room(&room);
+        let mut state = state_in(&room);
+        add_other_user(&mut state, 21);
+        let mut harness = harness();
+
+        let events = dispatch_from_frame(
+            &mut scripts,
+            &mut state,
+            &mut harness,
+            &Frame::new(opcode::USEREXIT, 21, Vec::new()),
+        );
+        let notes = note_texts(&events);
+        assert_eq!(
+            fired(&events, "USERLEAVE"),
+            1,
+            "the room's ON USERLEAVE ran: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("userleave-ran")),
+            "the handler body ran: {notes:?}"
+        );
+
+        let own_exit = dispatch_from_frame(
+            &mut scripts,
+            &mut state,
+            &mut harness,
+            &Frame::new(opcode::USEREXIT, HARNESS_SELF, Vec::new()),
+        );
+        assert_eq!(
+            fired(&own_exit, "USERLEAVE"),
+            0,
+            "our own exit must not run ON USERLEAVE: {:?}",
+            note_texts(&own_exit)
+        );
     }
 }
