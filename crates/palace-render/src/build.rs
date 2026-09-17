@@ -50,6 +50,10 @@ pub struct AvatarSpec {
     pub x: i32,
     /// Room y of the avatar anchor.
     pub y: i32,
+    /// Face index into the built-in sheet (clamped to `0..=12` when drawn).
+    pub face: i16,
+    /// Colour index into the built-in sheet (clamped to `0..=15` when drawn).
+    pub color: i16,
     /// Optional label, for reporting only.
     pub name: Option<String>,
     /// Worn prop ids, drawn in order (up to nine in the real client).
@@ -58,14 +62,27 @@ pub struct AvatarSpec {
 
 impl AvatarSpec {
     /// An avatar wearing `props` at `(x, y)`.
+    ///
+    /// The built-in face defaults to cell `(0, 0)`; use [`AvatarSpec::with_face_color`]
+    /// to select a different one.
     #[must_use]
     pub fn new(x: i32, y: i32, props: Vec<u32>) -> Self {
         AvatarSpec {
             x,
             y,
+            face: 0,
+            color: 0,
             name: None,
             props,
         }
+    }
+
+    /// Builder-style setter for the built-in face cell.
+    #[must_use]
+    pub fn with_face_color(mut self, face: i16, color: i16) -> Self {
+        self.face = face;
+        self.color = color;
+        self
     }
 }
 
@@ -315,6 +332,10 @@ impl SceneBuilder {
     }
 
     /// Stack an avatar's worn props around its anchor.
+    ///
+    /// The built-in face is added under the props unless a worn prop carries the
+    /// `HEAD` flag (`Avatar.mxml`'s `checkFaceProps`), so a prop-less user — one
+    /// the old runtime skipped entirely — is still visible.
     fn build_avatar(
         &self,
         x: i32,
@@ -322,15 +343,28 @@ impl SceneBuilder {
         spec: &AvatarSpec,
         notes: &mut Vec<AssetNote>,
     ) -> Avatar {
-        let mut parts = Vec::with_capacity(spec.props.len());
+        let mut parts = Vec::with_capacity(spec.props.len() + 1);
+        let mut has_head_prop = false;
         for id in &spec.props {
             let decoded = self.props.prop_or_placeholder(*id, notes);
+            has_head_prop |= decoded.is_head;
             parts.push(AvatarPart {
                 dx: -AVATAR_HALF + i32::from(decoded.h_offset),
                 dy: -AVATAR_HALF + i32::from(decoded.v_offset),
                 image: decoded.image,
                 alpha: decoded.alpha,
             });
+        }
+        if !has_head_prop {
+            parts.insert(
+                0,
+                AvatarPart {
+                    image: crate::face::smiley_cell(spec.face, spec.color),
+                    dx: 0,
+                    dy: 0,
+                    alpha: 1.0,
+                },
+            );
         }
         Avatar { x, y, parts }
     }
@@ -502,8 +536,9 @@ mod tests {
         assert_eq!((avatar.x, avatar.y), (300, 200));
         // The compositor places a part at (avatar.x + dx, avatar.y + dy), so dx
         // must be the -22 box half plus the prop offset, never the absolute x.
-        assert_eq!(avatar.parts[0].dx, -AVATAR_HALF + 7);
-        assert_eq!(avatar.parts[0].dy, -AVATAR_HALF + 7);
+        let worn_prop_after_the_face = avatar.parts.get(1).expect("the worn prop is present");
+        assert_eq!(worn_prop_after_the_face.dx, -AVATAR_HALF + 7);
+        assert_eq!(worn_prop_after_the_face.dy, -AVATAR_HALF + 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -527,5 +562,153 @@ mod tests {
             .notes
             .iter()
             .any(|n| matches!(n, AssetNote::MissingProp { id: 1 })));
+    }
+
+    fn empty_room() -> RoomDesc {
+        palace_room::decode_payload(&[0u8; 40], palace_wire::ByteOrder::Little).expect("empty room")
+    }
+
+    fn canvas_pixel(canvas: &crate::canvas::Canvas, x: u32, y: u32) -> [u8; 4] {
+        let at = ((y as usize) * (canvas.width() as usize) + x as usize) * 4;
+        let s = &canvas.as_rgba()[at..at + 4];
+        [s[0], s[1], s[2], s[3]]
+    }
+
+    fn first_opaque(image: &PropImage) -> (u32, u32) {
+        for y in 0..image.height() {
+            for x in 0..image.width() {
+                if matches!(image.pixel(x, y), Some(pixel) if pixel[3] == 255) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("this face cell has no opaque pixels");
+    }
+
+    fn store_with_prop(tag: &str, id: u32, flags: u16) -> (std::path::PathBuf, PropStore) {
+        let dir =
+            std::env::temp_dir().join(format!("palace-render-face-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let image = PropImage::from_rgba(44, 44, vec![255; 44 * 44 * 4]).expect("image");
+        let blob = palace_prop::encode_s20_blob(&image, 7, 7, flags).expect("encode");
+        std::fs::write(dir.join(format!("{id}_unnamed.bin")), &blob).expect("write");
+        let mut props = PropStore::new();
+        props.add_directory(&dir);
+        (dir, props)
+    }
+
+    #[test]
+    fn a_prop_less_avatar_renders_its_face_cell_at_the_anchor() {
+        use crate::compositor::{render, RenderOptions};
+
+        let scene = builder().build(
+            &empty_room(),
+            &[AvatarSpec::new(200, 150, vec![]).with_face_color(3, 5)],
+        );
+        let avatar = &scene.avatars[0];
+        assert_eq!(avatar.parts.len(), 1, "a prop-less avatar is just its face");
+        let face = &avatar.parts[0];
+        assert_eq!(
+            (face.dx, face.dy),
+            (0, 0),
+            "the trimmed cell draws at the anchor"
+        );
+        assert_eq!(
+            face.image,
+            crate::face::smiley_cell(3, 5),
+            "the (3, 5) cell, not some other"
+        );
+
+        let canvas = render(&scene, RenderOptions::at_dpr(1.0));
+        let (fx, fy) = first_opaque(&face.image);
+        assert_eq!(
+            canvas_pixel(&canvas, 200 + fx, 150 + fy),
+            face.image.pixel(fx, fy).expect("in bounds"),
+            "the face's pixels reach the frame at (avatar.x, avatar.y)"
+        );
+    }
+
+    #[test]
+    fn different_face_and_colour_cells_render_different_pixels() {
+        use crate::compositor::{render, RenderOptions};
+
+        let room = empty_room();
+        let one = builder().build(
+            &room,
+            &[AvatarSpec::new(200, 150, vec![]).with_face_color(0, 0)],
+        );
+        let two = builder().build(
+            &room,
+            &[AvatarSpec::new(200, 150, vec![]).with_face_color(4, 6)],
+        );
+        let a = render(&one, RenderOptions::at_dpr(1.0));
+        let b = render(&two, RenderOptions::at_dpr(1.0));
+        assert_ne!(
+            a.as_rgba(),
+            b.as_rgba(),
+            "two different (face, colour) values must not render identically"
+        );
+    }
+
+    #[test]
+    fn a_head_prop_hides_the_builtin_face() {
+        let (dir, props) = store_with_prop("head", 7001, palace_prop::FLAG_HEAD);
+        let scene_builder = SceneBuilder::new(MediaStore::default(), props);
+        let scene = scene_builder.build(
+            &empty_room(),
+            &[AvatarSpec::new(300, 200, vec![7001]).with_face_color(2, 4)],
+        );
+        let avatar = &scene.avatars[0];
+        assert_eq!(avatar.parts.len(), 1, "only the head prop is drawn");
+        assert_ne!(
+            avatar.parts[0].image,
+            crate::face::smiley_cell(2, 4),
+            "the head prop must suppress the built-in face, not sit beside it"
+        );
+        assert_eq!(
+            avatar.parts[0].dx,
+            -AVATAR_HALF + 7,
+            "the prop keeps its header offset"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_head_prop_keeps_the_builtin_face() {
+        let (dir, props) = store_with_prop("body", 7002, 0);
+        let scene_builder = SceneBuilder::new(MediaStore::default(), props);
+        let scene = scene_builder.build(
+            &empty_room(),
+            &[AvatarSpec::new(300, 200, vec![7002]).with_face_color(1, 2)],
+        );
+        let avatar = &scene.avatars[0];
+        assert_eq!(avatar.parts.len(), 2, "face plus the worn prop");
+        assert_eq!(avatar.parts[0].image, crate::face::smiley_cell(1, 2));
+        assert_eq!((avatar.parts[0].dx, avatar.parts[0].dy), (0, 0));
+        assert_eq!(avatar.parts[1].dx, -AVATAR_HALF + 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn out_of_range_face_and_colour_are_clamped_when_drawn() {
+        use crate::compositor::{render, RenderOptions};
+
+        let room = empty_room();
+        let wild = builder().build(
+            &room,
+            &[AvatarSpec::new(200, 150, vec![]).with_face_color(99, -7)],
+        );
+        let edge = builder().build(
+            &room,
+            &[AvatarSpec::new(200, 150, vec![]).with_face_color(12, 0)],
+        );
+        assert_eq!(
+            wild.avatars[0].parts[0].image, edge.avatars[0].parts[0].image,
+            "out-of-range values clamp to the edge cell"
+        );
+        let a = render(&wild, RenderOptions::at_dpr(1.0));
+        let b = render(&edge, RenderOptions::at_dpr(1.0));
+        assert_eq!(a.as_rgba(), b.as_rgba(), "and the frames match");
     }
 }
