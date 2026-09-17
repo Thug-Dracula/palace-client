@@ -263,7 +263,7 @@ fn register_palace_commands_installs_every_name_and_is_idempotent() {
     );
     for spec in PALACE_COMMANDS {
         let kind = set.get(spec.name);
-        if core.contains(spec.name) {
+        if core.contains(spec.name) && spec.name != "IPTVERSION" {
             assert_ne!(kind, Some(CommandKind::Host), "core {} must win", spec.name);
         } else {
             assert_eq!(kind, Some(CommandKind::Host), "{} must register", spec.name);

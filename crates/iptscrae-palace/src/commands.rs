@@ -205,9 +205,8 @@ pub const PALACE_COMMANDS: &[CommandSpec] = &[
 
 /// Register every Palace command name as a host command.
 ///
-/// Names already bound to a core builtin are left alone: `ALARMEXEC`,
-/// `GREPSTR` and `IPTVERSION` belong to the generic engine, and a Palace client
-/// only overrides their *behaviour*, not their identity.
+/// Core names keep their core binding, except `IPTVERSION`, which is overridden
+/// deliberately — the note in the body says why.
 ///
 /// Returns how many names were newly registered.
 pub fn register_palace_commands(set: &mut CommandSet) -> usize {
@@ -216,6 +215,11 @@ pub fn register_palace_commands(set: &mut CommandSet) -> usize {
         set.register_builtin("SGLOBAL", iptscrae::Builtin::Global);
         added += 1;
     }
+    // Deliberate override of a core name: the generic engine answers 1, a Palace
+    // client answers 2, and scripts branch on it. The reference client removes
+    // and re-adds this command for the same reason. Left core-bound, every
+    // `IPTVERSION 1 ==` legacy branch fired on a modern client.
+    set.register_host("IPTVERSION");
     for cmd in PALACE_COMMANDS {
         if set.register_host_if_absent(cmd.name) {
             added += 1;

@@ -125,6 +125,10 @@ impl Host for SkeletonHost {
 
     fn command(&mut self, name: &str, _args: &[Value]) -> Result<Vec<Value>> {
         *self.invocations.entry(name.to_owned()).or_insert(0) += 1;
+        // A Palace host answers the version banner as a Palace client does.
+        if name.eq_ignore_ascii_case("IPTVERSION") {
+            return Ok(vec![Value::Int(2)]);
+        }
         match command_spec(name) {
             Some(spec) => Ok(stub_values(spec)),
             None => Ok(Vec::new()),

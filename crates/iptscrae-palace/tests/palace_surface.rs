@@ -87,6 +87,16 @@ fn userid_and_username_read_through_the_trait() {
 }
 
 #[test]
+fn iptversion_reports_the_palace_version_not_the_generic_one() {
+    let mut engine = SkeletonHost::engine();
+    assert_eq!(
+        engine.run_source_resolved("IPTVERSION").unwrap(),
+        vec![Value::Int(2)],
+        "scripts branch on this; the generic engine's 1 sends them down legacy paths"
+    );
+}
+
+#[test]
 fn unimplemented_palace_commands_are_refused_not_ignored() {
     struct Client;
     impl iptscrae::Host for Client {}
