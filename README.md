@@ -48,27 +48,6 @@ the client accepts any host and port, either from the command line
 (`--host`/`--port`, `PALACE_HOST` and friends) or from the connect box in the
 window, and the protocol is the same everywhere.
 
-## What this client does not do yet
-
-- **No sound or music playback.** A room script's `SOUND`, `MIDIPLAY`,
-  `MIDILOOP` and `MIDISTOP` calls are decoded and surfaced to the interface, but
-  nothing reaches an audio device.
-- **Draw commands, name tags and chat text are not rasterized** into the room
-  image. The room's stored draw commands are decoded and kept, but not painted.
-- **Some script effects are recorded but not applied to the room**, so a script
-  appears to run while the room stays the same. Six of these change what you
-  should see: adding, moving or removing a **loose prop**, and changing your
-  **face or colour**. Room dimming (`DIMROOM`) was in the same state and is now
-  fixed. See the effect-application note in `STATUS.md` for the full list and the
-  pattern for fixing the rest.
-- **Avatar art for other users is untested live.** The compositor draws avatars,
-  but the development server had no other users online, so the asset transfer
-  that would supply their props was never exercised against a real peer.
-- **No live big-endian or HTTP-tunnel server was available.** Both paths exist
-  and are unit-tested, but no such server was reachable to prove them end to end.
-- **Guest logon only.** Authenticated (password) logon has not been attempted.
-
-
 ## Project status
 
 An honest snapshot: what is finished, what is not, and what stands between this
@@ -122,8 +101,9 @@ Alongside those, these subsystems are missing or incomplete:
 
 - **Audio.** Nothing plays.
 - **Drawing.** `LINE` reaches the server but is not rasterized locally;
-  `CIRCLE`, `FILL`, `PAINT` and `TEXT` are unimplemented; and the `DRAW` opcode
-  that carries other people's strokes is dropped on receipt.
+  `CIRCLE`, `FILL`, `PAINT` and `TEXT` are unimplemented; the `DRAW` opcode that
+  carries other people's strokes is dropped on receipt; and chat text is not
+  painted into the room image.
 - **Dynamic room content.** `ADDPIC`, `ADDSPOT` and `SETSPOTSCRIPT` — the
   commands rooms use to build their own interfaces.
 - **HTTP.** `HTTPGET` and `LOADSCRIPT`. The response to a fetch is itself a
@@ -139,6 +119,9 @@ Alongside those, these subsystems are missing or incomplete:
 - **Live verification is thinner than the unit tests.** Several receive paths
   are proven against a mock harness but have not been exercised against a busy
   server.
+- **No live big-endian or HTTP-tunnel server has been reachable.** Both paths
+  exist and are unit-tested, but neither has been proven end to end against a
+  real server.
 - **Asset transfer for other users' avatars** is untested against a real peer.
 - **Multi-block asset transfer and 16-bit props** are reference-derived, and the
   loose-prop artwork for the available corpus is missing from local stores.
