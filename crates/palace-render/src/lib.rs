@@ -58,6 +58,7 @@ pub mod canvas;
 pub mod compositor;
 pub mod corpus;
 pub mod error;
+pub mod face;
 pub mod image_clut;
 pub mod scene;
 pub mod viewport;
@@ -71,6 +72,7 @@ pub use canvas::Canvas;
 pub use compositor::{draw_into, render, sort_avatars, AnimationClock, RenderOptions};
 pub use corpus::RoomSource;
 pub use error::{AssetNote, RenderError};
+pub use face::{smiley_cell, COLOR_VARIANTS, FACE_CELL, FACE_VARIANTS};
 pub use scene::{
     layer_for_hotspot_flags, Avatar, AvatarPart, Layer, Scene, Sprite, FLAG_PICTURES_ABOVE_ALL,
     FLAG_PICTURES_ABOVE_NAME_TAGS, FLAG_PICTURES_ABOVE_PROPS,
