@@ -10,30 +10,21 @@
 
 use std::time::{Duration, Instant};
 
-use palace_client::{ClientConfig, ClientEvent, ClientHandle, ClientRuntime};
+use palace_client::{trace, ClientConfig, ClientEvent, ClientHandle, ClientRuntime};
 
 fn env_or(key: &str, fallback: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| fallback.to_string())
 }
 
 fn report(event: &ClientEvent) -> bool {
+    println!("{}", trace::describe_client_event(event));
     match event {
-        ClientEvent::Status { status, message } => println!("[status] {status:?} {message:?}"),
-        ClientEvent::Banner { banner } => println!(
-            "[banner] {} v{:?} media={:?} users={:?}",
-            banner.name.as_deref().unwrap_or("?"),
-            banner.version,
-            banner.media_base,
-            banner.total_users
-        ),
         ClientEvent::Rooms { rooms } => {
-            println!("[rooms] {}", rooms.len());
             for room in rooms.iter().take(100) {
                 println!("        #{} {:?} users={}", room.id, room.name, room.users);
             }
         }
         ClientEvent::Users { users } => {
-            println!("[users] {}", users.len());
             for user in users {
                 println!(
                     "        #{} {:?} face={} color={} props={} at ({},{})",
@@ -47,38 +38,14 @@ fn report(event: &ClientEvent) -> bool {
                 );
             }
         }
-        ClientEvent::RoomEntered { room } => {
-            println!("[room] #{} {:?} users={}", room.id, room.name, room.users)
-        }
-        ClientEvent::Chat { line } => {
-            println!("[chat:{:?}] {}: {}", line.kind, line.name, line.text)
-        }
         ClientEvent::Screen { screen } => {
-            println!(
-                "[screen] v{} room {} {}x{} buffer {}x{} scale {:.3} dpr {} avatars={} loose={} pending={}",
-                screen.version,
-                screen.room_id,
-                screen.geometry.room_w,
-                screen.geometry.room_h,
-                screen.geometry.bitmap_w,
-                screen.geometry.bitmap_h,
-                screen.geometry.scale,
-                screen.geometry.dpr,
-                screen.avatars,
-                screen.loose_props,
-                screen.props_pending
-            );
             for note in &screen.notes {
                 println!("        note: {note}");
             }
         }
         ClientEvent::Script {
-            event,
-            fired,
-            effects,
-            problems,
+            effects, problems, ..
         } => {
-            println!("[script] ON {event}: {fired} handler(s) fired");
             for effect in effects {
                 println!("        effect: {effect}");
             }
@@ -86,7 +53,11 @@ fn report(event: &ClientEvent) -> bool {
                 println!("        problems: {problems:?}");
             }
         }
-        ClientEvent::Note { text } => println!("[note] {text}"),
+        ClientEvent::Status { .. }
+        | ClientEvent::Banner { .. }
+        | ClientEvent::RoomEntered { .. }
+        | ClientEvent::Chat { .. }
+        | ClientEvent::Note { .. } => {}
     }
     matches!(event, ClientEvent::Screen { .. })
 }

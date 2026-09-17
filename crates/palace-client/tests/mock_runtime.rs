@@ -20,6 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use palace_client::runtime::ClientRuntime;
+use palace_client::trace::{self, Tracer};
 use palace_client::{
     ChatKind, ClientConfig, ClientEvent, ClientHandle, ConnectionStatus, RoomInfo, ScreenState,
     ServerBanner, UserInfo,
@@ -4600,4 +4601,220 @@ fn a_spot_move_for_this_room_recomposes_and_a_foreign_one_does_not() {
     drop(server);
     cleanup(&cache);
     cleanup(&seed);
+}
+
+// ---------------------------------------------------------------------------
+// The opt-in trace
+// ---------------------------------------------------------------------------
+
+/// The tracer is process-wide, so the tests that install one must not overlap.
+static TRACE_LOCK: Mutex<()> = Mutex::new(());
+
+fn trace_guard() -> std::sync::MutexGuard<'static, ()> {
+    TRACE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn trace_text(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+#[test]
+fn a_live_session_records_frames_scripts_effects_and_events_in_the_trace() {
+    let _guard = trace_guard();
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let server = MockServer::start(server_bytes(&fixture));
+    let cache = unique_temp_dir("trace-cache");
+    let seed = seed_media_dir(&room);
+    let probe = unique_temp_dir("trace-out");
+    let trace_path = probe.join("session.log");
+
+    trace::install(Some(Arc::new(
+        Tracer::to_path(&trace_path).expect("the trace file opens"),
+    )));
+
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    // A room must arrive first so the lifecycle scripts have fired.
+    let events = collect_events(
+        &mut rx,
+        |collected| !screens(collected).is_empty(),
+        Duration::from_secs(20),
+    );
+    assert!(
+        !screens(&events).is_empty(),
+        "the session composed a frame before the trace was read"
+    );
+    assert!(
+        wait_for(
+            || trace_text(&trace_path).contains("room_arrived room=901"),
+            Duration::from_secs(5)
+        ),
+        "the room arrival reached the trace"
+    );
+
+    // A navigation request, a worn-prop change and a chat line give the trace
+    // one of each sent frame the arena diagnosis needs.
+    handle.goto_room(903);
+    assert!(
+        wait_for(
+            || {
+                server
+                    .received_frames(order)
+                    .iter()
+                    .any(|frame| frame.opcode == opcode::ROOMGOTO)
+                    && trace_text(&trace_path).contains("room=903")
+            },
+            Duration::from_secs(5)
+        ),
+        "the navR request and its destination were traced"
+    );
+    handle.set_props(vec![99]);
+    handle.say("trace probe");
+    assert!(
+        wait_for(
+            || {
+                let sent = server.received_frames(order);
+                sent.iter().any(|frame| frame.opcode == opcode::USERPROP)
+                    && sent.iter().any(|frame| frame.opcode == opcode::TALK)
+                    && trace_text(&trace_path).contains("worn_props user=13 ids=[99]")
+            },
+            Duration::from_secs(5)
+        ),
+        "the prop change and chat were traced"
+    );
+    let _ = collect_events(&mut rx, |_| false, Duration::from_millis(300));
+
+    handle.disconnect();
+    drop(server);
+    let text = trace_text(&trace_path);
+    trace::install(None);
+    cleanup(&cache);
+    cleanup(&seed);
+    cleanup(&probe);
+
+    assert!(
+        text.contains("opcode=tiyr(TIYID)") && text.contains("recv "),
+        "every received frame is traced with its opcode: {text}"
+    );
+    assert!(
+        text.contains("opcode=regi(LOGON)") && text.contains("send "),
+        "every sent frame is traced with its opcode: {text}"
+    );
+    assert!(
+        text.contains("opcode=navR(ROOMGOTO)") && text.contains("room=903"),
+        "the room-change request names its destination: {text}"
+    );
+    assert!(
+        text.contains("worn_props user=13 ids=[99]"),
+        "the worn-prop change is recorded: {text}"
+    );
+    assert!(
+        text.contains("script event=") && text.contains("fired="),
+        "script dispatches with their handler counts are recorded: {text}"
+    );
+    assert!(
+        text.contains("[room] #901"),
+        "the emitted RoomEntered event is recorded as the harness renders it: {text}"
+    );
+    assert!(
+        text.contains("event  [note]") || text.contains("event [note]"),
+        "the emitted notes are recorded: {text}"
+    );
+    assert!(
+        text.contains("room_arrived room=901") && text.contains("nav_request room=903"),
+        "the state transitions are recorded: {text}"
+    );
+}
+
+#[test]
+fn a_trace_write_failure_does_not_break_the_session() {
+    let _guard = trace_guard();
+    let fixture = logon_fixture();
+    let room = room_desc(&fixture);
+    let server = MockServer::start(server_bytes(&fixture));
+    let cache = unique_temp_dir("trace-fail-cache");
+    let seed = seed_media_dir(&room);
+
+    // `/dev/full` accepts the open and fails every write — the "sink went away
+    // mid-session" case. On a platform without it, a path that cannot be opened
+    // proves the same degradation.
+    let full = Path::new("/dev/full");
+    let failing = full
+        .exists()
+        .then(|| Tracer::to_path(full).expect("opening /dev/full succeeds"));
+    if let Some(failing) = failing {
+        trace::install(Some(Arc::new(failing)));
+    } else {
+        let missing = unique_temp_dir("trace-missing").join("no/such/dir/log");
+        assert!(
+            Tracer::to_path(&missing).is_err(),
+            "an unopenable target is an error, not a panic"
+        );
+        trace::install(None);
+    }
+
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+    let events = collect_events(
+        &mut rx,
+        |collected| !screens(collected).is_empty(),
+        Duration::from_secs(20),
+    );
+    handle.disconnect();
+    drop(server);
+    trace::install(None);
+    cleanup(&cache);
+    cleanup(&seed);
+
+    assert!(
+        !screens(&events).is_empty(),
+        "the session keeps producing frames while the trace sink fails"
+    );
+    assert!(
+        !trace::enabled(),
+        "the failing tracer did not latch the gate on"
+    );
+}
+
+#[test]
+fn with_tracing_unset_the_session_runs_and_creates_no_trace_file() {
+    let _guard = trace_guard();
+    trace::install(None);
+    assert!(!trace::enabled(), "tracing starts off");
+    assert!(trace::tracer().is_none(), "no tracer is installed");
+
+    let fixture = logon_fixture();
+    let room = room_desc(&fixture);
+    let server = MockServer::start(server_bytes(&fixture));
+    let cache = unique_temp_dir("trace-unset-cache");
+    let seed = seed_media_dir(&room);
+
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+    let events = collect_events(
+        &mut rx,
+        |collected| !screens(collected).is_empty(),
+        Duration::from_secs(20),
+    );
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+
+    assert!(
+        !screens(&events).is_empty(),
+        "the session behaves exactly as before with tracing unset"
+    );
+    assert!(
+        !trace::enabled() && trace::tracer().is_none(),
+        "nothing turned tracing on during the session"
+    );
 }
