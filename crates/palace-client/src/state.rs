@@ -509,6 +509,12 @@ impl SessionState {
                     "server announced a new hotspot without describing it; this room is stale",
                 ));
             }
+            Message::Authenticate => {
+                applied.chat.push(self.system_line(
+                    ChatKind::Error,
+                    "server asked this client to authenticate; it cannot answer yet, so logon will not complete",
+                ));
+            }
             Message::RoomDescription(_) => {
                 match palace_room::decode_payload(&frame.payload, order) {
                     Ok(room) => {
@@ -843,6 +849,25 @@ mod tests {
             .iter()
             .map(|prop| prop.spec.id)
             .collect()
+    }
+
+    #[test]
+    fn an_authenticate_request_is_reported_rather_than_ignored() {
+        let mut state = room_state();
+
+        let applied = state.apply(
+            &Frame::new(opcode::AUTHENTICATE, 0, Vec::new()),
+            ByteOrder::Little,
+        );
+
+        assert!(
+            applied
+                .chat
+                .iter()
+                .any(|line| line.text.contains("authenticate")),
+            "a server asking for authentication must be reported, because silence here is an unexplained stall: {:?}",
+            applied.chat
+        );
     }
 
     #[test]
