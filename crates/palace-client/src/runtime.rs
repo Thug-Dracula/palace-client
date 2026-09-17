@@ -18,11 +18,12 @@ use palace_host::{
 };
 use palace_render::{
     clamp_dpr, render, AnimationClock, AvatarSpec, MediaStore, PointF, PropStore, RenderOptions,
-    SceneBuilder, SizeF, ViewTransform,
+    SceneBuilder, SizeF, ViewTransform, COLOR_VARIANTS, FACE_VARIANTS,
 };
+use palace_room::{LooseProp, LoosePropSpec};
 use palace_wire::byteorder::Writer;
 use palace_wire::frame::Frame;
-use palace_wire::messages::{reference_logon_record, Talk};
+use palace_wire::messages::{reference_logon_record, Point, Talk};
 use palace_wire::opcode;
 use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -1570,8 +1571,132 @@ fn apply_effect(
         Effect::Unsupported { command } => vec![ClientEvent::Note {
             text: format!("script: {command} is not implemented"),
         }],
-        other => vec![ClientEvent::Note {
-            text: format!("script: {other}"),
+
+        // An out-of-range face has no agreed meaning: OpenPalace clamps the *wire*
+        // value to 0..15 (`PalaceClient.setFace`) but its user model then maps
+        // anything past the last face to 0 (`PalaceUser.as`: `if (newValue > 12)
+        // newValue = 0`), QPalace ignores a face of 13 or more outright
+        // (`connection.hpp`), and ThePalacev0 wraps modulo 16 (`Index.js`). The
+        // rule here follows OpenPalace's model, because this renderer draws
+        // OpenPalace's sheet and face rules, so a script's face lands where an
+        // OpenPalace user would see it.
+        Effect::SetFace { face } => {
+            let changed = set_self_face(state, *face);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!("script: SETFACE {face}{}", no_change_suffix(changed)),
+            }]
+        }
+        Effect::SetColor { color } => {
+            let changed = set_self_color(state, *color);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!("script: SETCOLOR {color}{}", no_change_suffix(changed)),
+            }]
+        }
+
+        Effect::DonProp { prop } => {
+            let changed = prop_id(*prop).is_some_and(|id| wear_prop(state, id));
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!("script: DONPROP {prop}{}", no_change_suffix(changed)),
+            }]
+        }
+        Effect::DoffProp => {
+            let changed = doff_prop(state).is_some();
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!("script: DOFFPROP{}", no_change_suffix(changed)),
+            }]
+        }
+        Effect::RemoveProp { prop } => {
+            let changed = prop_id(*prop).is_some_and(|id| remove_worn_prop(state, id));
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!("script: REMOVEPROP {prop}{}", no_change_suffix(changed)),
+            }]
+        }
+
+        // `REMOVELOOSEPROP` and `MOVELOOSEPROP` address a prop by its list index,
+        // not by id. That index is the server's `propNum`, numbering props in the
+        // order they were added, and a client's list is built by walking
+        // `firstLProp` forward and appending — `PalaceClient.as` loads the room
+        // that way and then applies the script's index to that same list before
+        // forwarding it on — so it indexes `room.loose_props` directly.
+        Effect::AddLooseProp { prop, x, y } => {
+            let changed = prop_id(*prop).is_some_and(|id| add_loose_prop(state, id, *x, *y));
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: ADDLOOSEPROP {prop} at ({x},{y}){}",
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
+        Effect::RemoveLooseProp { index } => {
+            let changed = remove_loose_prop(state, *index);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: REMOVELOOSEPROP {index}{}",
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
+        Effect::MoveLooseProp { index, x, y } => {
+            let changed = move_loose_prop(state, *index, *x, *y);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: MOVELOOSEPROP {index} to ({x},{y}){}",
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
+        // `DROPPROP` takes off the most recently worn prop and leaves it on the
+        // floor where you are (`PalaceController.dropProp`).
+        Effect::DropProp { x, y } => {
+            let dropped = drop_prop(state, *x, *y);
+            *dirty_render |= dropped.is_some();
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: DROPPROP at ({x},{y}){}",
+                    no_change_suffix(dropped.is_some())
+                ),
+            }]
+        }
+
+        // The pen belongs to the host: `ScriptHost::pen` owns the position, colour,
+        // width and layer, and `wire_context` reads it when a stroke is encoded,
+        // so these have already taken effect by the time the effect arrives.
+        // Nothing rasterizes a stroke yet (`LINE` and `LINETO` are dispatched and
+        // dropped), so there is no local pen state to keep in step with.
+        Effect::MovePen { x, y } => vec![ClientEvent::Note {
+            text: format!("script: PENPOS ({x},{y})"),
+        }],
+        Effect::SetPenColor { r, g, b } => vec![ClientEvent::Note {
+            text: format!("script: PENCOLOR ({r},{g},{b})"),
+        }],
+        Effect::SetPenSize { size } => vec![ClientEvent::Note {
+            text: format!("script: PENSIZE {size}"),
+        }],
+        Effect::PaintLayer { front } => vec![ClientEvent::Note {
+            text: format!("script: {}", if *front { "PENFRONT" } else { "PENBACK" }),
+        }],
+
+        // A lock rides the wire as `DOORLOCK` / `DOORUNLOCK`, so the room's other
+        // occupants see it. This client keeps no lock state of its own — nothing
+        // consults it, because a click does not yet refuse to open a locked door.
+        Effect::Lock { spot } => vec![ClientEvent::Note {
+            text: format!("script: LOCK {spot}"),
+        }],
+        Effect::Unlock { spot } => vec![ClientEvent::Note {
+            text: format!("script: UNLOCK {spot}"),
+        }],
+        // The alarm is already scheduled: `ScriptHost` records it and the engine
+        // runs the handler when it falls due.
+        Effect::SetSpotAlarm { spot, ticks } => vec![ClientEvent::Note {
+            text: format!("script: SETALARM spot {spot} in {ticks} ticks"),
         }],
     }
 }
@@ -1592,9 +1717,147 @@ fn set_local_spot_state(state: &mut SessionState, spot: i32, value: i32) -> bool
     true
 }
 
+fn no_change_suffix(applied: bool) -> &'static str {
+    if applied {
+        ""
+    } else {
+        " (no change)"
+    }
+}
+
+fn prop_id(raw: i64) -> Option<u32> {
+    u32::try_from(raw).ok()
+}
+
+/// How many props a user may wear at once (`PalaceUser.wearProp`).
+const MAX_WORN_PROPS: usize = 9;
+
+/// `(x, y)` as a wire `Point`, which stores `(v, h)` = `(y, x)`.
+fn point(x: i32, y: i32) -> Point {
+    Point::new(y as i16, x as i16)
+}
+
+/// Change the signed-in user's face cell, following OpenPalace's model rule:
+/// floor at 0, and anything past the last defined face becomes face 0.
+fn set_self_face(state: &mut SessionState, face: i32) -> bool {
+    let face = if face > i32::from(FACE_VARIANTS - 1) {
+        0
+    } else {
+        face.max(0)
+    } as i16;
+    let Some(user) = state.users.get_mut(&state.banner.user_id) else {
+        return false;
+    };
+    let changed = user.face != face;
+    user.face = face;
+    changed
+}
+
+fn set_self_color(state: &mut SessionState, color: i32) -> bool {
+    let color = color.clamp(0, i32::from(COLOR_VARIANTS - 1)) as i16;
+    let Some(user) = state.users.get_mut(&state.banner.user_id) else {
+        return false;
+    };
+    let changed = user.color != color;
+    user.color = color;
+    changed
+}
+
+/// Wear one more prop, appending it to the worn list. A prop already worn, or a
+/// tenth prop, is refused rather than evicting an older one.
+fn wear_prop(state: &mut SessionState, prop: u32) -> bool {
+    let Some(user) = state.users.get_mut(&state.banner.user_id) else {
+        return false;
+    };
+    if user.props.len() >= MAX_WORN_PROPS || user.props.contains(&prop) {
+        return false;
+    }
+    user.props.push(prop);
+    true
+}
+
+fn doff_prop(state: &mut SessionState) -> Option<u32> {
+    state
+        .users
+        .get_mut(&state.banner.user_id)
+        .and_then(|user| user.props.pop())
+}
+
+fn remove_worn_prop(state: &mut SessionState, prop: u32) -> bool {
+    let Some(user) = state.users.get_mut(&state.banner.user_id) else {
+        return false;
+    };
+    let Some(at) = user.props.iter().position(|worn| *worn == prop) else {
+        return false;
+    };
+    user.props.remove(at);
+    true
+}
+
+/// Put a prop on the floor. Only the id and the position reach the wire, so every
+/// other field of the record is zero.
+fn add_loose_prop(state: &mut SessionState, prop: u32, x: i32, y: i32) -> bool {
+    let Some(room) = state.room_desc.as_mut() else {
+        return false;
+    };
+    room.loose_props.push(LooseProp {
+        next_ofst: 0,
+        reserved: 0,
+        spec: LoosePropSpec { id: prop, crc: 0 },
+        flags: 0,
+        ref_con: 0,
+        loc: point(x, y),
+    });
+    true
+}
+
+/// Drop one loose prop by index, or every one when the index is `-1`.
+fn remove_loose_prop(state: &mut SessionState, index: i32) -> bool {
+    let Some(room) = state.room_desc.as_mut() else {
+        return false;
+    };
+    if index == -1 {
+        let changed = !room.loose_props.is_empty();
+        room.loose_props.clear();
+        return changed;
+    }
+    let Ok(index) = usize::try_from(index) else {
+        return false;
+    };
+    if index >= room.loose_props.len() {
+        return false;
+    }
+    room.loose_props.remove(index);
+    true
+}
+
+fn move_loose_prop(state: &mut SessionState, index: i32, x: i32, y: i32) -> bool {
+    let Some(room) = state.room_desc.as_mut() else {
+        return false;
+    };
+    let Ok(index) = usize::try_from(index) else {
+        return false;
+    };
+    let Some(prop) = room.loose_props.get_mut(index) else {
+        return false;
+    };
+    prop.loc = point(x, y);
+    true
+}
+
+fn drop_prop(state: &mut SessionState, x: i32, y: i32) -> Option<u32> {
+    let prop = *state.users.get(&state.banner.user_id)?.props.last()?;
+    if !add_loose_prop(state, prop, x, y) {
+        return None;
+    }
+    let _ = remove_worn_prop(state, prop);
+    Some(prop)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use palace_wire::byteorder::ByteOrder;
 
     fn user(id: i32, props: Vec<u32>) -> UserInfo {
         UserInfo {
@@ -1609,6 +1872,234 @@ mod tests {
             away: false,
             is_self: false,
         }
+    }
+
+    const SELF_ID: i32 = 7;
+
+    fn session_with_self() -> SessionState {
+        let mut state = SessionState::new("test", 1);
+        state.banner.user_id = SELF_ID;
+        let mut me = user(SELF_ID, vec![]);
+        me.is_self = true;
+        state.users.insert(SELF_ID, me);
+        state
+    }
+
+    fn session_in_room() -> SessionState {
+        let mut state = session_with_self();
+        let room = palace_room::decode_payload(
+            include_bytes!("../../../fixtures/rooms/86.bin"),
+            ByteOrder::Little,
+        )
+        .expect("the fixture room decodes");
+        state.room_desc = Some(room);
+        state
+    }
+
+    fn loose_ids(state: &SessionState) -> Vec<u32> {
+        state
+            .room_desc
+            .as_ref()
+            .expect("a room")
+            .loose_props
+            .iter()
+            .map(|prop| prop.spec.id)
+            .collect()
+    }
+
+    #[test]
+    fn setface_past_the_last_face_falls_back_to_face_zero() {
+        let mut state = session_with_self();
+        assert!(set_self_face(&mut state, 4));
+        assert_eq!(state.users[&SELF_ID].face, 4);
+        assert!(set_self_face(&mut state, 13), "13 is outside the sheet");
+        assert_eq!(
+            state.users[&SELF_ID].face, 0,
+            "OpenPalace maps past-the-end to 0"
+        );
+        assert!(set_self_face(&mut state, 6));
+        assert!(set_self_face(&mut state, -1), "a negative face floors at 0");
+        assert_eq!(state.users[&SELF_ID].face, 0);
+        assert!(
+            !set_self_face(&mut state, 0),
+            "an unchanged face is no change"
+        );
+    }
+
+    #[test]
+    fn setcolor_clamps_to_the_palette() {
+        let mut state = session_with_self();
+        assert!(set_self_color(&mut state, 10));
+        assert_eq!(state.users[&SELF_ID].color, 10);
+        assert!(set_self_color(&mut state, 16), "16 clamps down to 15");
+        assert_eq!(state.users[&SELF_ID].color, 15);
+        assert!(set_self_color(&mut state, -3), "-3 clamps up to 0");
+        assert_eq!(state.users[&SELF_ID].color, 0);
+        assert!(
+            !set_self_color(&mut state, 0),
+            "an unchanged colour is no change"
+        );
+    }
+
+    #[test]
+    fn donprop_appends_and_refuses_a_duplicate_or_a_tenth() {
+        let mut state = session_with_self();
+        assert!(wear_prop(&mut state, 10));
+        assert!(wear_prop(&mut state, 20));
+        assert_eq!(
+            state.users[&SELF_ID].props,
+            vec![10, 20],
+            "the newest goes last"
+        );
+        assert!(!wear_prop(&mut state, 10), "a prop already worn is refused");
+        assert_eq!(state.users[&SELF_ID].props, vec![10, 20]);
+        for id in 30..40 {
+            wear_prop(&mut state, id);
+        }
+        assert_eq!(state.users[&SELF_ID].props.len(), MAX_WORN_PROPS);
+        assert!(
+            !wear_prop(&mut state, 99),
+            "a tenth prop is refused, not swapped in"
+        );
+        assert_eq!(state.users[&SELF_ID].props.len(), MAX_WORN_PROPS);
+    }
+
+    #[test]
+    fn doffprop_takes_the_most_recent_and_removeprop_the_named_one() {
+        let mut state = session_with_self();
+        for id in [10, 20, 30] {
+            wear_prop(&mut state, id);
+        }
+        assert_eq!(doff_prop(&mut state), Some(30));
+        assert_eq!(state.users[&SELF_ID].props, vec![10, 20]);
+        assert!(remove_worn_prop(&mut state, 10));
+        assert_eq!(state.users[&SELF_ID].props, vec![20]);
+        assert!(
+            !remove_worn_prop(&mut state, 10),
+            "removing it twice does nothing"
+        );
+        assert_eq!(doff_prop(&mut state), Some(20));
+        assert_eq!(doff_prop(&mut state), None, "nothing left to take off");
+    }
+
+    #[test]
+    fn addlooseprop_appends_a_record_at_the_scripted_position() {
+        let mut state = session_in_room();
+        let before = loose_ids(&state).len();
+        assert!(add_loose_prop(&mut state, 0xA26F_9DE3, 120, 240));
+        assert_eq!(loose_ids(&state).len(), before + 1);
+        let added = &state.room_desc.as_ref().unwrap().loose_props[before];
+        assert_eq!(added.spec.id, 0xA26F_9DE3);
+        assert_eq!(added.spec.crc, 0, "the wire carries no crc for a new prop");
+        assert_eq!(
+            (added.loc.h, added.loc.v),
+            (120, 240),
+            "loc stores x in h and y in v"
+        );
+        assert_eq!((added.flags, added.ref_con, added.next_ofst), (0, 0, 0));
+    }
+
+    #[test]
+    fn removelooseprop_removes_by_index_and_clears_everything_for_minus_one() {
+        let mut state = session_in_room();
+        let base = loose_ids(&state).len();
+        for (id, x, y) in [(1_u32, 10, 10), (2, 20, 20), (3, 30, 30)] {
+            add_loose_prop(&mut state, id, x, y);
+        }
+        assert!(remove_loose_prop(&mut state, base as i32 + 1));
+        assert_eq!(
+            loose_ids(&state)[base..],
+            [1, 3],
+            "index 1 of the added props"
+        );
+        assert!(
+            !remove_loose_prop(&mut state, 999),
+            "out of range changes nothing"
+        );
+        assert_eq!(loose_ids(&state).len(), base + 2);
+        assert!(remove_loose_prop(&mut state, -1));
+        assert!(state.room_desc.as_ref().unwrap().loose_props.is_empty());
+        assert!(
+            !remove_loose_prop(&mut state, -1),
+            "clearing an empty list is no change"
+        );
+    }
+
+    #[test]
+    fn movelooseprop_repositions_the_prop_at_that_index() {
+        let mut state = session_in_room();
+        add_loose_prop(&mut state, 5, 1, 2);
+        let index = loose_ids(&state).len() - 1;
+        assert!(move_loose_prop(&mut state, index as i32, 300, 400));
+        let prop = &state.room_desc.as_ref().unwrap().loose_props[index];
+        assert_eq!((prop.loc.h, prop.loc.v), (300, 400));
+        assert!(!move_loose_prop(&mut state, 999, 0, 0));
+    }
+
+    #[test]
+    fn dropprop_takes_the_last_worn_prop_and_leaves_it_on_the_floor() {
+        let mut state = session_in_room();
+        for id in [10, 20] {
+            wear_prop(&mut state, id);
+        }
+        let before = loose_ids(&state).len();
+        assert_eq!(drop_prop(&mut state, 55, 66), Some(20));
+        assert_eq!(
+            state.users[&SELF_ID].props,
+            vec![10],
+            "the dropped prop came off"
+        );
+        assert_eq!(loose_ids(&state)[before..], [20]);
+        let dropped = &state.room_desc.as_ref().unwrap().loose_props[before];
+        assert_eq!((dropped.loc.h, dropped.loc.v), (55, 66));
+    }
+
+    #[test]
+    fn effects_on_a_missing_room_or_user_change_nothing() {
+        let mut orphan = SessionState::new("test", 1);
+        assert!(!add_loose_prop(&mut orphan, 1, 0, 0));
+        assert!(!remove_loose_prop(&mut orphan, 0));
+        assert!(!move_loose_prop(&mut orphan, 0, 0, 0));
+        assert_eq!(drop_prop(&mut orphan, 0, 0), None);
+        assert!(!set_self_face(&mut orphan, 3));
+        assert!(!set_self_color(&mut orphan, 3));
+        assert!(!wear_prop(&mut orphan, 1));
+        assert_eq!(doff_prop(&mut orphan), None);
+        assert!(!remove_worn_prop(&mut orphan, 1));
+    }
+
+    #[test]
+    fn a_face_or_colour_change_reaches_the_composited_scene() {
+        let mut state = session_in_room();
+        let builder = SceneBuilder::new(MediaStore::default(), PropStore::new());
+        let room = state.room_desc.clone().expect("a room");
+
+        let face_cell = |state: &SessionState| {
+            let (avatars, hidden) = avatar_specs(&state.users_in_room(), builder.props());
+            assert_eq!(hidden, 0, "the only user wears nothing, so none is hidden");
+            let scene = builder.build_with(&room, &avatars, &[]);
+            let avatar = &scene.avatars[0];
+            assert_eq!(avatar.parts.len(), 1, "a prop-less avatar is just its face");
+            avatar.parts[0].image.clone()
+        };
+
+        assert!(set_self_face(&mut state, 5));
+        let five = face_cell(&state);
+        assert!(set_self_face(&mut state, 10));
+        assert_ne!(
+            five,
+            face_cell(&state),
+            "the drawn face must follow the user's face"
+        );
+
+        assert!(set_self_color(&mut state, 3));
+        let three = face_cell(&state);
+        assert!(set_self_color(&mut state, 11));
+        assert_ne!(
+            three,
+            face_cell(&state),
+            "the drawn face must follow the user's colour"
+        );
     }
 
     #[test]
