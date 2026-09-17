@@ -68,6 +68,97 @@ window, and the protocol is the same everywhere.
   and are unit-tested, but no such server was reachable to prove them end to end.
 - **Guest logon only.** Authenticated (password) logon has not been attempted.
 
+
+## Project status
+
+An honest snapshot: what is finished, what is not, and what stands between this
+and 1.0. Unit and offline integration tests pass, and line coverage is 90.6%
+against an 80% gate — but test coverage is not the same as completeness, and the
+gaps below are where the difference shows.
+
+### Finished
+
+- **The protocol layer** — framing, logon, the room-description message, the
+  opcode table, and byte order handled whatever the server uses. Cross-checked
+  against captured traffic and against three independent reference
+  implementations.
+- **The prop codec**, validated against roughly 228,000 real props with zero
+  disagreements against the reference decoder.
+- **A working desktop client** — rooms assemble into one picture, avatars and
+  name tags draw, chat sends and receives (including the encrypted forms some
+  servers use), doors walk, and the room and user lists are live.
+- **The script engine** — the IPTSCRAE language (72 core words: arithmetic,
+  logic, strings, maths, stack operations and control flow) plus the Palace
+  command host. Scripts run sandboxed, with no network, filesystem or process
+  access.
+- **Script events** — entering, leaving, selecting, chat, lock, unlock, state
+  change, rename, user leave, and the room lifecycle (`ROOMLOAD`, `ENTER`,
+  `ROOMREADY`) in the order the reference client fires it.
+- **Reading a real prop bag** — the `.bundle` format is decoded, and worn props
+  are sent to the server so other clients can see them.
+
+### Not finished
+
+**The command set is the largest gap.** The *language* is in good shape; the
+Palace *commands* are not. There are four kinds of gap, in descending order of
+how badly they hide:
+
+1. **Commands that run but do nothing.** `SOUND`, `MIDIPLAY`, `MIDILOOP` and
+   `MIDISTOP` are surfaced to the interface but never reach an audio device, so
+   a room's soundscape is silent while appearing to work. `LOADPROPS` has no
+   effect at all. `PAINTUNDO` undoes nothing. `ISLOCKED` always answers false,
+   and `GETPICDIMENSIONS` always answers zero.
+2. **Commands that are not registered at all.** A room calling one of these does
+   not get an "unsupported" report — the name is treated as a variable instead,
+   so the room misbehaves quietly. Around forty names are in this state,
+   including `ADDPIC` (115 uses in the rooms available to test against),
+   `SETSPOTSCRIPT` (82), `ADDSPOT` (81), `LOADSCRIPT` (51), `HTTPGET` (50) and
+   the tooltip pair (88 between them).
+3. **Commands missing from the dictionary** although the host could dispatch
+   them, plus one that is documented but never dispatched.
+4. **Two effects that can never be produced.**
+
+Alongside those, these subsystems are missing or incomplete:
+
+- **Audio.** Nothing plays.
+- **Drawing.** `LINE` reaches the server but is not rasterized locally;
+  `CIRCLE`, `FILL`, `PAINT` and `TEXT` are unimplemented; and the `DRAW` opcode
+  that carries other people's strokes is dropped on receipt.
+- **Dynamic room content.** `ADDPIC`, `ADDSPOT` and `SETSPOTSCRIPT` — the
+  commands rooms use to build their own interfaces.
+- **HTTP.** `HTTPGET` and `LOADSCRIPT`. The response to a fetch is itself a
+  script, which is how several Colosseum rooms load their logic.
+- **A props panel.** Worn props now reach the server, but nothing in the
+  interface can *set* them, so the feature is only half reachable.
+- **Authentication.** A server requiring a password is refused, with the request
+  reported rather than silently ignored.
+
+### Known limitations
+
+- **Placeholder art.** Some visual gaps cannot be closed without real assets.
+- **Live verification is thinner than the unit tests.** Several receive paths
+  are proven against a mock harness but have not been exercised against a busy
+  server.
+- **Asset transfer for other users' avatars** is untested against a real peer.
+- **Multi-block asset transfer and 16-bit props** are reference-derived, and the
+  loose-prop artwork for the available corpus is missing from local stores.
+- **One deep opcode (`durl`) remains unresolved.**
+
+### Roadmap to 1.0
+
+1. **Diagnosis tooling first** — a trace log, so live behaviour can be inspected
+   rather than inferred from static scripts.
+2. **Settle authentication** — implement the reply, which first needs a decision
+   about where a credential should live.
+3. **Complete the command set**, in order of use: register and implement the
+   dead names, then audio, then dynamic room content, then HTTP and
+   `LOADSCRIPT`, then drawing and tooltips.
+4. **Build the props panel**, so the prop bag is usable from the interface.
+5. **Replace the constant-answering stubs** with real answers, and turn any
+   remaining silent no-op into an explicit report.
+6. **Publish** and retire the remaining safety-net branches.
+
+---
 ## The repository
 
 This is a Rust workspace with eleven members: ten crates under `crates/` and the
@@ -177,181 +268,6 @@ message and the opcode table live in **[protocol.md](protocol.md)**. This file
 stays focused on what the client is and how to use it.
 
 ---
-
-## Fixtures
-
-`fixtures/logon-run1/` is a complete real session:
-
-```text
-fixtures/logon-run1/
-  manifest.json                     # session metadata + decoded form of every frame
-  frames/0000-server-tiyr.bin       # raw wire bytes, 12-byte header included
-  frames/0001-client-regi.bin
-  ...
-  frames/0015-client-bye_.bin
-```
-
-Raw frame files are exactly what the socket carried — nothing is transformed or
-renormalised. `manifest.json` records, per frame, the direction, mnemonic,
-opcode value, `refNum`, payload length, file path and the decoded description.
-
-`Fixture::load` re-decodes every frame, re-encodes it and checks the bytes match,
-and compares the decoded text against the manifest. A corrupt file therefore
-fails loudly.
-
-### Offline replay test
-
-`crates/palace-wire/tests/fixture_replay.rs` loads the fixture **with no server**
-and asserts:
-
-- the session is self-consistent and byte-exact (`verify()` / `load()`);
-- the first frame is `tiyr` (`MSG_TIYID`) and carries a positive user id;
-- the client `regi` frame decodes to a 128-byte `AuxRegistrationRec`;
-- the logon burst contains `vers`, `sinf`, `log `, `HTTP`, `room`, `endr`, `nprs`;
-- the room list count equals `refNum` and the entry-room family is present;
-- the user list count equals `refNum`;
-- the room description decodes to `Balamb Garden` with a background picture;
-- an unknown opcode in a fixture does not abort replay.
-
-### Regenerating
-
-```bash
-cargo run -p palace-probe -- --host localhost --port 9998 --user RustProbe \
-    --capture fixtures/logon-run1
-```
-
-Re-capture after changing any `Message::describe` text: the manifest stores the
-decoded form, and `load` treats a mismatch as corruption.
-
----
-
-## Tests
-
-```bash
-cargo test --workspace     # 621 passed, 0 failed, 2 ignored
-```
-
-The suite spans every crate in the workspace, not just the protocol layer:
-
-- **`palace-wire`** unit tests cover framing, opcode packing, every message
-  decoder, `Str31`/`PString` handling (including garbage padding) and the fixture
-  format — each integer path exercised in **both byte orders**.
-- **`palace-wire/tests/endianness.rs`** pins exact bytes for the banner, the
-  framing header, the logon body and the list messages in both orders, and
-  decodes a whole synthetic session in each. **`fixture_replay.rs`** is the
-  offline corpus replay described above, and **`navr_encoding.rs`** pins the
-  two-byte `navR` room-goto frame.
-- **`palace-room` unit tests and `tests/fixtures.rs`** build a synthetic room with
-  every sub-structure (overlay, hotspot with points/states/name/script, two linked
-  loose props, a path and a detonate draw command) in both byte orders, then
-  corrupt offsets one at a time (out-of-range array, absent offset, negative
-  offset, link cycle, packed-stride fallback, oversized draw operand,
-  unterminated script) and assert a `RoomWarning` instead of a panic.
-- **`palace-room/tests/corpus_replay.rs`** decodes all 799 live payloads
-  (804 records) with zero failures and zero warnings, and asserts the four
-  concatenated captures split correctly. **`corpus_scripts.rs`** extracts and
-  validates 2400/2400 hotspot scripts, and **`logon_room_fixture.rs`** pins the
-  Balamb Garden `room` frame from `fixtures/logon-run1/`.
-- **`palace-prop`** tests cover round-trips, malformed inputs and the 227,874-prop
-  corpus. **`palace-asset`** tests cover the `qAst`/`sAst`/`rAst` state machines,
-  the pacing scheduler, the media HTTP fallback chain and adversarial inputs.
-- **`palace-render`** tests cover the coordinate mapping round-trip and full
-  corpus renders. **`palace-client/tests/fixture_replay.rs`** replays every server
-  frame of `fixtures/logon-run1/` through the session state.
-- **`iptscrae`** tests run the language conformance and hostile-input suites;
-  **`iptscrae-palace`** runs the harvested script corpus and the Palace command
-  surface; **`palace-host`** tests script loading, event dispatch and wire effect
-  encoding.
-
-Two tests are ignored by default because they need resources this machine may not
-have: `palace-asset/tests/live_server.rs` needs a live pserver at
-`localhost:9998`, and `palace-prop/tests/corpus.rs` needs the local prop corpus.
-Run them with `cargo test -- --ignored` once those are available.
-
-Endianness is not skipped because "the server is little-endian anyway": the
-logon packet is asserted byte-for-byte against `palace_walker.py`, the
-big-endian twin is asserted to be the byte-swapped form, and a synthetic session
-is decoded under both orders with identical results.
-
----
-
-## Differential check against the Python oracle
-
-```bash
-python3 tools/diff_walker.py
-```
-
-Runs the probe and `~/palace-corpus/tools/palace_walker.py` against the same server,
-back to back, and compares room id sets and names. `palace_walker.py` is
-**executed read-only** and nothing under `~/palace-corpus/` is modified.
-
-Result recorded on 2026-09-16:
-
-```text
-probe  : 81 rooms, 2 users (byte order little, server 'Balamb Garden')
-walker : 81 rooms (reported 81)
-PASS: 81 room ids and names match exactly
-```
-
-The walker has no user-list support, so the user count is validated against the
-`uLst` reply itself (2 users, both in room 901) rather than against the walker.
-
----
-
-## Verified vs assumed
-
-**Verified against live traffic / a reference implementation**
-
-- Framing, the `tiyr`/`ryit`/`pser` banner and endianness detection.
-- The full 128-byte `AuxRegistrationRec` (byte-for-byte vs `palace_walker.py`).
-- The logon burst message set and its exact fields (see
-  [protocol.md](protocol.md#logon-burst-keepalive-exit)).
-- `rLst` and `uLst` record layouts and count semantics (including the
-  uninitialised `PString` padding, which the protocol reference permits).
-- `UserRec` is 124 bytes, confirmed by the live `nprs`.
-- `RoomRec` is 40 bytes and its offset fields resolve inside `len_vars`.
-- Room list and user list agree with `palace_walker.py`.
-
-**Assumed / not yet exercised**
-
-- **Big-endian servers** are implemented and unit-tested, but no live
-  big-endian pserver exists to connect to, so the big-endian path is proven by
-  byte fixtures and a synthetic session, not by a real handshake.
-- **`pser` (HTTP tunnel)** detection is tested as a byte banner, but the probe
-  has not met a tunnel server; it exits with a clear error by construction.
-- `MSG_USERSTATUS` (`uSta`) bodies are 44 bytes live. The protocol reference
-  describes only the leading `sint16` flag word, so the remaining 42 bytes are
-  preserved verbatim in `UserStatus::raw` and **not interpreted**.
-- `AuxRegistrationRec.wizPassword` is decoded/encoded as an empty `Str31`; no
-  authenticated (non-guest) logon has been attempted.
-
-**Implemented but not yet proven live**
-
-- **Hotspots, pictures, draw commands and loose props inside `room`** are decoded
-  by `palace-room`; the raw buffer is still kept as `RoomDescription::var_data`.
-  What is missing is painting: draw commands, name tags and chat text are not
-  rasterized into the frame.
-- **Asset transfer (`qAst`/`sAst`/`rAst`)** is implemented in `palace-asset` and
-  drives live media fetching. Multi-block transfer is derived from the reference
-  implementations only; no real capture of a multi-block transfer exists.
-- **Prop codecs** are implemented in `palace-prop` and validated over the corpus.
-  The 16-bit decoder has zero real samples to test against, and `pserver_full.prp`
-  is systematically corrupt.
-- **Avatars** are composited by `palace-render`, but the development server had no
-  other users online, so receiving another user's prop art over the wire is
-  untested live.
-- **IPTSCRAE** runs live: `iptscrae` and `iptscrae-palace` implement the language
-  and command surface, and `palace-host` dispatches room events into it. Sound
-  and music effects are decoded and surfaced but not played.
-
-**Still genuinely undetermined**
-
-- `MSG_BLOWTHRU` (`blow`) payload semantics — the live logon burst contained one
-  14-byte `blow` on an earlier connection; it is decoded only as a bounded
-  payload, never interpreted.
-
----
-
 ## Provenance
 
 Protocol facts come from the official Communities.com *Palace Protocol
