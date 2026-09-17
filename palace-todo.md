@@ -751,6 +751,44 @@ list (`OpenPalace` `handleDrawCommand` reads `size` bytes into `PalaceDrawRecord
 everything. `palace-room` already models these records; the live message and the rasterizer are a
 separate task.
 
+### 2.22 Audio: how the reference does it, and what the server actually serves
+
+`SOUND name` reaches `PalaceSoundPlayer.playSound(name)` (`OpenPalace/.../view/PalaceSoundPlayer.as`),
+which does two things:
+
+1. looks the name up, lowercased, in a **built-in map of bundled MP3s** — amen, applause, belch,
+   boom, chime, crunch, debut, doorClose, doorOpen, fader, fazein, guffaw, kiss, no, pop, teehee,
+   yes — and plays the embedded asset if it matches;
+2. otherwise strips a trailing `.wav`, lowercases, and loads **`mediaServer + name + ".mp3"`**.
+
+So a sound is either bundled or fetched by name from the server's media endpoint.
+
+**What Colosseum actually serves** (checked directly):
+
+| Requested | Result |
+|---|---|
+| `wrongo.wav` | **200**, `audio/x-wav`, 3570 bytes |
+| `garden` | **200**, `audio/midi`, 13050 bytes |
+| `chime.mp3` | 404 |
+| `boom.wav` | 404 |
+
+So the names rooms use are served as they are spelled — `wrongo.wav` comes back as a WAV, and the
+reference's `.mp3` rewrite is not what this server answers with. The fetch-by-name path is therefore
+the one that matters, and our media pipeline already fetches and caches arbitrary media by name
+(§2.18) — it fetches pictures that way today.
+
+`MIDIPLAY`/`MIDILOOP`/`MIDISTOP` are a separate and harder problem: they select **MIDI**, which needs
+a synthesizer, not just a decoder. Treating MIDI as a follow-up and `SOUND`/`BEEP` as the first
+deliverable is the pragmatic split.
+
+Two implementation routes, neither chosen yet:
+
+- **Rust side** — play the fetched bytes from the runtime. Straightforward for WAV, and keeps audio
+  independent of the interface; costs a dependency.
+- **Interface side** — hand the bytes to the web view and let it play them. No new Rust dependency
+  and the browser handles formats, but it needs a command or route in `src-tauri/`, and that layer
+  rebuilds slowly (it restarts the running app).
+
 ---
 
 ## Part 3 — How to verify
