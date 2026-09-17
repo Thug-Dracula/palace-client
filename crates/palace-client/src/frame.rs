@@ -151,6 +151,7 @@ impl FrameStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use palace_render::PointF;
 
     fn geometry(
         room: (f64, f64),
@@ -218,5 +219,243 @@ mod tests {
         assert!((low.zoom - 0.5).abs() < 1e-9);
         let high = geometry((512.0, 384.0), (960.0, 540.0), 99.0, false, 1.0);
         assert!((high.zoom - 3.0).abs() < 1e-9);
+    }
+
+    const EPS: f64 = 1e-9;
+
+    /// The room/viewport shapes the round-trip sweep runs over. `wide` and `tall`
+    /// differ in aspect from every room so both a pillarbox and a letterbox are in
+    /// the sweep; `small` makes the letterbox offsets negative (zoom-in overflow).
+    const VIEWPORTS: [(f64, f64); 5] = [
+        (960.0, 540.0),
+        (600.0, 400.0),
+        (1000.0, 700.0),
+        (500.0, 800.0),
+        (200.0, 150.0),
+    ];
+    const ZOOMS: [f64; 5] = [0.5, 0.75, 1.0, 1.25, 3.0];
+    const DPRS: [f64; 5] = [1.0, 1.25, 1.5, 1.75, 2.0];
+
+    /// Room coordinates picked w.r.t. the 512×384 reference room; the sweep scales
+    /// them to each room in the list so the same fractions are hit everywhere.
+    fn room_fractions() -> Vec<(f64, f64)> {
+        vec![
+            (0.0, 0.0),
+            (0.5, 0.5),
+            (0.25, 0.75),
+            (0.999, 0.001),
+            (-40.0, -25.0),
+            (512.0 + 60.0, 384.0 + 45.0),
+        ]
+    }
+
+    /// The point a viewport click resolves to. This is the client's
+    /// `click_room_point` (runtime.rs): the transform inverse, then `round`.
+    fn clicked_room_point(g: &ViewGeometry, screen: (f64, f64)) -> (f64, f64) {
+        let p = g
+            .transform()
+            .viewport_to_room(PointF::new(screen.0, screen.1));
+        (p.x.round(), p.y.round())
+    }
+
+    /// Half a logical pixel: the largest error a nearest-cell pick can introduce,
+    /// and the tolerance every round trip through a click is held to. The two
+    /// transforms are exact inverses (viewport.rs), so a larger error means the
+    /// wrong cell was picked, not float noise.
+    const PICK_TOLERANCE: f64 = 0.5;
+
+    fn pick_error(g: &ViewGeometry, room: (f64, f64)) -> (f64, f64) {
+        let screen = g.transform().room_to_viewport(PointF::new(room.0, room.1));
+        let clicked = clicked_room_point(g, (screen.x, screen.y));
+        ((clicked.0 - room.0).abs(), (clicked.1 - room.1).abs())
+    }
+
+    #[test]
+    fn a_room_point_round_trips_through_the_viewport_at_every_zoom_dpr_and_viewport_shape() {
+        for (room_w, room_h) in [(512.0, 384.0), (1000.0, 383.0)] {
+            for (viewport_w, viewport_h) in VIEWPORTS {
+                for zoom in ZOOMS {
+                    for dpr in DPRS {
+                        for native in [false, true] {
+                            let g = geometry(
+                                (room_w, room_h),
+                                (viewport_w, viewport_h),
+                                zoom,
+                                native,
+                                dpr,
+                            );
+                            let transform = g.transform();
+                            for (fx, fy) in room_fractions() {
+                                let room = (room_w * fx, room_h * fy);
+                                let screen =
+                                    transform.room_to_viewport(PointF::new(room.0, room.1));
+                                let back =
+                                    transform.viewport_to_room(PointF::new(screen.x, screen.y));
+                                // viewport_to_room is room_to_viewport's algebraic
+                                // inverse, so the only error is floating-point
+                                // rounding (~1e-13 here), never a pixel.
+                                assert!(
+                                    (back.x - room.0).abs() <= EPS && (back.y - room.1).abs() <= EPS,
+                                    "room {room:?} -> {screen:?} -> {back:?} \
+                                     (viewport {viewport_w}x{viewport_h}, zoom {zoom}, dpr {dpr}, native {native})"
+                                );
+                                let (ex, ey) = pick_error(&g, room);
+                                assert!(
+                                    ex <= PICK_TOLERANCE && ey <= PICK_TOLERANCE,
+                                    "the clicked cell must be the nearest cell to {room:?}, \
+                                     off by ({ex}, {ey}) at {screen:?} \
+                                     (viewport {viewport_w}x{viewport_h}, zoom {zoom}, dpr {dpr}, native {native})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_missed_cell_click_returns_that_cell_not_a_neighbour() {
+        for (viewport_w, viewport_h, dpr) in [
+            (960.0, 540.0, 1.0),
+            (1000.0, 700.0, 1.25),
+            (200.0, 150.0, 2.0),
+            (500.0, 800.0, 1.5),
+        ] {
+            let g = geometry((512.0, 384.0), (viewport_w, viewport_h), 1.0, false, dpr);
+            let mut cell = -272;
+            while cell <= 272 {
+                for (rx, ry) in [
+                    (cell, -272),
+                    (cell, 272),
+                    (-272, cell),
+                    (272, cell),
+                    (cell, cell),
+                    (cell, -cell),
+                ] {
+                    let room = (f64::from(rx), f64::from(ry));
+                    let (ex, ey) = pick_error(&g, room);
+                    assert!(
+                        ex <= PICK_TOLERANCE && ey <= PICK_TOLERANCE,
+                        "cell {room:?} must survive the round trip, off by ({ex}, {ey})"
+                    );
+                }
+                cell += 37;
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_in_the_letterbox_maps_outside_the_room_it_is_not_clamped_to_the_edge() {
+        for (viewport_w, viewport_h) in [(600.0, 400.0), (1000.0, 700.0), (500.0, 800.0)] {
+            for zoom in [1.0, 1.25] {
+                let g = geometry((512.0, 384.0), (viewport_w, viewport_h), zoom, false, 1.0);
+                let rect = g.transform().content_rect();
+                let bars: [(f64, &str); 2] = [(rect.x, "left"), (rect.y, "top")];
+                for (bar, edge) in bars {
+                    if bar <= 0.0 {
+                        continue;
+                    }
+                    let screen = if edge == "left" {
+                        (bar / 2.0, rect.y + 5.0)
+                    } else {
+                        (rect.x + 5.0, bar / 2.0)
+                    };
+                    let (rx, ry) = clicked_room_point(&g, screen);
+                    let outside = if edge == "left" { rx < 0.0 } else { ry < 0.0 };
+                    assert!(
+                        outside,
+                        "a click {edge} of the room in the {edge} bar must not clamp to the edge"
+                    );
+                }
+
+                // The visible-room corner is still in the room: the rejection
+                // above must come from the letterbox, not from an off-by-one on
+                // the content rect.
+                let corner = (rect.x, rect.y);
+                assert_eq!(
+                    clicked_room_point(&g, corner),
+                    (0.0, 0.0),
+                    "the content-rect corner is room (0,0)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_full_screen_room_buffer_screen_chain_composes_exactly() {
+        for (room_w, room_h) in [(512.0, 384.0), (1000.0, 383.0)] {
+            for (viewport_w, viewport_h) in VIEWPORTS {
+                for zoom in ZOOMS {
+                    for dpr in DPRS {
+                        for native in [false, true] {
+                            let g = geometry(
+                                (room_w, room_h),
+                                (viewport_w, viewport_h),
+                                zoom,
+                                native,
+                                dpr,
+                            );
+                            let transform = g.transform();
+                            let sizes = [
+                                (transform.content_rect().x, transform.content_rect().y),
+                                (viewport_w / 3.0, viewport_h / 3.0),
+                                (viewport_w + 12.0, -9.0),
+                            ];
+                            for (sx, sy) in sizes {
+                                let screen = PointF::new(sx, sy);
+                                let direct = transform.viewport_to_buffer(screen);
+                                let two_step =
+                                    transform.room_to_buffer(transform.viewport_to_room(screen));
+                                // Two routes to the same space, so they may only
+                                // differ by float rounding, never by a DPR factor.
+                                assert!(
+                                    (direct.x - two_step.x).abs() <= EPS
+                                        && (direct.y - two_step.y).abs() <= EPS,
+                                    "viewport {screen:?} -> direct {direct:?} vs {two_step:?} \
+                                     (viewport {viewport_w}x{viewport_h}, zoom {zoom}, dpr {dpr}, native {native})"
+                                );
+
+                                let back =
+                                    transform.buffer_to_viewport(PointF::new(direct.x, direct.y));
+                                assert!(
+                                    (back.x - sx).abs() <= EPS && (back.y - sy).abs() <= EPS,
+                                    "buffer -> viewport lost {screen:?}, got {back:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_letterboxed_room_rect_maps_to_the_frame_pixels_the_room_was_drawn_into() {
+        // The frame buffer is the room at DPR with no letterboxing, so the visible
+        // content rect's corners must land on the buffer corners: that is what
+        // makes a click on a drawn pixel find the prop drawn there.
+        for (viewport_w, viewport_h) in [(600.0, 400.0), (1000.0, 700.0), (500.0, 800.0)] {
+            for dpr in [1.0, 1.25, 1.5, 2.0] {
+                let g = geometry((512.0, 384.0), (viewport_w, viewport_h), 1.0, false, dpr);
+                let rect = g.transform().content_rect();
+                let top_left = g
+                    .transform()
+                    .viewport_to_buffer(PointF::new(rect.x, rect.y));
+                let bottom_right = g
+                    .transform()
+                    .viewport_to_buffer(PointF::new(rect.x + rect.width, rect.y + rect.height));
+                assert_eq!(
+                    (top_left.x.round(), top_left.y.round()),
+                    (0.0, 0.0),
+                    "the content rect starts at the buffer's top-left"
+                );
+                assert_eq!(
+                    (bottom_right.x.round(), bottom_right.y.round()),
+                    (f64::from(g.bitmap_w), f64::from(g.bitmap_h)),
+                    "the content rect ends at the buffer's bottom-right"
+                );
+            }
+        }
     }
 }

@@ -468,6 +468,9 @@ fn transparency_colour(image: &PropImage, trans_color: i16) -> Option<[u8; 3]> {
 mod tests {
     use super::*;
     use crate::assets::PropStore;
+    use crate::scene::{
+        FLAG_PICTURES_ABOVE_ALL, FLAG_PICTURES_ABOVE_NAME_TAGS, FLAG_PICTURES_ABOVE_PROPS,
+    };
 
     fn builder() -> SceneBuilder {
         SceneBuilder::new(MediaStore::default(), PropStore::new())
@@ -677,6 +680,101 @@ mod tests {
         let mut props = PropStore::new();
         props.add_directory(&dir);
         (dir, props)
+    }
+
+    /// A scene band as `(bucket, layer)` so a routing sweep can compare the two.
+    fn bands_of(scene: &Scene) -> [(&[Sprite], Layer); 4] {
+        [
+            (scene.overlays_above_nothing.as_slice(), Layer::AboveNothing),
+            (scene.overlays_above_avatars.as_slice(), Layer::AboveAvatars),
+            (
+                scene.overlays_above_name_tags.as_slice(),
+                Layer::AboveNameTags,
+            ),
+            (
+                scene.overlays_above_everything.as_slice(),
+                Layer::AboveEverything,
+            ),
+        ]
+    }
+
+    /// Every hotspot-flag band must land in its own scene bucket with its own
+    /// image. A hotspot routed to the wrong bucket is invisible in this crate's
+    /// unit tests (each bucket looks fine alone) and only shows up as a wrong
+    /// z-order on screen.
+    #[test]
+    fn each_hotspot_flag_routes_its_overlay_to_the_matching_scene_band() {
+        let dir =
+            std::env::temp_dir().join(format!("palace-render-band-routing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let flags = [
+            (0, Layer::AboveNothing),
+            (FLAG_PICTURES_ABOVE_PROPS, Layer::AboveAvatars),
+            (FLAG_PICTURES_ABOVE_NAME_TAGS, Layer::AboveNameTags),
+            (FLAG_PICTURES_ABOVE_ALL, Layer::AboveEverything),
+        ];
+        let mut media = MediaStore::default();
+        let mut expected: BTreeMap<Layer, PropImage> = BTreeMap::new();
+        for (index, (_flag, layer)) in flags.iter().enumerate() {
+            let name = format!("band-{index}.png");
+            let value = (index as u8 + 1) * 40;
+            {
+                let file = std::fs::File::create(dir.join(&name)).expect("create png");
+                let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), 1, 1);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                let mut writer = encoder.write_header().expect("png header");
+                writer
+                    .write_image_data(&[value, value, value, 255])
+                    .expect("png data");
+            }
+            assert!(
+                !media.insert_path(&name, dir.join(&name)),
+                "a fresh store has not indexed this name yet"
+            );
+            expected.insert(
+                *layer,
+                PropImage::from_rgba(1, 1, vec![value, value, value, 255]).expect("image"),
+            );
+        }
+
+        let mut room = empty_room();
+        for (index, (flag, _)) in flags.iter().enumerate() {
+            let name = format!("band-{index}.png");
+            room.pictures.push(palace_room::PictureOverlay {
+                pic_id: index as i16 + 7,
+                name: Some(name),
+                trans_color: -1,
+                ..palace_room::PictureOverlay::default()
+            });
+            room.hotspots.push(palace_room::Hotspot {
+                id: index as i16 + 1,
+                state: 0,
+                flags: *flag,
+                loc: palace_wire::messages::Point::new(index as i16 * 50, 0),
+                states: vec![palace_room::HotspotState {
+                    pict_id: index as i16 + 7,
+                    ..palace_room::HotspotState::default()
+                }],
+                ..palace_room::Hotspot::default()
+            });
+        }
+
+        let scene = SceneBuilder::new(media, PropStore::new()).build(&room, &[]);
+        for (bucket, layer) in bands_of(&scene) {
+            assert_eq!(
+                bucket.len(),
+                1,
+                "exactly one hotspot routes to {layer:?}, got {}",
+                bucket.len()
+            );
+            assert_eq!(
+                bucket[0].image, expected[&layer],
+                "{layer:?} must hold the image of the hotspot flagged for it"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

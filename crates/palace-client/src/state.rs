@@ -688,6 +688,75 @@ mod tests {
         );
     }
 
+    fn user_at(id: i32, x: i16, y: i16) -> UserInfo {
+        UserInfo {
+            id,
+            name: format!("user-{id}"),
+            face: 0,
+            color: 0,
+            room_id: 901,
+            x,
+            y,
+            props: Vec::new(),
+            away: false,
+            is_self: id == SELF,
+        }
+    }
+
+    /// The compositor draws avatars in the order this returns, so the order must
+    /// be a documented total order — (y, x, id) — and not whatever order the map
+    /// happened to be built in.
+    #[test]
+    fn users_in_room_returns_a_canonical_order_whatever_the_insertion_order() {
+        let users = [
+            user_at(510, 30, 40),
+            user_at(507, 30, 90),
+            user_at(509, 30, 40),
+            user_at(502, 10, 90),
+            user_at(505, 30, 40),
+        ];
+        let expected: Vec<i32> = vec![505, 509, 510, 502, 507];
+        let orders = [
+            vec![0, 1, 2, 3, 4],
+            vec![4, 3, 2, 1, 0],
+            vec![2, 4, 1, 0, 3],
+        ];
+        for order in orders {
+            let mut state = SessionState::new("test", 1);
+            state.room_users.clear();
+            for index in order {
+                state.users.insert(users[index].id, users[index].clone());
+            }
+            let got: Vec<i32> = state.users_in_room().iter().map(|u| u.id).collect();
+            assert_eq!(
+                got, expected,
+                "the canonical order must not depend on insertion order"
+            );
+        }
+        // Sorted by (y, x, id): y=40 first, then the two at y=90 with x=10
+        // before x=30; equal positions ordered by id.
+        let expected_order: Vec<(i16, i16, i32)> = vec![
+            (40, 30, 505),
+            (40, 30, 509),
+            (40, 30, 510),
+            (90, 10, 502),
+            (90, 30, 507),
+        ];
+        let mut state = SessionState::new("test", 1);
+        state.room_users.clear();
+        for user in &users {
+            state.users.insert(user.id, user.clone());
+        }
+        assert_eq!(
+            state
+                .users_in_room()
+                .iter()
+                .map(|u| (u.y, u.x, u.id))
+                .collect::<Vec<_>>(),
+            expected_order
+        );
+    }
+
     fn prop_body(specs: &[(i32, u32)]) -> Vec<u8> {
         let mut w = Writer::new(ByteOrder::Little);
         w.write_i32(specs.len() as i32);
