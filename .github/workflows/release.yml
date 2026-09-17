@@ -152,11 +152,14 @@ jobs:
 
       # gh is preinstalled on the runner. --verify-tag refuses to invent a tag,
       # so this can only ever attach files to the tag that started the run.
+      # --repo is required: this job never checks the code out, so there is no
+      # git directory for gh to infer the repository from.
       - name: Attach the files to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             --verify-tag \
