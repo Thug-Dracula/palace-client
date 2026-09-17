@@ -429,6 +429,87 @@ the prop numbering. It is not. `PalaceClient.as` loads a room by walking
 list *and* forwards it unchanged, so traversal order **is** the prop numbering.
 That sentence describes the byte offsets, and should say so.
 
+## The receive path: messages the client could not hear (done 2026-09-16)
+
+The other half of the gap the effect work addressed. Those `Effect` arms apply what *scripts*
+ask for; this is what the *server* announces about everyone else. The client decoded 21 of the
+75 opcodes in `opcode.rs` and the rest fell to `Message::Unknown`, which only wrote a transcript
+line. So in a populated room every other user looked frozen — faces, colours and worn props
+never changed, and props people added, moved or removed never appeared. Seven now decode and
+apply.
+
+| Message | Opcode | Body | Applied as |
+|---|---|---|---|
+| USERFACE | `usrF` | `i16 faceNbr` (2 B) | user's face, re-render |
+| USERCOLOR | `usrC` | `i16 colorNbr` (2 B) | user's colour, re-render |
+| USERPROP | `usrP` | `i32 nbrProps` + `AssetSpec[n]` (4+8n) | worn list replaced wholesale |
+| USERDESC | `usrD` | `i16 faceNbr`, `i16 colorNbr`, `i32 nbrProps` + `AssetSpec[n]` (8+8n) | all three at once |
+| PROPNEW | `nPrp` | `AssetSpec spec` + `Point pos` (12 B) | appended to the room's loose props |
+| PROPMOVE | `mPrp` | `i32 propNum` + `Point pos` (8 B) | that prop's `loc`, absolute |
+| PROPDEL | `dPrp` | `i32 propNum` (4 B) | that prop removed; `-1` clears the room |
+
+Wire primitives, both confirmed against the spec: `Point { sint16 v; sint16 h; }` —
+**vertical first** — and `AssetSpec { sint32 id; uint32 crc; }` — id first.
+
+**Go here first for any protocol question:**
+`~/palace-corpus/reference/repos/ThePalacev0/ThePalace.Core.Database/Documentation/PalaceProtocolRef.txt`
+— the official Communities.com *Palace Server Protocols* (1999), with explicit structs. Point
+:193, AssetSpec :212, PROPDEL :1450, PROPMOVE :1464, PROPNEW :1481, USERCOLOR :2009, USERDESC
+:2023, USERFACE :2057, USERPROP :2170. It sits beside the original "Mansion" client C source.
+
+Four rules that are easy to get wrong and are now pinned by tests:
+- `propNum` is a **0-based insertion-order index** into the room's loose props — not a crc, not
+  an offset, not a position. `PROPNEW` carries no index at all: the server appends, so a new
+  prop's address is the list length before the add. Two reference *clients* (OpenPalace and the
+  ThePalacev0 web client) prepend at index 0, which would desync every later index-based
+  MOVE/DEL — we append, matching the server and the spec.
+- For the four appearance messages the user id is the frame **`refNum`, not a body field**.
+- `USERPROP`/`USERDESC` are **whole-list replacements** with unused slots omitted, never
+  zero-padded. The fixed 9-slot array belongs to the `UserRec` in `USERLIST`/`USERNEW`, a
+  different message. A declared count is validated against the body length: too short *or*
+  trailing bytes is a decode error, not a silent truncation.
+- `PROPDEL -1` clears the room; any *other* out-of-range index is ignored with a transcript
+  line so a stale index cannot empty the room. `refNum` 0 is never trusted — the ThePalacev0
+  server relays `USERCOLOR` with `refNum` 0 while relaying `USERFACE` correctly.
+
+Both paths converge: the effect arms in `runtime.rs` now delegate to the same
+`SessionState::add_loose_prop`/`move_loose_prop`/`remove_loose_prop` the wire messages use.
+
+**Test harness gap closed.** `tests/mock_runtime.rs` had no user record carrying the handshake's
+id (13), so `is_self` was false for every user and self-targeted activity could not be exercised
+over the socket at all. It now emits a self record, and 7 socket tests cover the receive path.
+
+**Verified:** `cargo fmt --all -- --check` clean, `clippy -D warnings` clean on all five crates,
+every suite green (palace-client lib 34, mock_runtime 20). Each new test was proven real by
+cutting its application arm and confirming the failure, then restoring — e.g. prepending instead
+of appending fails `[2222, 1111]` vs `[1111, 2222]`.
+
+**Not yet live-tested.** All of the above is against the mock harness. Nobody has watched a real
+second user's face change arrive from Balamb Garden.
+
+### Placeholder art: a decision, not a task
+The face art is a **deliberate placeholder** and must not constrain anything. Two facts to keep:
+the artwork is 44x44 on a **45-pixel stride** (OpenPalace's `defaultsmileys.png`, 586x720, 44x44
+art padded with a blank row and column), and the sheet bakes **16 colour tints** although the
+original design tints one face from a 16-entry palette (`SmileyPalette.js`). Our render sheet is
+a *resampled* 572x704 copy: 1,467 colours per cell against the source's 200, which is
+interpolation, and it inflated the file from 182 KB to 807 KB for a worse result. A pixel-perfect
+re-extract (208 clean 44x44 cells) is parked at `~/ProgramFiles/palace-faces-placeholder/` and is
+a zero-code-change drop-in.
+
+The real limitation is **not** art quality: it is that the grid (13 faces, 16 colours, 44 px) is
+hardcoded in the binary, so different art or a different face count is a code change. Removing
+that — describe the grid in a small data file and load the art from a folder like every other
+Palace asset — is what would make the placeholder genuinely replaceable. Deliberately not done
+yet; it is polish, not a blocker.
+
+**Face order (0-12), confirmed two independent ways:** `closed, smile, tiltdown, talk, winkleft,
+normal, winkright, tiltleft, tiltup, tiltright, sad, blotto, angry`. pserver's `FACE_*` enum
+(`~/palace-corpus/reference/repos/pserver/include/connection.hpp:54-70`, `NUM_FACES = 13`) lists
+exactly that order, and the sprite sheet's columns match it one-for-one when inspected visually
+(closed eyes, smile, flat, open-mouth talk, wink, neutral smile, opposite wink, looking left,
+up, right, sad, X-eyes, angry). The canonical names are `TILT*`, not "down/left/up/right".
+
 ## Running it
 
 ```bash
@@ -450,6 +531,15 @@ or `PALACE_HOST`/`PALACE_PORT`/`PALACE_USER`. `PALACE_SEED_MEDIA` /
 `PALACE_SEED_PROPS` add read-only local fallback roots (colon-separated).
 
 ## Operational rules that have been earning their keep
+
+- **Stage explicit paths, never `git add -A`, whenever another agent or opencode instance may be
+  sharing the worktree.** `-A` sweeps a concurrent editor's half-written files into your commit.
+  This has already been a near-miss: commit `df09082` used `-A` and was clean only by luck.
+  Related: release CI (`.github/workflows/release.yml`) was authored by a *different* instance,
+  so commits touching it are not automatically ours.
+- **A placeholder must not become a constraint.** The face art is a placeholder; the thing that
+  would actually limit us is the hardcoded grid, not the art's quality. Keep the two separate
+  when deciding what to work on.
 
 * **NEVER run `--workspace` cargo commands in a fresh worktree.** A new worktree
   has no `target/`, so `cargo test --workspace` / `cargo clippy --workspace

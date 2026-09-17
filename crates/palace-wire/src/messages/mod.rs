@@ -11,6 +11,7 @@
 mod chat;
 mod lists;
 mod logon;
+mod props;
 mod room;
 mod server;
 mod user;
@@ -18,9 +19,13 @@ mod user;
 pub use chat::{Talk, Whisper};
 pub use lists::{RoomList, RoomListRec, UserList, UserListRec};
 pub use logon::{aux_flags, reference_logon_record, AuxRegistrationRec, ReferenceProfile};
+pub use props::{PropDel, PropMove, PropNew};
 pub use room::{RoomDescription, RoomRec};
 pub use server::{AltLogonReply, HttpServer, ServerInfo, ServerVersion, UserLog};
-pub use user::{AssetSpec, Point, UserExit, UserMove, UserNew, UserRec, UserStatus};
+pub use user::{
+    AssetSpec, Point, UserColor, UserDesc, UserExit, UserFace, UserMove, UserNew, UserProp,
+    UserRec, UserStatus,
+};
 
 use crate::byteorder::{ByteOrder, Reader};
 use crate::error::{Result, WireError};
@@ -56,10 +61,24 @@ pub enum Message {
     UserExit(UserExit),
     /// `uLoc` — a user moved.
     UserMove(UserMove),
+    /// `usrF` — a user's face changed.
+    UserFace(UserFace),
+    /// `usrC` — a user's colour changed.
+    UserColor(UserColor),
+    /// `usrP` — a user's complete worn prop list.
+    UserProp(UserProp),
+    /// `usrD` — a user's face, colour and props together.
+    UserDesc(UserDesc),
     /// `uSta` — own user status flags.
     UserStatus(UserStatus),
     /// `room` — room description.
     RoomDescription(RoomDescription),
+    /// `nPrp` — a loose prop was added to the room.
+    PropNew(PropNew),
+    /// `mPrp` — a loose prop moved.
+    PropMove(PropMove),
+    /// `dPrp` — a loose prop was deleted.
+    PropDel(PropDel),
     /// `endr` — end of room description.
     RoomDescEnd,
     /// `talk` — public chat.
@@ -117,8 +136,15 @@ impl Message {
             opcode::USERNEW => Message::UserNew(UserNew::decode(ref_num, r)?),
             opcode::USEREXIT => Message::UserExit(UserExit::from_ref_num(ref_num)),
             opcode::USERMOVE => Message::UserMove(UserMove::decode(ref_num, r)?),
+            opcode::USERFACE => Message::UserFace(UserFace::decode(ref_num, r)?),
+            opcode::USERCOLOR => Message::UserColor(UserColor::decode(ref_num, r)?),
+            opcode::USERPROP => Message::UserProp(UserProp::decode(ref_num, r)?),
+            opcode::USERDESC => Message::UserDesc(UserDesc::decode(ref_num, r)?),
             opcode::USERSTATUS => Message::UserStatus(UserStatus::decode(ref_num, r)?),
             opcode::ROOMDESC => Message::RoomDescription(RoomDescription::decode(r)?),
+            opcode::PROPNEW => Message::PropNew(PropNew::decode(r)?),
+            opcode::PROPMOVE => Message::PropMove(PropMove::decode(r)?),
+            opcode::PROPDEL => Message::PropDel(PropDel::decode(r)?),
             opcode::ROOMDESCEND => Message::RoomDescEnd,
             opcode::TALK => Message::Talk(Talk::decode(ref_num, r)?),
             opcode::WHISPER => Message::Whisper(Whisper::decode(ref_num, r)?),
@@ -173,6 +199,20 @@ impl Message {
                 "user moved: id={} v={} h={}",
                 m.user_id, m.position.v, m.position.h
             ),
+            Message::UserFace(f) => format!("user face: id={} face={}", f.user_id, f.face_nbr),
+            Message::UserColor(c) => format!("user color: id={} color={}", c.user_id, c.color_nbr),
+            Message::UserProp(p) => format!(
+                "user props: id={} props={}",
+                p.user_id,
+                summarize_asset_specs(&p.props)
+            ),
+            Message::UserDesc(d) => format!(
+                "user desc: id={} face={} color={} props={}",
+                d.user_id,
+                d.face_nbr,
+                d.color_nbr,
+                summarize_asset_specs(&d.props)
+            ),
             Message::UserStatus(s) => format!(
                 "user status: user_id={} flags={:#06x} ({}) raw_len={}",
                 s.user_id,
@@ -194,6 +234,15 @@ impl Message {
                 d.header.len_vars
             ),
             Message::RoomDescEnd => "end of room description".to_string(),
+            Message::PropNew(p) => format!(
+                "new prop: id={} crc={:#010x} v={} h={}",
+                p.spec.id, p.spec.crc, p.position.v, p.position.h
+            ),
+            Message::PropMove(p) => format!(
+                "move prop: index={} v={} h={}",
+                p.prop_num, p.position.v, p.position.h
+            ),
+            Message::PropDel(p) => format!("delete prop: index={}", p.prop_num),
             Message::Talk(t) => format!("talk: user_id={} {:?}", t.user_id, t.text),
             Message::Whisper(w) => format!(
                 "whisper: from={} to={} {:?}",
@@ -277,6 +326,18 @@ fn summarize_user_flags(f: u16) -> String {
     summarize_bits(f as u32, BITS)
 }
 
+fn summarize_asset_specs(specs: &[AssetSpec]) -> String {
+    let ids: Vec<String> = specs
+        .iter()
+        .map(|spec| (spec.id as u32).to_string())
+        .collect();
+    if ids.is_empty() {
+        "none".to_string()
+    } else {
+        ids.join(",")
+    }
+}
+
 fn summarize_bits(value: u32, bits: &[(u32, &str)]) -> String {
     let mut names: Vec<&str> = bits
         .iter()
@@ -292,7 +353,8 @@ fn summarize_bits(value: u32, bits: &[(u32, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opcode::{LISTOFALLROOMS, LOGOFF, PING, TALK};
+    use crate::byteorder::Writer;
+    use crate::opcode::{LISTOFALLROOMS, LOGOFF, PING, PROPMOVE, TALK, USERFACE, USERPROP};
 
     #[test]
     fn unknown_opcodes_decode_to_unknown_not_error() {
@@ -339,5 +401,50 @@ mod tests {
             payload_len: 0,
         };
         assert!(unknown.describe().contains("unknown"));
+    }
+
+    #[test]
+    fn the_new_appearance_and_prop_messages_reach_their_arms() {
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(7);
+        let face = Message::decode(USERFACE, 5, &w.into_vec(), ByteOrder::Little).unwrap();
+        assert_eq!(
+            face,
+            Message::UserFace(UserFace {
+                user_id: 5,
+                face_nbr: 7
+            })
+        );
+        assert!(face.describe().contains("face=7"));
+
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i32(1);
+        w.write_i32(99);
+        w.write_u32(0xabcd);
+        let props = Message::decode(USERPROP, 5, &w.into_vec(), ByteOrder::Little).unwrap();
+        assert_eq!(
+            props,
+            Message::UserProp(UserProp {
+                user_id: 5,
+                props: vec![AssetSpec {
+                    id: 99,
+                    crc: 0xabcd
+                }],
+            })
+        );
+
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i32(3);
+        w.write_i16(2);
+        w.write_i16(4);
+        let mv = Message::decode(PROPMOVE, 0, &w.into_vec(), ByteOrder::Little).unwrap();
+        assert_eq!(
+            mv,
+            Message::PropMove(PropMove {
+                prop_num: 3,
+                position: Point::new(2, 4)
+            })
+        );
+        assert!(mv.describe().contains("index=3"));
     }
 }

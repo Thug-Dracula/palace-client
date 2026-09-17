@@ -20,10 +20,9 @@ use palace_render::{
     clamp_dpr, render, AnimationClock, AvatarSpec, MediaStore, PointF, PropStore, RenderOptions,
     SceneBuilder, SizeF, ViewTransform, COLOR_VARIANTS, FACE_VARIANTS,
 };
-use palace_room::{LooseProp, LoosePropSpec};
 use palace_wire::byteorder::Writer;
 use palace_wire::frame::Frame;
-use palace_wire::messages::{reference_logon_record, Point, Talk};
+use palace_wire::messages::{reference_logon_record, AssetSpec, Point, Talk};
 use palace_wire::opcode;
 use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -1830,55 +1829,25 @@ fn remove_worn_prop(state: &mut SessionState, prop: u32) -> bool {
     true
 }
 
-/// Put a prop on the floor. Only the id and the position reach the wire, so every
-/// other field of the record is zero.
+/// Put a prop on the floor. The scripted path carries no CRC and no flags, so
+/// only the id and the position reach the shared room state.
 fn add_loose_prop(state: &mut SessionState, prop: u32, x: i32, y: i32) -> bool {
-    let Some(room) = state.room_desc.as_mut() else {
-        return false;
-    };
-    room.loose_props.push(LooseProp {
-        next_ofst: 0,
-        reserved: 0,
-        spec: LoosePropSpec { id: prop, crc: 0 },
-        flags: 0,
-        ref_con: 0,
-        loc: point(x, y),
-    });
-    true
+    state.add_loose_prop(
+        AssetSpec {
+            id: prop as i32,
+            crc: 0,
+        },
+        point(x, y),
+    )
 }
 
 /// Drop one loose prop by index, or every one when the index is `-1`.
 fn remove_loose_prop(state: &mut SessionState, index: i32) -> bool {
-    let Some(room) = state.room_desc.as_mut() else {
-        return false;
-    };
-    if index == -1 {
-        let changed = !room.loose_props.is_empty();
-        room.loose_props.clear();
-        return changed;
-    }
-    let Ok(index) = usize::try_from(index) else {
-        return false;
-    };
-    if index >= room.loose_props.len() {
-        return false;
-    }
-    room.loose_props.remove(index);
-    true
+    state.remove_loose_prop(index)
 }
 
 fn move_loose_prop(state: &mut SessionState, index: i32, x: i32, y: i32) -> bool {
-    let Some(room) = state.room_desc.as_mut() else {
-        return false;
-    };
-    let Ok(index) = usize::try_from(index) else {
-        return false;
-    };
-    let Some(prop) = room.loose_props.get_mut(index) else {
-        return false;
-    };
-    prop.loc = point(x, y);
-    true
+    state.move_loose_prop(index, point(x, y))
 }
 
 fn drop_prop(state: &mut SessionState, x: i32, y: i32) -> Option<u32> {
