@@ -86,7 +86,7 @@ pub use assembler::{
 pub use asset::{
     AssetDescriptor, AssetKey, AssetSpec, AssetTransfer, AssetType, BlockHeader, OP_REGI, OP_SEND,
 };
-pub use cache::{sanitise_media_name, AssetCache, MediaCache};
+pub use cache::{escape_name_component, sanitise_media_name, AssetCache, MediaCache};
 pub use error::{
     AssetError, Result, BLOCK_HEADER_LEN, DESCRIPTOR_LEN, MAX_ASSET_SIZE, MAX_BLOCK_COUNT,
     MAX_BLOCK_SIZE, NAME_FIELD_LEN,

@@ -510,6 +510,56 @@ exactly that order, and the sprite sheet's columns match it one-for-one when ins
 (closed eyes, smile, flat, open-mouth talk, wink, neutral smile, opposite wink, looking left,
 up, right, sad, X-eyes, angry). The canonical names are `TILT*`, not "down/left/up/right".
 
+## Windows portability (first real run, 2026-09-17)
+
+The Windows build had **never been run** — only compiled in CI. The first launch of the
+`v0.1.0` portable zip failed immediately, and the failure mode is worth recording because
+every check we had was blind to it.
+
+**Symptom:** `io: The filename, directory name, or volume label syntax is incorrect.
+(os error 123)`, printed about three times in the first five seconds.
+
+**Cause:** `runtime.rs` built the per-session cache directory from `host:port`:
+
+```rust
+let session_root = cfg.cache_root.join(format!("{}:{}", cfg.host, cfg.port));
+```
+
+which produced a folder named `localhost:9998`. A colon is legal in a Linux filename and
+**illegal in a Windows one** (reserved for drive letters and file streams), so the first
+`create_dir_all` inside `AssetWorkspace::new` failed with `ERROR_INVALID_NAME`. The three
+repeats were the supervisor retry loop's 1500/3000/6000 ms backoff, not a fixed limit.
+
+**Fixes, all now tested:**
+- `host:port` is escaped into a legal single component (`localhost%3A9998`) via
+  `palace_asset::escape_name_component`, newly shared with the media-name sanitiser so one
+  escaping rule serves both instead of two that can drift. Escaping rather than
+  substituting also covers IPv6 hosts, which carry colons of their own.
+- `session_cache_dir()` is extracted so the **wiring** is testable, not merely the helper.
+  The test asserts no component of the composed path holds a character Windows forbids;
+  reverting the wiring to `format!("{}:{}")` fails it with `':' cannot appear in a Windows
+  filename, but Normal("localhost:9998") has it`.
+- The cache root no longer falls through to `/tmp` (which on Windows means `C:\tmp`). It
+  now prefers `XDG_CACHE_HOME`, then `LOCALAPPDATA`, then `HOME/.cache`, then
+  `std::env::temp_dir()`. The candidates are passed as arguments so the Windows rung is
+  testable from Linux.
+- `split_paths` used `split(':')`, which broke Windows drive letters — `C:\props` became
+  `C` and `\props`, so the seeds silently vanished. It now uses `std::env::split_paths`,
+  which knows the platform separator. `HOME` also falls back to `USERPROFILE`.
+
+**Still open — needs a decision, not a mechanical fix:** `assets.rs` `write_media` strips
+directories but does not escape Windows-illegal characters or reserved device names
+(`CON`, `NUL`, `COM1`), unlike the HTTP cache in the same pipeline which sanitises properly.
+Escaping on write changes the on-disk name, while the renderer later looks the file up by
+the room's *original* name — so a naive escape converts a crash into silently missing
+images. Skip-with-a-logged-note is the likely answer.
+
+**Lesson worth keeping:** a cross-compile check cannot catch this class of bug.
+`cargo check --target x86_64-pc-windows-gnu -p palace-app` passed cleanly throughout — the
+problem is path *semantics at runtime*, not anything the compiler can see. The Windows
+build has to be **launched**, not just compiled. Setup instructions for a fast Windows dev
+loop live in `$MEDIA/palace-client-windows-dev-setup.md`.
+
 ## Running it
 
 ```bash

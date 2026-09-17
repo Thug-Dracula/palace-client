@@ -81,12 +81,16 @@ impl Settings {
     }
 }
 
+/// Split a search path using the platform's own separator.
+///
+/// `std::env::split_paths` uses `;` on Windows and `:` on Unix. Splitting on `:`
+/// ourselves broke Windows drive letters: `C:\props` came out as `C` and
+/// `\props`, neither of which is a directory, so the seeds silently vanished.
 fn split_paths(value: Option<String>) -> Vec<PathBuf> {
     value
         .map(|list| {
-            list.split(':')
-                .filter(|part| !part.is_empty())
-                .map(PathBuf::from)
+            std::env::split_paths(&list)
+                .filter(|part| !part.as_os_str().is_empty())
                 .filter(|path| path.is_dir())
                 .collect()
         })
@@ -98,6 +102,7 @@ fn seed_media() -> Vec<PathBuf> {
         return split_paths(Some(explicit.to_string_lossy().into_owned()));
     }
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_default();
     [

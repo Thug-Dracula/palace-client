@@ -338,7 +338,7 @@ pub fn sanitise_media_name(name: &str) -> Result<PathBuf> {
         if part.len() > MAX_MEDIA_COMPONENT_LEN {
             return Err(AssetError::UnsafeMediaName(name.to_string()));
         }
-        out.push(escape_component(part));
+        out.push(escape_name_component(part));
     }
     if out.as_os_str().is_empty() {
         return Err(AssetError::UnsafeMediaName(name.to_string()));
@@ -346,7 +346,15 @@ pub fn sanitise_media_name(name: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
-fn escape_component(part: &str) -> String {
+/// Percent-escape one path component: only `[A-Za-z0-9._-]` survives, every other
+/// byte becomes `%XX`.
+///
+/// Escaping rather than substituting is a Windows rule. Windows forbids `: * ? " <
+/// > |` inside a filename, so `localhost:9998` is a legal Linux directory name
+/// and an illegal Windows one, and `create_dir_all` rejects the whole path with
+/// `ERROR_INVALID_NAME` (os error 123) rather than just the component.
+#[must_use]
+pub fn escape_name_component(part: &str) -> String {
     let mut out = String::with_capacity(part.len());
     for b in part.bytes() {
         match b {
