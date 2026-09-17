@@ -1,0 +1,163 @@
+name: Release
+
+# What this does, in plain terms: when you tag a commit (v0.1.0), GitHub builds
+# the Windows installer and the Linux AppImage on its own machines and attaches
+# both files to a Release page the public can download from. Nothing is
+# published unless BOTH builds succeed.
+#
+# You can also run it by hand from the Actions tab ("Run workflow"): that builds
+# and checks everything but publishes nothing, which is the safe way to test.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Needed to create the Release and upload files to it.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: tag matches tauri.conf.json
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # A tag that disagrees with the version baked into the app produces files
+      # named 0.1.0 attached to a release called v0.2.0, which is confusing for
+      # everyone. Fail early with instructions instead.
+      - name: Compare the tag with the declared version
+        id: check
+        run: |
+          version=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "manual run — declared version is $version, no tag to compare against"
+            exit 0
+          fi
+
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in src-tauri/tauri.conf.json"
+            echo "::error::bump \"version\" in src-tauri/tauri.conf.json, commit that, then tag v$version"
+            exit 1
+          fi
+
+          echo "tag $GITHUB_REF_NAME matches declared version $version"
+
+  windows:
+    name: Windows installer
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+
+      - name: Frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # Produces a -setup.exe. It installs per-user, so nobody needs admin
+      # rights. The binary is unsigned, so Windows SmartScreen will warn on
+      # first run until a signing certificate is used.
+      - name: Build the NSIS installer
+        run: bun run tauri build --bundles nsis
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux AppImage
+    needs: version
+    runs-on: ubuntu-24.04
+
+    # Built inside Ubuntu 22.04 deliberately. An AppImage is dynamically
+    # linked, so the glibc of the build machine becomes the oldest system it
+    # will start on. Building on 24.04 would produce an AppImage that refuses to
+    # run on Ubuntu 22.04 or Debian 12. The runner itself is 24.04 because
+    # GitHub started retiring the 22.04 runner image on 2026-09-17.
+    #
+    # If this container step ever misbehaves, delete the 'container:' line below
+    # and change the runner to ubuntu-22.04 — at the cost of the deprecation
+    # warning and a 2027 deadline.
+    container: ubuntu:22.04
+
+    steps:
+      # This image does not ship git, and the checkout step needs it. Must run
+      # before checkout, which is why it is a step rather than a setup action.
+      - name: Install git, and the tools bun's installer needs
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git ca-certificates unzip
+
+      - uses: actions/checkout@v7
+
+      - name: Tauri system dependencies
+        run: |
+          apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf xdg-utils
+
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+
+      - name: Frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # If this ever fails inside linuxdeploy with "unknown type [0x13] section
+      # .relr.dyn", add NO_STRIP: "true" to this step's env. That skips the
+      # bundled-library stripping pass; the AppImage gets larger but builds.
+      - name: Build the AppImage
+        run: bun run tauri build --bundles appimage
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-appimage
+          path: target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          # An AppImage is already a compressed image; zipping it again only
+          # costs time.
+          compression-level: 0
+
+  release:
+    name: Publish the release
+    needs: [version, windows, linux]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List what was collected
+        run: ls -lh dist
+
+      # gh is preinstalled on the runner. --verify-tag refuses to invent a tag,
+      # so this can only ever attach files to the tag that started the run.
+      - name: Attach the files to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            dist/*
