@@ -645,6 +645,7 @@ fn run_session(
                     shared,
                     &mut conn,
                     &mut dirty_render,
+                    None,
                 ) {
                     shared.emit(event);
                 }
@@ -695,6 +696,7 @@ fn run_session(
                                 shared,
                                 &mut conn,
                                 &mut dirty_render,
+                                Some(id),
                             ) {
                                 shared.emit(event);
                             }
@@ -812,6 +814,7 @@ fn run_session(
                                     shared,
                                     &mut conn,
                                     &mut dirty_render,
+                                    None,
                                 ) {
                                     shared.emit(event);
                                 }
@@ -823,6 +826,7 @@ fn run_session(
                                 shared,
                                 &mut conn,
                                 &mut dirty_render,
+                                None,
                             ) {
                                 shared.emit(event);
                             }
@@ -1127,7 +1131,8 @@ fn compose(
         })
         .collect();
 
-    let scene = builder.build_with(&room, &avatars, &[]);
+    let mut scene = builder.build_with(&room, &avatars, &[]);
+    scene.dim_level = state.room_dim;
     let (logical_w, logical_h) = scene.logical_size();
     let viewport = shared.viewport();
     let dpr = clamp_dpr(viewport.dpr);
@@ -1258,10 +1263,12 @@ fn run_dispatch(
     shared: &Arc<Shared>,
     conn: &mut Connection,
     dirty_render: &mut bool,
+    only: Option<i32>,
 ) -> Vec<ClientEvent> {
-    run_event(scripts, event, state, shared, conn, dirty_render, 0)
+    run_event(scripts, event, state, shared, conn, dirty_render, only, 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_event(
     scripts: &mut ScriptEngine,
     event: ScriptEvent,
@@ -1269,10 +1276,14 @@ fn run_event(
     shared: &Arc<Shared>,
     conn: &mut Connection,
     dirty_render: &mut bool,
+    only: Option<i32>,
     depth: u32,
 ) -> Vec<ClientEvent> {
     scripts.set_view(host_view(state, shared));
-    let report = scripts.fire(event);
+    let report = match only {
+        Some(spot) => scripts.fire_spot(event, spot),
+        None => scripts.fire(event),
+    };
     let mut out = Vec::new();
     for run in &report.runs {
         if let Some(error) = &run.error {
@@ -1308,7 +1319,7 @@ fn run_event(
         }
         return out;
     }
-    for next in follow {
+    for (next, next_only) in follow {
         out.extend(run_event(
             scripts,
             next,
@@ -1316,6 +1327,7 @@ fn run_event(
             shared,
             conn,
             dirty_render,
+            next_only,
             depth + 1,
         ));
     }
@@ -1367,7 +1379,7 @@ fn apply_effect(
     shared: &Arc<Shared>,
     conn: &mut Connection,
     dirty_render: &mut bool,
-    follow: &mut Vec<ScriptEvent>,
+    follow: &mut Vec<(ScriptEvent, Option<i32>)>,
 ) -> Vec<ClientEvent> {
     if let Some(frame) = effect_frame(effect, context) {
         let _ = conn.send(&frame);
@@ -1421,9 +1433,13 @@ fn apply_effect(
         Effect::Beep => vec![ClientEvent::Note {
             text: "script: BEEP".to_string(),
         }],
-        Effect::DimRoom { percent } => vec![ClientEvent::Note {
-            text: format!("script: DIMROOM {percent}%"),
-        }],
+        Effect::DimRoom { percent } => {
+            state.room_dim = f64::from((*percent).clamp(0, 100)) / 100.0;
+            *dirty_render = true;
+            vec![ClientEvent::Note {
+                text: format!("script: DIMROOM {percent}%"),
+            }]
+        }
         Effect::SetSpotState { spot, state: value }
         | Effect::SetSpotStateLocal { spot, state: value } => {
             let applied = set_local_spot_state(state, *spot, *value);
@@ -1486,12 +1502,12 @@ fn apply_effect(
                 text: format!("script: GOTOROOM {room}"),
             }]
         }
-        Effect::SelectSpot { .. } => {
-            follow.push(ScriptEvent::Select);
+        Effect::SelectSpot { spot } => {
+            follow.push((ScriptEvent::Select, Some(*spot)));
             Vec::new()
         }
         Effect::Macro { index } => {
-            follow.push(ScriptEvent::Macro((*index).clamp(0, 9) as u8));
+            follow.push((ScriptEvent::Macro((*index).clamp(0, 9) as u8), None));
             Vec::new()
         }
         Effect::HideAvatars => {

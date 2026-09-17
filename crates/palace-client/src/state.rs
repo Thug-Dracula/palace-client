@@ -107,6 +107,8 @@ pub struct SessionState {
     pub room_users: Vec<i32>,
     pub current_room: Option<RoomInfo>,
     pub room_desc: Option<RoomDesc>,
+    /// Client-side `DIMROOM` level for the current room; `1.0` is undimmed.
+    pub room_dim: f64,
     pub chat: Vec<ChatLine>,
     chat_seq: u64,
     last_error: Option<String>,
@@ -128,6 +130,7 @@ impl SessionState {
             room_users: Vec::new(),
             current_room: None,
             room_desc: None,
+            room_dim: 1.0,
             chat: Vec::new(),
             chat_seq: 0,
             last_error: None,
@@ -400,6 +403,7 @@ impl SessionState {
                             flags: room.header.room_flags,
                         });
                         self.room_desc = Some(room);
+                        self.room_dim = 1.0;
                         applied.room_entered = true;
                         applied.render = true;
                     }
