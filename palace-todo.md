@@ -552,6 +552,86 @@ Plan, in dependency order:
 
 The bag is **live data belonging to a running client** — read it read-only; never write there.
 
+### 2.16 Wearing props: nothing reaches the server — CONFIRMED live
+
+A live run of the smoke harness (`crates/palace-client/src/bin/live-smoke.rs`) against
+`media.palace.example.info:9998`:
+
+```text
+PALACE_HOST=media.palace.example.info PALACE_USER=SmokeTest PALACE_SMOKE_SECS=20 \
+  cargo run -p palace-client --bin live-smoke
+```
+
+```text
+[room] #901 "Balamb Garden" users=0
+[script] ON ENTER: 1 handler(s) fired
+        effect: MIDILOOP "garden" x99
+        effect: SOUND "garden"
+[users] 1
+        #637 "SmokeTest" face=5 color=14 props=0 at (210,255)
+```
+
+Two things at once: **the room lifecycle fires live** (the point of §2.13), and **our own record
+carries `props=0`**.
+
+`HASPROP` reads `HostView::self_props`, built from our own entry in `state.users`
+(`runtime.rs:1339`), so `HASPROP` is **always false** and prop-gated room logic is unreachable. The
+second half of the cause is that nothing tells the server either — `Effect::SetProps`, `DonProp` and
+`DoffProp` mutate local state and return `Vec::new()` without sending a frame. The `USER_PROP` encoder
+already exists in `palace-wire` and is simply never called.
+
+Consequence, and the reason it was noticed: the Colosseum menu's **Audience** button is a chain of
+
+```text
+{ 14109 GOTOROOM }  cname "Cyan" ==                        IF
+{ 7592  GOTOROOM }  cname "Gogo" == 1020771340 HASPROP AND IF
+```
+
+so every branch is unreachable — the button does nothing. The **Red/Blue** team buttons work because
+they check only `USERNAME` (`USERNAME "Elly" == IFELSE`), which the server does know. That asymmetry
+is the signature of this bug: name-gated logic works, prop-gated logic cannot.
+
+- [ ] Send `USER_PROP` when the worn list changes (in progress).
+- [ ] Decide whether `ASSET_REGI` (uploading the art) is required for the server to accept a worn
+  prop, or whether `USER_PROP` alone suffices.
+
+### 2.17 The Colosseum "you get kicked out" bounce is the room working as designed
+
+The audience rooms carry a capacity guard:
+
+```text
+{ "@512 0Too many audience members; space needed for players!"
+  LOCALMSG  "wrongo.wav" SOUND  { 31743 GOTOROOM } 80 ALARMEXEC }
+NBRROOMUSERS 19 > IF
+```
+
+Over 19 users (17 for non-wizards) they announce the message, play `wrongo.wav` and teleport you to
+**room 31743, the Colosseum menu**. That is exactly the observed `GOTOROOM 31743` + `SOUND "wrongo.wav"`
+and the "boots me out to the menu" symptom: the audience was full. `LOCALMSG` does reach the user —
+the runtime renders it as a `System` chat line (`runtime.rs:1612`) — so the ejection is explained in
+chat, not silent.
+
+Do not "fix" this by suppressing the teleport.
+
+### 2.18 Media comes from seeded directories, not (only) from fetching
+
+`src-tauri/src/lib.rs` builds the media roots as `seed_media()` plus the session cache:
+
+- `$CORPUS/http_harvest` (110 files) and `$MEDIA/colosseum-bgs` (280 files) — read-only seeds;
+- `~/.cache/palace-client/<host%3Aport>/media/http-cache/media/<hash>/` — per-session fetch cache.
+
+So the harness reports `background "sqoom23.gif" not found ... used flat backdrop` because it sets no
+seeds and fetched nothing in its 20s run — an artifact of the harness, **not** a user-facing bug: the
+app resolves art from the seeds (and has a populated fetch cache for other servers). Worth re-checking
+in the GUI if a room ever looks flat.
+
+### 2.19 Running the live harness
+
+`live-smoke` runs the real runtime against a real server and prints every `ClientEvent`. It is the only
+way to see script behaviour live, because the runtime has no logging of its own. Env: `PALACE_HOST`,
+`PALACE_PORT` (9998), `PALACE_USER`, `PALACE_SMOKE_SECS`, `PALACE_SMOKE_ROOM`, `PALACE_CLICK_ROOM`.
+It logs in as a normal user, so pick a name that makes the test obvious to anyone in the room.
+
 ---
 
 ## Part 3 — How to verify
