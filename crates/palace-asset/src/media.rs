@@ -98,6 +98,15 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
+    /// Sparky's HTTP execute branch accepts only these two MIME types.
+    #[must_use]
+    pub fn is_script(&self) -> bool {
+        self.content_type.as_deref().is_some_and(|value| {
+            let mime = value.split(';').next().unwrap_or("").trim();
+            mime.eq_ignore_ascii_case("text/iptscrae") || mime.eq_ignore_ascii_case("text/ipt")
+        })
+    }
+
     /// True for a 2xx status.
     #[must_use]
     pub fn is_success(&self) -> bool {
@@ -412,6 +421,152 @@ pub fn media_url(base_url: &str, name: &str) -> String {
     )
 }
 
+/// Sparky's HTTP cap (`Lc=4`): more than this many in flight is refused.
+pub const DEFAULT_MAX_HTTP_IN_FLIGHT: usize = 4;
+
+/// The media join sparky's `Mc` helper applies before any HTTP GET.
+///
+/// Absolute `http(s)` URLs pass through unchanged; anything else is joined to
+/// the base with exactly one separator, so `""` with no base is refused and a
+/// doubled slash cannot be produced. An empty relative name is a refusal.
+#[must_use]
+pub fn script_url(media_base: &str, url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() || url.len() > 2048 {
+        return None;
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(url.to_string());
+    }
+    let base = media_base.trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some(media_url(base, url))
+}
+
+/// One script-fetch request as the runtime enqueued it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptFetch {
+    /// The URL exactly as the script spelled it.
+    pub requested: String,
+    /// The URL actually fetched, after base joining.
+    pub url: String,
+    /// The executing hotspot; `0` means room-level.
+    pub spot: i32,
+}
+
+/// The end state of one script fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptOutcome {
+    /// A body arrived; `is_script` says whether it must be executed.
+    Response {
+        requested: String,
+        url: String,
+        spot: i32,
+        body: Vec<u8>,
+        content_type: Option<String>,
+    },
+    /// The fetch failed; the reason is for `ON HTTPERROR`.
+    Failure {
+        requested: String,
+        url: String,
+        spot: i32,
+        reason: String,
+    },
+}
+
+impl ScriptOutcome {
+    /// The spot the request was scoped to.
+    #[must_use]
+    pub fn spot(&self) -> i32 {
+        match self {
+            ScriptOutcome::Response { spot, .. } | ScriptOutcome::Failure { spot, .. } => *spot,
+        }
+    }
+
+    /// The requested URL, for event trace and error text.
+    #[must_use]
+    pub fn requested(&self) -> &str {
+        match self {
+            ScriptOutcome::Response { requested, .. }
+            | ScriptOutcome::Failure { requested, .. } => requested,
+        }
+    }
+}
+
+/// Admission guard for queued, running and not-yet-delivered HTTP requests (`Lc=4`).
+#[must_use]
+pub fn admits_in_flight(in_flight: usize) -> bool {
+    in_flight < DEFAULT_MAX_HTTP_IN_FLIGHT
+}
+
+/// Bounded worker: the runtime hands over [`ScriptFetch`] jobs, this drains them
+/// one at a time and refuses a job while the admit ledger is at the ceiling, so
+/// a script cannot queue requests faster than the runtime delivers them.
+pub fn run_script_worker<T: HttpTransport + 'static>(
+    transport: T,
+    media_base: std::sync::mpsc::Receiver<String>,
+    jobs: std::sync::mpsc::Receiver<ScriptFetch>,
+    out: std::sync::mpsc::Sender<ScriptOutcome>,
+) {
+    let mut base = String::new();
+    let mut admitted = 0usize;
+    while let Ok(job) = jobs.recv() {
+        while let Ok(update) = media_base.try_recv() {
+            base = update;
+        }
+        if !admits_in_flight(admitted) {
+            let _ = out.send(ScriptOutcome::Failure {
+                requested: job.requested,
+                url: job.url,
+                spot: job.spot,
+                reason: "too many concurrent requests".to_string(),
+            });
+            continue;
+        }
+        admitted += 1;
+        let resolved = script_url(&base, &job.requested);
+        let Some(url) = resolved else {
+            admitted -= 1;
+            let _ = out.send(ScriptOutcome::Failure {
+                requested: job.requested,
+                url: job.url,
+                spot: job.spot,
+                reason: if base.is_empty() {
+                    "no media base URL known".to_string()
+                } else {
+                    "could not resolve URL to http(s)".to_string()
+                },
+            });
+            continue;
+        };
+        let outcome = match transport.get(&url, DEFAULT_MAX_MEDIA_BYTES) {
+            Ok(response) if response.is_success() => ScriptOutcome::Response {
+                requested: job.requested,
+                url,
+                spot: job.spot,
+                body: response.body,
+                content_type: response.content_type,
+            },
+            Ok(response) => ScriptOutcome::Failure {
+                requested: job.requested,
+                url,
+                spot: job.spot,
+                reason: format!("HTTP {}", response.status),
+            },
+            Err(e) => ScriptOutcome::Failure {
+                requested: job.requested,
+                url,
+                spot: job.spot,
+                reason: e.to_string(),
+            },
+        };
+        let _ = out.send(outcome);
+    }
+}
+
 fn build_url(base_url: &str, name: &str) -> Result<String> {
     let url = media_url(base_url, name);
     if url.len() > 2048 {
@@ -706,5 +861,233 @@ mod tests {
         let _ = f.fetch(BASE, "bg.gif", 0).unwrap();
         let seen = f.transport.seen();
         assert_eq!(seen, vec![url]);
+    }
+
+    // ------------------------------------------------- script fetch (LOADSCRIPT/HTTPGET)
+
+    fn script_response(ct: &str, body: &[u8]) -> Result<HttpResponse> {
+        Ok(HttpResponse {
+            status: 200,
+            body: body.to_vec(),
+            content_type: Some(ct.to_string()),
+        })
+    }
+
+    #[test]
+    fn the_content_type_branch_matches_only_the_iptscrae_mime_types() {
+        let mk = |ct: &str| HttpResponse {
+            status: 200,
+            body: Vec::new(),
+            content_type: Some(ct.to_string()),
+        };
+        assert!(mk("text/iptscrae").is_script());
+        assert!(mk("text/ipt").is_script());
+        assert!(mk("Text/IPTSCRAE; charset=utf-8").is_script());
+        assert!(!mk("text/plain").is_script());
+        assert!(!mk("image/gif").is_script());
+        assert!(!mk("text/html").is_script());
+        assert!(!mk("text/javascript").is_script());
+        let none = HttpResponse {
+            status: 200,
+            body: Vec::new(),
+            content_type: None,
+        };
+        assert!(!none.is_script(), "no content type is not a script");
+    }
+
+    #[test]
+    fn an_absolute_url_passes_through_and_a_relative_one_joins_the_base() {
+        assert_eq!(
+            script_url("https://colosseum.example/media", "http://a/x.txt"),
+            Some("http://a/x.txt".to_string())
+        );
+        assert_eq!(
+            script_url("https://colosseum.example/media", "https://a/x.txt"),
+            Some("https://a/x.txt".to_string())
+        );
+        assert_eq!(
+            script_url("https://colosseum.example/media", "media/custo2.txt"),
+            Some("https://colosseum.example/media/media/custo2.txt".to_string())
+        );
+        assert_eq!(
+            script_url("https://colosseum.example/media", "/custo2.txt"),
+            Some("https://colosseum.example/media/custo2.txt".to_string())
+        );
+        assert_eq!(
+            script_url("https://colosseum.example/media", "custo2.txt"),
+            Some("https://colosseum.example/media/custo2.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn a_relative_url_with_no_base_is_refused() {
+        assert_eq!(script_url("", "media/x.txt"), None, "no base, no fetch");
+        assert_eq!(script_url("   ", "media/x.txt"), None);
+        assert_eq!(script_url("", ""), None);
+        assert_eq!(script_url("", "ftp://a/x"), None);
+        assert_eq!(script_url("", "javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn the_worker_resolves_relative_urls_against_the_advertised_base() {
+        let base = "http://stub.invalid/media";
+        let full = "http://stub.invalid/media/media/custo2.txt";
+        let stub = StubTransport::new(vec![(
+            full,
+            script_response("text/iptscrae", b"1000 500 ADDLOOSEPROP"),
+        )]);
+        let (base_tx, base_rx) = std::sync::mpsc::channel();
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        base_tx.send(base.to_string()).unwrap();
+        job_tx
+            .send(ScriptFetch {
+                requested: "media/custo2.txt".to_string(),
+                url: "media/custo2.txt".to_string(),
+                spot: 0,
+            })
+            .unwrap();
+        drop(job_tx);
+        run_script_worker(stub, base_rx, job_rx, done_tx);
+        let outcome = done_rx.try_recv().unwrap();
+        match outcome {
+            ScriptOutcome::Response { url, spot, .. } => {
+                assert_eq!(url, full);
+                assert_eq!(spot, 0);
+            }
+            other => panic!("expected a Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_worker_reports_every_failure_shape_with_its_url() {
+        let base = "http://stub.invalid/media";
+        let stub = StubTransport::new(vec![
+            (
+                "http://stub.invalid/media/gone.txt",
+                Ok(HttpResponse {
+                    status: 404,
+                    body: Vec::new(),
+                    content_type: None,
+                }),
+            ),
+            (
+                "http://stub.invalid/media/dead.txt",
+                Err(AssetError::Http("connection refused".into())),
+            ),
+        ]);
+        let (base_tx, base_rx) = std::sync::mpsc::channel();
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        base_tx.send(base.to_string()).unwrap();
+        job_tx
+            .send(ScriptFetch {
+                requested: "gone.txt".to_string(),
+                url: "gone.txt".to_string(),
+                spot: 7,
+            })
+            .unwrap();
+        job_tx
+            .send(ScriptFetch {
+                requested: "dead.txt".to_string(),
+                url: "dead.txt".to_string(),
+                spot: 0,
+            })
+            .unwrap();
+        drop(job_tx);
+        run_script_worker(stub, base_rx, job_rx, done_tx);
+        let mut outcomes = Vec::new();
+        while let Ok(outcome) = done_rx.try_recv() {
+            outcomes.push(outcome);
+        }
+        assert_eq!(outcomes.len(), 2, "every job is answered");
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, ScriptOutcome::Failure { .. }),
+                "a 404 and a transport error are failures, got {outcome:?}"
+            );
+        }
+        assert!(matches!(
+            &outcomes[0],
+            ScriptOutcome::Failure { spot: 7, reason, .. } if reason.contains("404")
+        ));
+        assert!(matches!(
+            &outcomes[1],
+            ScriptOutcome::Failure { reason, .. } if reason.contains("connection refused")
+        ));
+    }
+
+    #[test]
+    fn the_in_flight_ceiling_admits_four_and_refuses_a_fifth() {
+        for n in 0..DEFAULT_MAX_HTTP_IN_FLIGHT {
+            assert!(admits_in_flight(n), "{n} in flight must be admitted");
+        }
+        assert!(
+            !admits_in_flight(DEFAULT_MAX_HTTP_IN_FLIGHT),
+            "the cap is exactly {}",
+            DEFAULT_MAX_HTTP_IN_FLIGHT
+        );
+    }
+
+    #[test]
+    fn a_request_over_the_ceiling_is_rejected_with_a_named_reason() {
+        struct Reentrant;
+        impl HttpTransport for Reentrant {
+            fn get(&self, _url: &str, _max_bytes: u64) -> Result<HttpResponse> {
+                Err(AssetError::Http(
+                    "transport fault simulating an in-flight request".into(),
+                ))
+            }
+        }
+        let (base_tx, base_rx) = std::sync::mpsc::channel();
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        base_tx
+            .send("http://stub.invalid/media".to_string())
+            .unwrap();
+        for i in 0..DEFAULT_MAX_HTTP_IN_FLIGHT + 1 {
+            job_tx
+                .send(ScriptFetch {
+                    requested: format!("f{i}.txt"),
+                    url: format!("f{i}.txt"),
+                    spot: 0,
+                })
+                .unwrap();
+        }
+        drop(job_tx);
+        run_script_worker(Reentrant, base_rx, job_rx, done_tx);
+        let outcomes: Vec<ScriptOutcome> = done_rx.try_iter().collect();
+        assert_eq!(
+            outcomes.len(),
+            DEFAULT_MAX_HTTP_IN_FLIGHT + 1,
+            "every job is answered, none are dropped"
+        );
+        for outcome in &outcomes {
+            assert!(matches!(outcome, ScriptOutcome::Failure { .. }));
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_url_fails_with_its_own_reason() {
+        let (base_tx, base_rx) = std::sync::mpsc::channel();
+        let (job_tx, job_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        job_tx
+            .send(ScriptFetch {
+                requested: "ludo/".to_string(),
+                url: "ludo/".to_string(),
+                spot: 3,
+            })
+            .unwrap();
+        drop(job_tx);
+        drop(base_tx);
+        run_script_worker(StubTransport::new(vec![]), base_rx, job_rx, done_tx);
+        match done_rx.try_recv().unwrap() {
+            ScriptOutcome::Failure { spot, reason, .. } => {
+                assert_eq!(spot, 3, "the spot rides along on resolution failure");
+                assert!(reason.contains("media base"), "reason was: {reason}");
+            }
+            other => panic!("expected a Failure, got {other:?}"),
+        }
     }
 }

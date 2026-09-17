@@ -134,6 +134,16 @@ pub enum Effect {
     SetSpotAlarm { spot: i32, ticks: i32 },
     /// `CHATSTR` was rewritten by an `ON INCHAT`/`ON OUTCHAT` handler.
     SetChatString { text: String },
+    /// `LOADSCRIPT` / `HTTPGET` — fetch a URL on the media base.
+    ///
+    /// Sparky scopes the response event to the executing hotspot, so the spot
+    /// rides along from the handler that asked.
+    FetchScript {
+        /// The URL as the script spelled it (absolute, or relative to the media base).
+        url: String,
+        /// The executing hotspot; `0` for room-level scripts.
+        spot: i32,
+    },
     /// A command this host does not implement. Recorded so a run can report it
     /// rather than silently dropping it.
     Unsupported { command: String },
@@ -156,6 +166,7 @@ impl Effect {
             Effect::ErrorMessage { .. } => "ERRORMSG",
             Effect::GotoRoom { .. } => "GOTOROOM",
             Effect::GotoUrl { .. } => "GOTOURL",
+            Effect::FetchScript { url: _, .. } => "LOADSCRIPT",
             Effect::LaunchApp { .. } => "LAUNCHAPP",
             Effect::MoveUserAbs { .. } => "SETPOS",
             Effect::MoveUserRel { .. } => "MOVE",
@@ -253,6 +264,7 @@ impl fmt::Display for Effect {
             }
             Effect::GotoRoom { room } => write!(f, "GOTOROOM {room}"),
             Effect::GotoUrl { url } => write!(f, "GOTOURL {url:?}"),
+            Effect::FetchScript { url, spot } => write!(f, "FETCHSCRIPT spot={spot} {url:?}"),
             Effect::LaunchApp { app } => write!(f, "LAUNCHAPP {app:?}"),
             Effect::MoveUserAbs { x, y } => write!(f, "SETPOS ({x},{y})"),
             Effect::MoveUserRel { dx, dy } => write!(f, "MOVE ({dx},{dy})"),

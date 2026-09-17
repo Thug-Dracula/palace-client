@@ -253,3 +253,118 @@ fn spot_hit_testing_uses_the_decoded_room() {
     assert_eq!(view.spot_at(200, 100).map(|s| s.id), Some(7), "inside");
     assert_eq!(view.spot_at(0, 0).map(|s| s.id), None, "outside");
 }
+
+// ------------------------------------------------------- LOADSCRIPT / HTTPGET
+
+#[test]
+fn loadscript_records_a_fetch_scoped_to_the_executing_spot() {
+    let mut engine = engine_for(&[(7, "ON SELECT { \"custo2.txt\" LOADSCRIPT }")]);
+    let report = engine.fire_spot(ScriptEvent::Select, 7);
+    assert!(report.runs[0].error.is_none());
+    assert_eq!(
+        report.effects,
+        vec![Effect::FetchScript {
+            url: "custo2.txt".to_string(),
+            spot: 7,
+        }]
+    );
+}
+
+#[test]
+fn httpget_from_a_room_level_handler_is_scoped_to_room_zero() {
+    let mut engine = engine_for(&[(0, "ON ROOMREADY { \"ludo/\" HTTPGET }")]);
+    let report = engine.fire(ScriptEvent::RoomReady);
+    assert!(report.fired());
+    assert_eq!(
+        report.effects,
+        vec![Effect::FetchScript {
+            url: "ludo/".to_string(),
+            spot: 0,
+        }]
+    );
+}
+
+#[test]
+fn a_fetched_source_executes_and_its_definitions_answer_httpreceived() {
+    let mut engine = engine_for(&[(
+        9,
+        "ON HTTPRECEIVED { cname GOTPROPS == { \"defined\" SAY } { \"undefined\" SAY } IF }",
+    )]);
+    let run = engine.execute_fetched_source(
+        "\"Gogo\" cname = { 14109 GOTOROOM } cname \"Cyan\" == IF",
+        9,
+    );
+    assert!(
+        run.error.is_none(),
+        "fetched source runs clean: {:?}",
+        run.error
+    );
+    let report = engine.fire_spot(ScriptEvent::HttpReceived, 9);
+    assert_eq!(
+        report.effects,
+        vec![Effect::Say {
+            text: "defined".to_string()
+        }],
+        "the fetched definition is callable from the response handler"
+    );
+}
+
+#[test]
+fn a_fetched_global_survives_until_the_response_dispatch() {
+    let mut engine = engine_for(&[(
+        9,
+        "ON HTTPRECEIVED { gotprops 1 == { \"defined\" SAY } { \"undefined\" SAY } IF }",
+    )]);
+    let run = engine.execute_fetched_source("\"Gogo\" cname = 1 gotprops =", 9);
+    assert!(
+        run.error.is_none(),
+        "fetched source runs clean: {:?}",
+        run.error
+    );
+    let report = engine.fire_spot(ScriptEvent::HttpReceived, 9);
+    assert_eq!(
+        report.effects,
+        vec![Effect::Say {
+            text: "defined".to_string()
+        }],
+        "a global the fetched body assigned is readable in the response dispatch"
+    );
+}
+
+#[test]
+fn a_malformed_fetched_source_faults_inside_the_run_report() {
+    let mut engine = engine_for(&[(3, "ON HTTPRECEIVED { }")]);
+    let run = engine.execute_fetched_source("{ this is not iptscrae", 3);
+    assert!(run.error.is_some(), "the parse failure is reported");
+    assert_eq!(run.spot, 3);
+    let report = engine.fire_spot(ScriptEvent::HttpReceived, 3);
+    assert!(
+        !report.fired() || report.runs.iter().all(|r| r.error.is_none()),
+        "the engine is still alive afterwards"
+    );
+}
+
+#[test]
+fn a_hostile_fetched_source_is_stopped_by_the_budget() {
+    let mut engine = engine_for(&[(3, "ON HTTPRECEIVED { }")]);
+    let run = engine.execute_fetched_source("{ 1 } { 1 } WHILE", 3);
+    assert!(
+        run.error.is_some(),
+        "the step budget must stop an infinite fetched loop"
+    );
+}
+
+#[test]
+fn an_httperror_handler_receives_the_failure_dispatch() {
+    let mut engine = engine_for(&[(5, "ON HTTPERROR { \"handled\" SAY }")]);
+    let report = engine.fire_spot(ScriptEvent::HttpError, 5);
+    assert!(report.fired(), "the spot-scoped error handler runs");
+    assert_eq!(
+        report.effects,
+        vec![Effect::Say {
+            text: "handled".to_string()
+        }]
+    );
+    let other = engine.fire_spot(ScriptEvent::HttpError, 6);
+    assert!(!other.fired(), "a different spot's handler does not run");
+}
