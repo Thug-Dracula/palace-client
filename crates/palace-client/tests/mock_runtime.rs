@@ -24,10 +24,10 @@ use palace_client::{
     ChatKind, ClientConfig, ClientEvent, ClientHandle, ConnectionStatus, RoomInfo, ScreenState,
     ServerBanner, UserInfo,
 };
-use palace_wire::byteorder::ByteOrder;
+use palace_wire::byteorder::{ByteOrder, Writer};
 use palace_wire::fixture::{default_fixture_dir, Fixture};
 use palace_wire::frame::Frame;
-use palace_wire::messages::{reference_logon_record, Message};
+use palace_wire::messages::{reference_logon_record, AssetSpec, Message, Point, UserRec};
 use palace_wire::opcode;
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
 
@@ -74,6 +74,157 @@ fn room_desc(fixture: &Fixture) -> palace_room::RoomDesc {
         }
     }
     panic!("the fixture contains a decodable room description");
+}
+
+// ---------------------------------------------------------------------------
+// Synthesised frames: the fixture is a replayer and carries no user record for
+// the handshake's own id, so tests emit the users and messages they need.
+// ---------------------------------------------------------------------------
+
+/// The user id the fixture's `MSG_TIYID` handshake assigns to this connection.
+const SELF_ID: i32 = 13;
+
+/// Encode a `UserRec` body for room 901, not away and open to messages.
+fn user_rec_body(
+    order: ByteOrder,
+    id: i32,
+    name: &str,
+    face: i16,
+    color: i16,
+    props: &[u32],
+    pos: Point,
+) -> Vec<u8> {
+    let mut rec = UserRec {
+        user_id: id,
+        room_pos: pos,
+        prop_spec: [AssetSpec::default(); AssetSpec::USER_PROP_SLOTS],
+        room_id: 901,
+        face_nbr: face,
+        color_nbr: color,
+        away_flag: 0,
+        open_to_msgs: 1,
+        nbr_props: props.len() as i16,
+        name: name.to_string(),
+    };
+    for (slot, id) in rec.prop_spec.iter_mut().zip(props) {
+        slot.id = *id as i32;
+    }
+    let mut w = Writer::new(order);
+    rec.encode(&mut w);
+    w.into_vec()
+}
+
+/// A `USERNEW` frame carrying a full `UserRec`. The body's id and the frame ref
+/// agree, the shape the real `nprs` uses.
+fn user_new_frame(
+    order: ByteOrder,
+    id: i32,
+    name: &str,
+    face: i16,
+    color: i16,
+    props: &[u32],
+    pos: Point,
+) -> Vec<u8> {
+    let body = user_rec_body(order, id, name, face, color, props, pos);
+    Frame::new(opcode::USERNEW, id, body)
+        .encode(order)
+        .expect("usernw encodes")
+}
+
+/// A `USERNEW` for the handshake's own user id, so a test can see the self user.
+fn self_user_frame(order: ByteOrder) -> Vec<u8> {
+    user_new_frame(order, SELF_ID, "RustProbe", 5, 4, &[], Point::new(306, 151))
+}
+
+fn user_face_frame(order: ByteOrder, id: i32, face: i16) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i16(face);
+    Frame::new(opcode::USERFACE, id, w.into_vec())
+        .encode(order)
+        .expect("usrF encodes")
+}
+
+fn user_color_frame(order: ByteOrder, id: i32, color: i16) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i16(color);
+    Frame::new(opcode::USERCOLOR, id, w.into_vec())
+        .encode(order)
+        .expect("usrC encodes")
+}
+
+fn user_prop_frame(order: ByteOrder, id: i32, props: &[(i32, u32)]) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i32(props.len() as i32);
+    for (prop, crc) in props {
+        w.write_i32(*prop);
+        w.write_u32(*crc);
+    }
+    Frame::new(opcode::USERPROP, id, w.into_vec())
+        .encode(order)
+        .expect("usrP encodes")
+}
+
+fn user_desc_frame(
+    order: ByteOrder,
+    id: i32,
+    face: i16,
+    color: i16,
+    props: &[(i32, u32)],
+) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i16(face);
+    w.write_i16(color);
+    w.write_i32(props.len() as i32);
+    for (prop, crc) in props {
+        w.write_i32(*prop);
+        w.write_u32(*crc);
+    }
+    Frame::new(opcode::USERDESC, id, w.into_vec())
+        .encode(order)
+        .expect("usrD encodes")
+}
+
+fn prop_new_frame(order: ByteOrder, id: i32, crc: u32, pos: Point) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i32(id);
+    w.write_u32(crc);
+    pos.encode(&mut w);
+    Frame::new(opcode::PROPNEW, 0, w.into_vec())
+        .encode(order)
+        .expect("nPrp encodes")
+}
+
+fn prop_move_frame(order: ByteOrder, index: i32, pos: Point) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i32(index);
+    pos.encode(&mut w);
+    Frame::new(opcode::PROPMOVE, 0, w.into_vec())
+        .encode(order)
+        .expect("mPrp encodes")
+}
+
+fn prop_del_frame(order: ByteOrder, index: i32) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i32(index);
+    Frame::new(opcode::PROPDEL, 0, w.into_vec())
+        .encode(order)
+        .expect("dPrp encodes")
+}
+
+/// Write a decodable solid prop blob named `<id>.bin` for each id, so the prop
+/// store holds — and therefore draws — them.
+fn seed_props_dir(ids: &[u32], rgb: [u8; 3]) -> PathBuf {
+    let dir = unique_temp_dir("seed-props");
+    let mut rgba = Vec::with_capacity(8 * 8 * 4);
+    for _ in 0..(8 * 8) {
+        rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+    }
+    let image = palace_prop::PropImage::from_rgba(8, 8, rgba).expect("prop image");
+    let blob = palace_prop::encode_s20_blob(&image, 0, 0, 0).expect("prop encodes");
+    for id in ids {
+        fs::write(dir.join(format!("{id}.bin")), &blob).expect("write seeded prop");
+    }
+    dir
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,4 +1887,529 @@ fn entering_a_new_room_resets_the_dim() {
     cleanup(&cache);
     cleanup(&seed_86);
     cleanup(&seed_887);
+}
+
+// ---------------------------------------------------------------------------
+// Appearance and loose-prop messages: another user's face/colour and the room's
+// props must change both the model and the composited frame
+// ---------------------------------------------------------------------------
+
+/// The handshake plus the fixture's room descriptor, with nothing else.
+fn room_only_frames(fixture: &Fixture) -> Vec<Vec<u8>> {
+    let order = fixture.byte_order;
+    vec![
+        server_bytes(fixture)[0].clone(),
+        Frame::new(opcode::ROOMDESC, 0, room_desc_payload(fixture))
+            .encode(order)
+            .expect("room descriptor encodes"),
+    ]
+}
+
+#[test]
+fn a_remote_face_and_colour_change_update_the_user_and_recompose() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(user_new_frame(
+        order,
+        21,
+        "Other",
+        1,
+        2,
+        &[],
+        Point::new(100, 120),
+    ));
+    let tail = vec![
+        user_face_frame(order, 21, 7),
+        user_color_frame(order, 21, 9),
+    ];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("appearance-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+                && user_lists(collected)
+                    .iter()
+                    .any(|users| users.iter().any(|user| user.id == 21))
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        user_lists(&events)
+            .iter()
+            .any(|users| users.iter().any(|user| user.id == 21 && user.face == 1)),
+        "another user entered with face 1"
+    );
+    let baseline_png = handle.frames().png().expect("a frame was composited");
+    let baseline_version = handle.frames().version();
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            let face = user_lists(collected)
+                .iter()
+                .any(|users| users.iter().any(|user| user.id == 21 && user.face == 7));
+            let color = user_lists(collected)
+                .iter()
+                .any(|users| users.iter().any(|user| user.id == 21 && user.color == 9));
+            face && color
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        user_lists(&events)
+            .iter()
+            .any(|users| users.iter().any(|user| user.id == 21 && user.face == 7)),
+        "USERFACE updated the other user's face"
+    );
+    assert!(
+        user_lists(&events)
+            .iter()
+            .any(|users| users.iter().any(|user| user.id == 21 && user.color == 9)),
+        "USERCOLOR updated the other user's colour"
+    );
+    assert!(
+        wait_for(
+            || handle.frames().version() > baseline_version,
+            Duration::from_secs(5)
+        ),
+        "the appearance change was composited into a new frame"
+    );
+    assert_ne!(
+        handle.frames().png().as_deref(),
+        Some(baseline_png.as_slice()),
+        "the composited frame changed when the other user's face and colour did"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_self_user_appearance_message_reaches_the_self_record() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(self_user_frame(order));
+    let tail = vec![
+        user_prop_frame(order, SELF_ID, &[(10, 0), (20, 0), (30, 0)]),
+        user_desc_frame(order, SELF_ID, 9, 3, &[(111, 7), (222, 0)]),
+    ];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("self-appearance-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+                && user_lists(collected)
+                    .iter()
+                    .any(|users| users.iter().any(|user| user.id == SELF_ID))
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        user_lists(&events)
+            .iter()
+            .any(|users| users.iter().any(|user| user.id == SELF_ID && user.is_self)),
+        "the handshake's own user is present and flagged self"
+    );
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            user_lists(collected).iter().any(|users| {
+                users
+                    .iter()
+                    .any(|user| user.id == SELF_ID && user.props == vec![111, 222])
+            })
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        user_lists(&events).iter().any(|users| {
+            users
+                .iter()
+                .any(|user| user.id == SELF_ID && user.props == vec![10, 20, 30])
+        }),
+        "USERPROP replaced the self user's worn list wholesale"
+    );
+    let last_self = user_lists(&events)
+        .iter()
+        .filter_map(|users| users.iter().find(|user| user.id == SELF_ID))
+        .next_back()
+        .expect("the self user was re-emitted");
+    assert_eq!(
+        (last_self.face, last_self.color),
+        (9, 3),
+        "USERDESC carried the new face and colour"
+    );
+    assert_eq!(
+        last_self.props,
+        vec![111, 222],
+        "USERDESC replaced the worn props in order"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn propnew_appends_a_loose_prop_that_reaches_the_composited_frame() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let frames = room_only_frames(&fixture);
+    let tail = vec![prop_new_frame(
+        order,
+        4242,
+        0xdead_beef,
+        Point::new(90, 150),
+    )];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("propnew-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let props = seed_props_dir(&[4242], [0x10, 0x20, 0xE0]);
+    let mut cfg = config_for(server.port, cache.clone(), seed.clone());
+    cfg.seed_props = vec![props.clone()];
+    let (handle, stream) = ClientRuntime::spawn(cfg);
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .all(|screen| screen.loose_props == 0),
+        "the fixture room starts with no loose props"
+    );
+    let baseline_png = handle.frames().png().expect("a frame was composited");
+    let baseline_version = handle.frames().version();
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.loose_props == 1)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.loose_props == 1),
+        "PROPNEW grew the room's loose-prop list"
+    );
+    assert!(
+        wait_for(
+            || handle.frames().version() > baseline_version,
+            Duration::from_secs(5)
+        ),
+        "the appended prop was composited into a new frame"
+    );
+    assert_ne!(
+        handle.frames().png().as_deref(),
+        Some(baseline_png.as_slice()),
+        "the composited frame changed when the prop was added"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+    cleanup(&props);
+}
+
+#[test]
+fn propmove_repositions_a_loose_prop_and_recomposes() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(prop_new_frame(order, 4242, 0, Point::new(50, 60)));
+    let tail = vec![prop_move_frame(order, 0, Point::new(360, 300))];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("propmove-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let props = seed_props_dir(&[4242], [0xE0, 0x30, 0x10]);
+    let mut cfg = config_for(server.port, cache.clone(), seed.clone());
+    cfg.seed_props = vec![props.clone()];
+    let (handle, stream) = ClientRuntime::spawn(cfg);
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.loose_props == 1)
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.loose_props == 1),
+        "the prop is present before the move"
+    );
+    let at_rest_png = handle.frames().png().expect("a frame was composited");
+    let before_move_version = handle.frames().version();
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.loose_props == 1 && screen.version > before_move_version)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.loose_props == 1),
+        "PROPMOVE left the prop in the room"
+    );
+    assert!(
+        wait_for(
+            || handle.frames().version() > before_move_version,
+            Duration::from_secs(5)
+        ),
+        "the move was composited into a new frame"
+    );
+    assert_ne!(
+        handle.frames().png().as_deref(),
+        Some(at_rest_png.as_slice()),
+        "the composited frame changed when the prop moved"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+    cleanup(&props);
+}
+
+#[test]
+fn propdel_removes_the_loose_prop_and_recomposes() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(prop_new_frame(order, 4242, 0, Point::new(50, 60)));
+    let tail = vec![prop_del_frame(order, 0)];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("propdel-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let props = seed_props_dir(&[4242], [0x20, 0xE0, 0x20]);
+    let mut cfg = config_for(server.port, cache.clone(), seed.clone());
+    cfg.seed_props = vec![props.clone()];
+    let (handle, stream) = ClientRuntime::spawn(cfg);
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.loose_props == 1)
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.loose_props == 1),
+        "the prop is present before the delete"
+    );
+    let with_prop_png = handle.frames().png().expect("a frame was composited");
+    let before_delete_version = handle.frames().version();
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.loose_props == 0)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.loose_props == 0),
+        "PROPDEL shrank the room's loose-prop list"
+    );
+    assert!(
+        wait_for(
+            || handle.frames().version() > before_delete_version,
+            Duration::from_secs(5)
+        ),
+        "the delete was composited into a new frame"
+    );
+    assert_ne!(
+        handle.frames().png().as_deref(),
+        Some(with_prop_png.as_slice()),
+        "the composited frame changed when the prop was deleted"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+    cleanup(&props);
+}
+
+#[test]
+fn a_stale_prop_index_does_not_clear_the_room() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(prop_new_frame(order, 4242, 0, Point::new(50, 60)));
+    let tail = vec![
+        prop_del_frame(order, 999),
+        prop_new_frame(order, 5252, 0, Point::new(200, 220)),
+    ];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("stale-index-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let props = seed_props_dir(&[4242, 5252], [0x80, 0x80, 0x80]);
+    let mut cfg = config_for(server.port, cache.clone(), seed.clone());
+    cfg.seed_props = vec![props.clone()];
+    let (handle, stream) = ClientRuntime::spawn(cfg);
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.loose_props == 1)
+        },
+        Duration::from_secs(20),
+    );
+    assert!(screens(&events)
+        .iter()
+        .any(|screen| screen.loose_props == 1));
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.loose_props == 2)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.loose_props == 2),
+        "a stale PROPDEL index is ignored, so both props remain"
+    );
+    assert!(
+        chats(&events)
+            .iter()
+            .any(|text| text.contains("ignored PROPDEL")),
+        "the stale index was reported"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+    cleanup(&props);
+}
+
+#[test]
+fn propdel_minus_one_clears_every_loose_prop() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(prop_new_frame(order, 4242, 0, Point::new(50, 60)));
+    frames.push(prop_new_frame(order, 5252, 0, Point::new(200, 220)));
+    let tail = vec![prop_del_frame(order, -1)];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("propdel-all-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let props = seed_props_dir(&[4242, 5252], [0x80, 0x80, 0x80]);
+    let mut cfg = config_for(server.port, cache.clone(), seed.clone());
+    cfg.seed_props = vec![props.clone()];
+    let (handle, stream) = ClientRuntime::spawn(cfg);
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.loose_props == 2)
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.loose_props == 2),
+        "both props are present before the clear"
+    );
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.loose_props == 0)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.loose_props == 0),
+        "PROPDEL -1 cleared every loose prop"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+    cleanup(&props);
 }
