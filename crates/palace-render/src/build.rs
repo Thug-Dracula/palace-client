@@ -135,11 +135,23 @@ pub fn clamp_avatar_position(x: i32, y: i32, room_width: i32, room_height: i32) 
 }
 
 /// Build scenes from a room description and local asset stores.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SceneBuilder {
     media: MediaStore,
     props: PropStore,
     pic_opacity: BTreeMap<(i16, i16), f64>,
+    name_tags_visible: bool,
+}
+
+impl Default for SceneBuilder {
+    fn default() -> Self {
+        SceneBuilder {
+            media: MediaStore::default(),
+            props: PropStore::default(),
+            pic_opacity: BTreeMap::new(),
+            name_tags_visible: true,
+        }
+    }
 }
 
 impl SceneBuilder {
@@ -149,8 +161,23 @@ impl SceneBuilder {
         SceneBuilder {
             media,
             props,
-            pic_opacity: BTreeMap::new(),
+            ..SceneBuilder::default()
         }
+    }
+
+    /// Show or hide name tags on the scenes this builder produces.
+    ///
+    /// Defaults to visible; a client flips this when the user toggles names in
+    /// the UI and then rebuilds (or clears [`Scene::name_tags_visible`] on the
+    /// scene it already holds).
+    pub fn set_name_tags_visible(&mut self, visible: bool) {
+        self.name_tags_visible = visible;
+    }
+
+    /// Whether name tags are currently shown.
+    #[must_use]
+    pub fn name_tags_visible(&self) -> bool {
+        self.name_tags_visible
     }
 
     /// Draw a hotspot's picture at `alpha`, keyed by hotspot id and state index.
@@ -254,6 +281,7 @@ impl SceneBuilder {
 
         scene.background = background;
         scene.notes = notes;
+        scene.name_tags_visible = self.name_tags_visible;
         scene
     }
 
@@ -390,7 +418,12 @@ impl SceneBuilder {
                 },
             );
         }
-        Avatar { x, y, parts }
+        Avatar {
+            x,
+            y,
+            parts,
+            name: spec.name.clone(),
+        }
     }
 }
 
@@ -889,5 +922,37 @@ mod tests {
         let a = render(&wild, RenderOptions::at_dpr(1.0));
         let b = render(&edge, RenderOptions::at_dpr(1.0));
         assert_eq!(a.as_rgba(), b.as_rgba(), "and the frames match");
+    }
+
+    #[test]
+    fn name_tags_default_to_visible_and_the_builder_can_hide_them() {
+        let room = empty_room();
+        let mut scene_builder = builder();
+        assert!(
+            scene_builder.name_tags_visible(),
+            "name tags default to visible"
+        );
+
+        let spec = AvatarSpec {
+            name: Some("Rico".to_string()),
+            ..AvatarSpec::new(200, 150, vec![])
+        };
+        let scene = scene_builder.build(&room, std::slice::from_ref(&spec));
+        assert!(scene.name_tags_visible, "the default reaches the scene");
+        assert_eq!(
+            scene.avatars[0].name.as_deref(),
+            Some("Rico"),
+            "the spec's name reaches the avatar"
+        );
+
+        scene_builder.set_name_tags_visible(false);
+        assert!(!scene_builder.name_tags_visible());
+        let scene = scene_builder.build(&room, std::slice::from_ref(&spec));
+        assert!(!scene.name_tags_visible, "the toggle reaches the scene");
+        assert_eq!(
+            scene.avatars[0].name.as_deref(),
+            Some("Rico"),
+            "hiding tags must not discard the name"
+        );
     }
 }

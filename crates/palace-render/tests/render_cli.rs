@@ -474,6 +474,50 @@ fn clock_ms_and_avatar_props_are_accepted() {
 }
 
 #[test]
+fn an_avatar_name_is_parsed_and_rasterized_into_the_frame() {
+    let dir = TempDir::new("avatar-name");
+    let plain = dir.path("plain.png");
+    let named = dir.path("named.png");
+    let frame = frame_fixture();
+    let frame = frame.to_str().unwrap();
+
+    let base = run(
+        &dir,
+        &owned(&[
+            "--frame-file",
+            frame,
+            "--avatar",
+            "300,200",
+            "--out",
+            plain.to_str().unwrap(),
+        ]),
+    );
+    assert_eq!(code(&base), 0, "stderr: {}", stderr(&base));
+    assert!(stderr(&base).contains("avatars 1"), "{}", stderr(&base));
+
+    let with_name = run(
+        &dir,
+        &owned(&[
+            "--frame-file",
+            frame,
+            "--avatar",
+            "300,200;Alice",
+            "--out",
+            named.to_str().unwrap(),
+        ]),
+    );
+    assert_eq!(code(&with_name), 0, "stderr: {}", stderr(&with_name));
+
+    let plain = std::fs::read(&plain).expect("plain png");
+    let named = std::fs::read(&named).expect("named png");
+    assert!(png_size(&plain).is_some() && png_size(&named).is_some());
+    assert_ne!(
+        plain, named,
+        "the name tag must reach the PNG, so the frames cannot be identical"
+    );
+}
+
+#[test]
 fn a_bad_clock_ms_exits_one() {
     let out = run(
         &TempDir::new("bad-clock"),

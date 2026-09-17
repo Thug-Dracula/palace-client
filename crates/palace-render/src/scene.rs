@@ -133,12 +133,15 @@ pub struct Avatar {
     pub y: i32,
     /// The stacked prop images, in the order they should be drawn.
     pub parts: Vec<AvatarPart>,
+    /// The user's name, drawn as a name tag above the avatar when
+    /// [`Scene::name_tags_visible`] is set. `None` draws no tag.
+    pub name: Option<String>,
 }
 
 /// Everything the compositor needs to draw one frame.
 ///
 /// Build it with [`crate::build::SceneBuilder`], or by hand in tests.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Scene {
     /// Logical room size in pixels. Never assume 512×384 — this is the
     /// background's size with that floor applied.
@@ -163,6 +166,28 @@ pub struct Scene {
     pub avatars: Vec<Avatar>,
     /// Non-fatal asset problems worth reporting.
     pub notes: Vec<AssetNote>,
+    /// Whether the compositor draws name tags. Defaults to `true`; a UI toggle
+    /// can clear it on a built scene without rebuilding anything.
+    pub name_tags_visible: bool,
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Scene {
+            size: (0, 0),
+            backdrop: [0, 0, 0, 0],
+            background: None,
+            dim_level: 0.0,
+            overlays_above_nothing: Vec::new(),
+            overlays_above_avatars: Vec::new(),
+            overlays_above_name_tags: Vec::new(),
+            overlays_above_everything: Vec::new(),
+            loose_props: Vec::new(),
+            avatars: Vec::new(),
+            notes: Vec::new(),
+            name_tags_visible: true,
+        }
+    }
 }
 
 impl Scene {
@@ -181,6 +206,7 @@ impl Scene {
             loose_props: Vec::new(),
             avatars: Vec::new(),
             notes: Vec::new(),
+            name_tags_visible: true,
         }
     }
 
@@ -234,5 +260,11 @@ mod tests {
         assert!(Layer::AboveNothing < Layer::AboveAvatars);
         assert!(Layer::AboveAvatars < Layer::AboveNameTags);
         assert!(Layer::AboveNameTags < Layer::AboveEverything);
+    }
+
+    #[test]
+    fn name_tags_are_visible_on_a_fresh_scene() {
+        assert!(Scene::new(10, 10).name_tags_visible);
+        assert!(Scene::default().name_tags_visible);
     }
 }

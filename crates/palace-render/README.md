@@ -70,10 +70,11 @@ The four overlay bands are not arbitrary: `Hotspot.flags` selects them and
 (`0x01` → above all, `0x04` → above props/avatars, `0x40` → above name tags,
 otherwise above nothing). Priority follows the reference: above-all wins.
 
-**Layers 4, 8, 9 and 11 are not rasterized in this milestone.** All 799 corpus
-rooms declare zero draw commands, and name tags and chat text are font work for
-the presentation layer. They are listed so the ordering is on record rather than
-rediscovered later.
+**Layers 4, 8 and 11 are not rasterized in this milestone.** All 799 corpus
+rooms declare zero draw commands, and chat text is font work for the
+presentation layer. They are listed so the ordering is on record rather than
+rediscovered later. **Layer 9 (name tags) is rasterized** by `nametag`, from an
+embedded Liberation Sans Bold face (see below).
 
 **Image overlays are selected, not drawn wholesale.** A hotspot's *current state*
 (`Hotspot.state`) names a picture id; that id selects a `PictureOverlay` from the
@@ -166,7 +167,8 @@ nearest for sprites and smooth for photographic backgrounds.
 | Horizontal mirror of `imageClutARGB` transparency | `PalaceImageOverlay.processTransparency` | **verified** |
 | Exact-RGB transparency match | reference compares through a `0x00AAFF00` mask, which ignores the blue channel (a Flash `threshold` artefact) | **deliberate divergence** |
 | Prop id → blob via `.prp` `id → dataOffset` | `PRP-FORMAT.md`; cross-checked against 180,661 roster records | **verified** |
-| Draw commands / name tags / chat text | — | **not implemented** (0/799 rooms use draw commands) |
+| Name tag geometry, font, glow | `NameTag.mxml`: `x = user.x - 1 - width/2`, `y = user.y + 17`, Arial 12 bold white, `GlowFilter(blur=2, strength=5)` | **verified** (glow is a documented 2 px dilation, not a Gaussian blur) |
+| Draw commands / chat text | — | **not implemented** (0/799 rooms use draw commands) |
 
 **The 1 px avatar discrepancy.** `linpal`'s C++ client draws the avatar box at
 `x-22, y-22` and each prop at `x + hOffset - 22`; OpenPalace's AS3 client and the
@@ -260,9 +262,11 @@ reported. It skips cleanly when the corpus is absent.
 
 ## Not in this milestone
 
-Tauri, windowing, network, asset *fetching*, IPTSCRAE, name tags, chat text, draw
-command rasterization, prop animation (the clock is injected but the scene is
-static), Type 1 avatars, and per-picture effects. Multi-frame prop animation
+Tauri, windowing, network, asset *fetching*, IPTSCRAE, chat text, draw command
+rasterization, prop animation (the clock is injected but the scene is static),
+Type 1 avatars, and per-picture effects. Name tags *are* rasterized, but only in
+the fixed Liberation Sans Bold face — there is no font selection or user-supplied
+font. Multi-frame prop animation
 needs the `ANIMATE`/`BOUNCE` frame sequence, which is a later milestone.
 
 ## Sources
@@ -274,4 +278,6 @@ hotspot bands, overlay centring, avatar geometry, transparency),
 (`gtkbigpage.cpp`, prop offsets), the web client **sparky** (y-ordering), and
 `~/palace-corpus/PRP-FORMAT.md` + `pserver.prp` (the `.prp` container). Licensing is
 deliberately not a constraint for this non-commercial port; the client as a whole
-is GPL-3.0-or-later.
+is GPL-3.0-or-later. The name-tag font is Liberation Sans Bold (metric-compatible
+with the reference's Arial), embedded under the SIL OFL 1.1 — see
+`assets/LiberationSans-Bold.LICENSE.txt`.

@@ -38,6 +38,8 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "m
 flate2 = "1.1"
 png = "0.18"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+# Name-tag text: parse and rasterize the embedded Liberation Sans Bold face.
+fontdue = "0.9.4"
 
 [profile.release]
 lto = "thin"
