@@ -349,23 +349,43 @@ from silently doing nothing.
 | `Lock`, `Unlock` | Reported: the frame goes on the wire, and nothing local consults lock state |
 | `SetSpotAlarm` | Reported: `ScriptHost` records the alarm and the engine runs it |
 
-### The double defect: seven arms that apply nothing
+### The double defect: seven arms that applied nothing (**closed**)
 
 The table that used to sit here counted *missing arms*, which was too kind a
-metric. Seven variants already had an arm that sets `*dirty_render = true` and
-emits a note but **mutates no state at all** — so they force a re-render that is
-guaranteed byte-identical. An inert arm is indistinguishable from a working one
-inside a `match`, which is how this stayed hidden.
+metric. Seven variants already had an arm that set `*dirty_render = true` and
+emitted a note but **mutated no state at all** — so they forced a re-render that
+was guaranteed byte-identical. An inert arm is indistinguishable from a working
+one inside a `match`, which is how this stayed hidden. All seven now mutate what
+the renderer already reads:
 
-| Arm | Currently | Should mutate |
-|---|---|---|
-| `MoveSpot`, `MoveSpotLocal` (`SETLOC`) | dirty + note | `hotspot.loc` — the renderer reads it (`build.rs:329`) |
-| `SetPicOffset`, `SetPicOffsetLocal` (`SETPICLOC`) | dirty + note | `states[].pic_loc` (`build.rs:330`) |
-| `SetPicOpacity` | note only, not even dirty | `Sprite.alpha` exists (`scene.rs:83`); needs client-side state |
-| `HideAvatars`, `ShowAvatars` | dirty + note | a flag `compose` consults |
+| Arm | Now |
+|---|---|
+| `MoveSpot`, `MoveSpotLocal` (`SETLOC`) | replace `hotspot.loc` |
+| `SetPicOffset`, `SetPicOffsetLocal` (`SETPICLOC`) | replace `states[].pic_loc`, the current state's when none is named |
+| `SetPicOpacity` | `SessionState.pic_opacity` → `SceneBuilder::set_pic_opacity` → `Sprite.alpha` |
+| `HideAvatars`, `ShowAvatars` | `SessionState.avatars_hidden`, which `compose` consults |
 
-**Still open.** `SETLOC`/`SETPICLOC` need their absolute-vs-relative semantics
-settled against the references before they can be applied.
+All four local overrides reset when a room descriptor arrives, exactly as
+`room_dim` does, and `PalaceClient.as` clears its own room overrides the same way.
+
+**The semantics are verified, not guessed.** `SETLOC` and `SETPICLOC` take
+**absolute** values, not deltas. `MSG_SPOTMOVE`/`MSG_PICTMOVE` carry a *new
+position* with no delta field, ThePalacev0's server assigns it (`spot.loc = pos`),
+and OpenPalace carries a commit titled "Making SETLOCLOCAL use absolute positions
+instead of relative". Counter-evidence worth knowing: the original IPTSCRAE
+manual's prose says `SETLOC` moves a spot "relative to its current position", while
+its own summary table says "Moves spotID to x,y" — the summary and the protocol are
+right. For `SETPICLOC` the manual's worked example settles it: `-50 -50 100
+SETPICLOC` followed by `54 -21 100 SETPICLOC` restores the original offset, which
+only works if the value replaces rather than adds. `SETPICOPACITY` is an OpenPalace
+extension absent from the original guide, with `alpha = percent / 100`.
+
+**Still open: `SETLOC`/`SETPICLOC` never reach the server.** The non-local variants
+should broadcast so the whole room sees the move, but the opcodes (`SPOTMOVE`
+`coLs`, `PICTMOVE` `pLoc`) have no verified body layout to port — OpenPalace's own
+`moveSpot`/`setPicOffset` are no-op stubs, and every other encoder in `wire.rs` is
+pinned byte-for-byte against a working reference sender. Until one is found, a
+script's spot move is local to this client only.
 
 ### The one fixed earlier: `DIMROOM`
 
