@@ -166,7 +166,7 @@ impl Effect {
             Effect::ErrorMessage { .. } => "ERRORMSG",
             Effect::GotoRoom { .. } => "GOTOROOM",
             Effect::GotoUrl { .. } => "GOTOURL",
-            Effect::FetchScript { url: _, .. } => "LOADSCRIPT",
+            Effect::FetchScript { .. } => "LOADSCRIPT",
             Effect::LaunchApp { .. } => "LAUNCHAPP",
             Effect::MoveUserAbs { .. } => "SETPOS",
             Effect::MoveUserRel { .. } => "MOVE",
