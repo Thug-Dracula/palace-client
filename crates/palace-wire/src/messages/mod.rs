@@ -11,6 +11,7 @@
 mod chat;
 mod lists;
 mod logon;
+mod pictures;
 mod props;
 mod room;
 mod server;
@@ -20,10 +21,11 @@ mod user;
 pub use chat::{Talk, Whisper};
 pub use lists::{RoomList, RoomListRec, UserList, UserListRec};
 pub use logon::{aux_flags, reference_logon_record, AuxRegistrationRec, ReferenceProfile};
+pub use pictures::PictMove;
 pub use props::{PropDel, PropMove, PropNew};
 pub use room::{RoomDescription, RoomRec};
 pub use server::{AltLogonReply, HttpServer, ServerInfo, ServerVersion, UserLog};
-pub use spots::{DoorLock, SpotState};
+pub use spots::{DoorLock, SpotDel, SpotMove, SpotNew, SpotState};
 pub use user::{
     AssetSpec, Point, UserColor, UserDesc, UserExit, UserFace, UserMove, UserNew, UserProp,
     UserRec, UserStatus,
@@ -87,6 +89,14 @@ pub enum Message {
     DoorUnlock(DoorLock),
     /// `sSta` — a hotspot's state changed.
     SpotState(SpotState),
+    /// `opSn` — a hotspot was created; the body is empty.
+    SpotNew,
+    /// `opSd` — a hotspot was deleted.
+    SpotDel(SpotDel),
+    /// `coLs` — a hotspot moved to an absolute position.
+    SpotMove(SpotMove),
+    /// `pLoc` — a picture moved to an absolute position.
+    PictMove(PictMove),
     /// `endr` — end of room description.
     RoomDescEnd,
     /// `talk` — public chat.
@@ -156,6 +166,13 @@ impl Message {
             opcode::DOORLOCK => Message::DoorLock(DoorLock::decode(r)?),
             opcode::DOORUNLOCK => Message::DoorUnlock(DoorLock::decode(r)?),
             opcode::SPOTSTATE => Message::SpotState(SpotState::decode(r)?),
+            opcode::SPOTNEW => {
+                SpotNew::decode(r)?;
+                Message::SpotNew
+            }
+            opcode::SPOTDEL => Message::SpotDel(SpotDel::decode(r)?),
+            opcode::SPOTMOVE => Message::SpotMove(SpotMove::decode(r)?),
+            opcode::PICTMOVE => Message::PictMove(PictMove::decode(r)?),
             opcode::ROOMDESCEND => Message::RoomDescEnd,
             opcode::TALK => Message::Talk(Talk::decode(ref_num, r)?),
             opcode::WHISPER => Message::Whisper(Whisper::decode(ref_num, r)?),
@@ -261,6 +278,16 @@ impl Message {
             Message::SpotState(s) => format!(
                 "spot state: room={} spot={} state={}",
                 s.room_id, s.spot_id, s.state
+            ),
+            Message::SpotNew => "new spot (no body)".to_string(),
+            Message::SpotDel(d) => format!("delete spot: spot={}", d.spot_id),
+            Message::SpotMove(m) => format!(
+                "move spot: room={} spot={} v={} h={}",
+                m.room_id, m.spot_id, m.position.v, m.position.h
+            ),
+            Message::PictMove(m) => format!(
+                "move picture: room={} spot={} v={} h={}",
+                m.room_id, m.spot_id, m.position.v, m.position.h
             ),
             Message::Talk(t) => format!("talk: user_id={} {:?}", t.user_id, t.text),
             Message::Whisper(w) => format!(
@@ -374,8 +401,8 @@ mod tests {
     use super::*;
     use crate::byteorder::Writer;
     use crate::opcode::{
-        DOORLOCK, DOORUNLOCK, LISTOFALLROOMS, LOGOFF, PING, PROPMOVE, SPOTSTATE, TALK, USERFACE,
-        USERPROP,
+        DOORLOCK, DOORUNLOCK, LISTOFALLROOMS, LOGOFF, PICTMOVE, PING, PROPMOVE, SPOTDEL, SPOTMOVE,
+        SPOTNEW, SPOTSTATE, TALK, USERFACE, USERPROP,
     };
 
     #[test]
@@ -511,5 +538,49 @@ mod tests {
             })
         );
         assert!(spot.describe().contains("state=1"));
+    }
+
+    #[test]
+    fn the_room_change_messages_reach_their_arms() {
+        assert_eq!(
+            Message::decode(SPOTNEW, 0, &[], ByteOrder::Little).unwrap(),
+            Message::SpotNew
+        );
+        assert!(Message::decode(SPOTNEW, 0, &[0u8; 2], ByteOrder::Little).is_err());
+
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(4);
+        let del = Message::decode(SPOTDEL, 0, &w.into_vec(), ByteOrder::Little).unwrap();
+        assert_eq!(del, Message::SpotDel(SpotDel { spot_id: 4 }));
+        assert!(del.describe().contains("spot=4"));
+
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(887);
+        w.write_i16(33);
+        Point::new(240, 120).encode(&mut w);
+        let body = w.into_vec();
+        assert_eq!(body.len(), 8);
+
+        let mv = Message::decode(SPOTMOVE, 0, &body, ByteOrder::Little).unwrap();
+        assert_eq!(
+            mv,
+            Message::SpotMove(SpotMove {
+                room_id: 887,
+                spot_id: 33,
+                position: Point::new(240, 120)
+            })
+        );
+        assert!(mv.describe().contains("v=240 h=120"));
+
+        let pic = Message::decode(PICTMOVE, 0, &body, ByteOrder::Little).unwrap();
+        assert_eq!(
+            pic,
+            Message::PictMove(PictMove {
+                room_id: 887,
+                spot_id: 33,
+                position: Point::new(240, 120)
+            })
+        );
+        assert!(pic.describe().contains("spot=33"));
     }
 }

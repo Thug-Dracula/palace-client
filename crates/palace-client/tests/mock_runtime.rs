@@ -230,6 +230,16 @@ fn spot_state_frame(order: ByteOrder, room_id: i16, spot_id: i16, state: i16) ->
         .expect("sSta encodes")
 }
 
+fn spot_move_frame(order: ByteOrder, room_id: i16, spot_id: i16, pos: Point) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i16(room_id);
+    w.write_i16(spot_id);
+    pos.encode(&mut w);
+    Frame::new(opcode::SPOTMOVE, 0, w.into_vec())
+        .encode(order)
+        .expect("coLs encodes")
+}
+
 /// A server-side `talk` frame, used as an ordered marker: frames are processed
 /// in arrival order, so seeing this chat line proves every earlier frame ran.
 fn talk_marker_frame(order: ByteOrder, text: &str) -> Vec<u8> {
@@ -649,6 +659,25 @@ fn script_runs(events: &[ClientEvent]) -> Vec<ScriptRun<'_>> {
             _ => None,
         })
         .collect()
+}
+
+/// The frame version once it has held still for a moment, so a later comparison
+/// is not confused by media still arriving.
+fn settled_frame_version(handle: &ClientHandle, timeout: Duration) -> u64 {
+    let deadline = Instant::now() + timeout;
+    let mut version = handle.frames().version();
+    let mut changed_at = Instant::now();
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+        let now = handle.frames().version();
+        if now != version {
+            version = now;
+            changed_at = Instant::now();
+        } else if changed_at.elapsed() > Duration::from_millis(250) {
+            break;
+        }
+    }
+    version
 }
 
 fn wait_for(mut predicate: impl FnMut() -> bool, timeout: Duration) -> bool {
@@ -3102,6 +3131,89 @@ fn a_non_door_hotspot_with_a_nonzero_state_still_dispatches_select() {
             .any(|text| text.contains("locked door")),
         "an ordinary hotspot is never refused: {:?}",
         notes(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_spot_move_for_this_room_recomposes_and_a_foreign_one_does_not() {
+    const FOREIGN: &str = "foreign-spot-move-processed";
+    const LOCAL: &str = "local-spot-move-processed";
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("887");
+    let room = palace_room::decode_payload(&payload, order).expect("room 887 decodes");
+    let spot_id = room.hotspots[0].id;
+
+    let mut initial = vec![server_bytes(&fixture)[0].clone()];
+    initial.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let tail = vec![
+        spot_move_frame(order, 999, spot_id, Point::new(1, 1)),
+        talk_marker_frame(order, FOREIGN),
+        spot_move_frame(order, 887, spot_id, Point::new(240, 120)),
+        talk_marker_frame(order, LOCAL),
+    ];
+    let (server, gate) = MockServer::start_gated(initial, tail);
+    let cache = unique_temp_dir("spot-move-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 887)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 887)
+        .expect("a frame was composed for room 887");
+    wait_for_entry_alarm(&handle, screen);
+    let settled = settled_frame_version(&handle, Duration::from_secs(5));
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| chats(collected).iter().any(|text| text.contains(FOREIGN)),
+        Duration::from_secs(10),
+    );
+    assert!(
+        chats(&events).iter().any(|text| text.contains(FOREIGN)),
+        "the foreign spot move was processed before its marker: {:?}",
+        chats(&events)
+    );
+    assert_eq!(
+        handle.frames().version(),
+        settled,
+        "a move aimed at room 999 must not recompose this room"
+    );
+
+    let events = collect_events(
+        &mut rx,
+        |collected| chats(collected).iter().any(|text| text.contains(LOCAL)),
+        Duration::from_secs(10),
+    );
+    assert!(
+        chats(&events).iter().any(|text| text.contains(LOCAL)),
+        "the in-room spot move was processed before its marker: {:?}",
+        chats(&events)
+    );
+    assert!(
+        handle.frames().version() > settled,
+        "the move aimed at room 887 recomposed the frame"
     );
 
     handle.disconnect();
