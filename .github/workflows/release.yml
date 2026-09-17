@@ -175,7 +175,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          notes="Don't expect this to be a working client. It isn't one yet. If you want to download it, it should be because you want to contribute, or you're just curious and want to see what state it's in."
+
+          # Look the release up by tag, not by name: 'gh release view' also
+          # matches a release whose *name* equals the tag, which silently hides
+          # a release that has been detached from its tag.
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --clobber \
@@ -184,6 +189,7 @@ jobs:
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$GITHUB_REF_NAME" \
+              --notes "$notes" \
               --generate-notes \
               --verify-tag \
               dist/*
