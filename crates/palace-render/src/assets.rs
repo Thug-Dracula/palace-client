@@ -371,6 +371,7 @@ impl PropStore {
                 alpha: if prop.header.is_ghost() { 0.5 } else { 1.0 },
                 h_offset: prop.header.h_offset,
                 v_offset: prop.header.v_offset,
+                is_head: prop.header.is_head(),
             },
             Err(err) => {
                 notes.push(AssetNote::BadProp {
@@ -394,11 +395,14 @@ pub struct DecodedProp {
     pub h_offset: i16,
     /// Vertical origin offset from the prop header.
     pub v_offset: i16,
+    /// Whether the prop header carries the `HEAD` flag. A user wearing one gets
+    /// no built-in face (`Avatar.mxml`'s `checkFaceProps`).
+    pub is_head: bool,
 }
 
 impl DecodedProp {
     /// The placeholder used when a prop cannot be resolved. Offsets are zero
-    /// because there is no header to read.
+    /// because there is no header to read, and it is not a head prop.
     #[must_use]
     pub fn placeholder(_id: u32) -> Self {
         DecodedProp {
@@ -406,6 +410,7 @@ impl DecodedProp {
             alpha: 1.0,
             h_offset: 0,
             v_offset: 0,
+            is_head: false,
         }
     }
 }
@@ -500,6 +505,7 @@ mod tests {
         assert_eq!((decoded.image.width(), decoded.image.height()), (44, 44));
         assert_eq!(decoded.alpha, 1.0);
         assert_eq!((decoded.h_offset, decoded.v_offset), (0, 0));
+        assert!(!decoded.is_head, "a placeholder is never a head prop");
         assert_eq!(notes, vec![AssetNote::MissingProp { id: 7 }]);
     }
 
@@ -524,6 +530,7 @@ mod tests {
         assert!(notes.is_empty(), "a valid prop produces no note: {notes:?}");
         assert_eq!((decoded.h_offset, decoded.v_offset), (7, 7));
         assert_eq!(decoded.alpha, 0.5, "GHOST bit halves the drawn alpha");
+        assert!(decoded.is_head, "HEAD bit suppresses the built-in face");
         assert_eq!((decoded.image.width(), decoded.image.height()), (44, 44));
         let _ = std::fs::remove_dir_all(&dir);
     }
