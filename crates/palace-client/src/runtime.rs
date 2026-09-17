@@ -23,7 +23,7 @@ use palace_render::{
 };
 use palace_wire::byteorder::Writer;
 use palace_wire::frame::{user_color_frame, user_face_frame, user_move_frame, Frame};
-use palace_wire::messages::{reference_logon_record, AssetSpec, Point, Talk};
+use palace_wire::messages::{reference_logon_record, AssetSpec, Point, Talk, UserProp};
 use palace_wire::opcode;
 use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -140,6 +140,14 @@ pub enum ClientCommand {
     SetAvatar {
         face: i16,
         color: i16,
+    },
+    /// Replace the signed-in user's worn props with the complete list `props`.
+    ///
+    /// `USERPROP` replaces the worn list rather than extending it, and id `0` is
+    /// the empty slot, not a prop. Ids outside the 9-prop cap are ignored; see
+    /// [`set_self_props`].
+    SetProps {
+        props: Vec<u32>,
     },
     RunScript(String),
     SetViewport {
@@ -348,6 +356,11 @@ impl ClientHandle {
     /// Change the signed-in user's face and colour, locally and on the server.
     pub fn set_avatar(&self, face: i16, color: i16) {
         self.send(ClientCommand::SetAvatar { face, color });
+    }
+
+    /// Replace the signed-in user's worn props, locally and on the server.
+    pub fn set_props(&self, props: Vec<u32>) {
+        self.send(ClientCommand::SetProps { props });
     }
 
     /// Report the pointer position, in viewport pixels.
@@ -643,6 +656,18 @@ fn run_session(
                         dirty_render = true;
                     }
                 }
+                ClientCommand::SetProps { props } => {
+                    let outcome = set_self_props(&mut state, &mut conn, &props)?;
+                    if outcome.changed {
+                        dirty_render = true;
+                    }
+                    if outcome.dropped > 0 {
+                        shared.note(format!(
+                            "props: kept the first {MAX_WORN_PROPS} worn props, ignored {}",
+                            outcome.dropped
+                        ));
+                    }
+                }
                 ClientCommand::RunScript(source) => run_source_pending = Some(source),
                 ClientCommand::SetViewport {
                     width,
@@ -822,6 +847,10 @@ fn run_session(
             }
         }
         if let Some(source) = run_source_pending.take() {
+            // The input box runs against the *current* session: without this a
+            // box script reads whatever view the last event dispatch left, so a
+            // `HASPROP` would answer for the wrong worn list.
+            scripts.set_view(host_view(&state, shared));
             match scripts.run_source(&source) {
                 Ok(run) => {
                     shared.note(format!(
@@ -1593,8 +1622,13 @@ fn apply_effect(
     dirty_render: &mut bool,
     follow: &mut Vec<(ScriptEvent, Option<i32>)>,
 ) -> Vec<ClientEvent> {
-    if let Some(frame) = effect_frame(effect, context) {
-        let _ = conn.send(&frame);
+    // `effect_frame` also encodes `SETPROPS`, but the prop arms below send the
+    // worn list through one shared path (`set_self_props`); skipping the generic
+    // encoder for `SETPROPS` is what keeps it to a single `USERPROP`.
+    if !matches!(effect, Effect::SetProps { .. }) {
+        if let Some(frame) = effect_frame(effect, context) {
+            let _ = conn.send(&frame);
+        }
     }
     match effect {
         Effect::Say { text } | Effect::GlobalMessage { text } => {
@@ -1802,17 +1836,26 @@ fn apply_effect(
         }
         Effect::DrawLine { .. } | Effect::DrawLineRel { .. } => Vec::new(),
         Effect::SetProps { props } => {
-            if let Some(user) = state.users.get_mut(&state.banner.user_id) {
-                user.props = props.iter().map(|p| *p as u32).collect();
+            let wanted: Vec<u32> = props
+                .iter()
+                .filter_map(|p| u32::try_from(*p).ok())
+                .collect();
+            let outcome = set_self_props(state, conn, &wanted).unwrap_or(PropOutcome::NONE);
+            *dirty_render |= outcome.changed;
+            if outcome.dropped > 0 {
+                vec![ClientEvent::Note {
+                    text: format!(
+                        "script: SETPROPS kept the first {MAX_WORN_PROPS} worn props, ignored {}",
+                        outcome.dropped
+                    ),
+                }]
+            } else {
+                Vec::new()
             }
-            *dirty_render = true;
-            Vec::new()
         }
         Effect::Naked => {
-            if let Some(user) = state.users.get_mut(&state.banner.user_id) {
-                user.props.clear();
-            }
-            *dirty_render = true;
+            let outcome = set_self_props(state, conn, &[]).unwrap_or(PropOutcome::NONE);
+            *dirty_render |= outcome.changed;
             Vec::new()
         }
         Effect::SetUserName { name } => {
@@ -1852,6 +1895,9 @@ fn apply_effect(
 
         Effect::DonProp { prop } => {
             let changed = prop_id(*prop).is_some_and(|id| wear_prop(state, id));
+            if changed {
+                let _ = send_self_props(state, conn);
+            }
             *dirty_render |= changed;
             vec![ClientEvent::Note {
                 text: format!("script: DONPROP {prop}{}", no_change_suffix(changed)),
@@ -1859,6 +1905,9 @@ fn apply_effect(
         }
         Effect::DoffProp => {
             let changed = doff_prop(state).is_some();
+            if changed {
+                let _ = send_self_props(state, conn);
+            }
             *dirty_render |= changed;
             vec![ClientEvent::Note {
                 text: format!("script: DOFFPROP{}", no_change_suffix(changed)),
@@ -1866,6 +1915,9 @@ fn apply_effect(
         }
         Effect::RemoveProp { prop } => {
             let changed = prop_id(*prop).is_some_and(|id| remove_worn_prop(state, id));
+            if changed {
+                let _ = send_self_props(state, conn);
+            }
             *dirty_render |= changed;
             vec![ClientEvent::Note {
                 text: format!("script: REMOVEPROP {prop}{}", no_change_suffix(changed)),
@@ -1912,6 +1964,9 @@ fn apply_effect(
         // floor where you are (`PalaceController.dropProp`).
         Effect::DropProp { x, y } => {
             let dropped = drop_prop(state, *x, *y);
+            if dropped.is_some() {
+                let _ = send_self_props(state, conn);
+            }
             *dirty_render |= dropped.is_some();
             vec![ClientEvent::Note {
                 text: format!(
@@ -1999,6 +2054,151 @@ fn prop_id(raw: i64) -> Option<u32> {
 /// How many props a user may wear at once (`PalaceUser.wearProp`).
 const MAX_WORN_PROPS: usize = 9;
 
+/// What applying a worn-list request did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PropOutcome {
+    /// Whether the model's worn list actually changed.
+    changed: bool,
+    /// Real ids the 9-prop cap ignored, for the caller to report.
+    dropped: usize,
+}
+
+impl PropOutcome {
+    /// Nothing changed and nothing was ignored.
+    const NONE: PropOutcome = PropOutcome {
+        changed: false,
+        dropped: 0,
+    };
+}
+
+/// The worn list the reference model would hold from `requested`.
+///
+/// `PalaceUser.setProps` clears and re-adds, skipping id 0 (the empty slot the
+/// server pads a record with), skipping duplicates, and stopping at 9 — so a
+/// request is filtered the same way here. Returns the first-seen order and the
+/// number of real ids the cap ignored.
+fn normalize_worn_props(requested: &[u32]) -> (Vec<u32>, usize) {
+    let mut worn = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut dropped = 0usize;
+    for id in requested {
+        if *id == 0 || !seen.insert(*id) {
+            continue;
+        }
+        if worn.len() >= MAX_WORN_PROPS {
+            dropped += 1;
+            continue;
+        }
+        worn.push(*id);
+    }
+    (worn, dropped)
+}
+
+/// A row for the signed-in user, used only until the server's own record
+/// arrives (`nprs`/`rprs` replaces it wholesale).
+fn self_row(user_id: i32, props: Vec<u32>) -> UserInfo {
+    UserInfo {
+        id: user_id,
+        name: String::new(),
+        face: 0,
+        color: 0,
+        room_id: 0,
+        x: 0,
+        y: 0,
+        props,
+        away: false,
+        is_self: true,
+    }
+}
+
+/// The signed-in user's row, inserting an empty one when the server's record
+/// has not arrived yet so a worn-prop change is not lost. `None` before the
+/// handshake has assigned an id.
+fn self_user_mut(state: &mut SessionState) -> Option<&mut UserInfo> {
+    let user_id = state.banner.user_id;
+    if user_id <= 0 {
+        return None;
+    }
+    Some(
+        state
+            .users
+            .entry(user_id)
+            .or_insert_with(|| self_row(user_id, Vec::new())),
+    )
+}
+
+/// Replace the signed-in user's worn list in the model, without touching the
+/// wire. Returns whether it changed and how many ids the cap ignored.
+///
+/// Our own record may not be in `state.users` yet when a command arrives: the
+/// server's `UserRec` has not been seen, so `host_view`'s `self_props` — and
+/// therefore `HASPROP` — reads an empty list. Rather than drop the props on the
+/// floor, a self row is inserted; the server's later record replaces it.
+fn replace_self_props(state: &mut SessionState, requested: &[u32]) -> PropOutcome {
+    let (worn, dropped) = normalize_worn_props(requested);
+    let unchanged = || PropOutcome {
+        changed: false,
+        dropped,
+    };
+    if state.banner.user_id <= 0 {
+        return unchanged();
+    }
+    if !state.users.contains_key(&state.banner.user_id) && worn.is_empty() {
+        return unchanged();
+    }
+    let Some(user) = self_user_mut(state) else {
+        return unchanged();
+    };
+    if user.props == worn {
+        return unchanged();
+    }
+    user.props = worn;
+    PropOutcome {
+        changed: true,
+        dropped,
+    }
+}
+
+/// Send the complete worn list as exactly one `USERPROP` frame.
+///
+/// `refNum` is our own user id and the body is `count` then `(asset id, 0)` per
+/// prop (`PalaceClient.as::updateUserProps`). The list never exceeds the
+/// encoder's bound because [`normalize_worn_props`] clamps it.
+fn send_self_props(state: &SessionState, conn: &mut Connection) -> Result<()> {
+    let user_id = state.banner.user_id;
+    let props = state.users.get(&user_id).map_or_else(Vec::new, |user| {
+        user.props
+            .iter()
+            .map(|id| AssetSpec {
+                id: *id as i32,
+                crc: 0,
+            })
+            .collect()
+    });
+    let frame = UserProp { user_id, props }.frame(state.byte_order())?;
+    conn.send(&frame)
+}
+
+/// Apply a worn-list request to the model and, when it changed, tell the
+/// server in one `USERPROP`.
+///
+/// This is the one path both a [`ClientCommand::SetProps`] and a script's
+/// `SETPROPS`/`DONPROP`/`DOFFPROP`/`REMOVEPROP`/`NAKED` take, so the list
+/// `HASPROP` reads and the list the server keeps cannot drift. An unchanged
+/// list sends nothing: the frame would carry no new information and script
+/// effects can repeat.
+fn set_self_props(
+    state: &mut SessionState,
+    conn: &mut Connection,
+    requested: &[u32],
+) -> Result<PropOutcome> {
+    let outcome = replace_self_props(state, requested);
+    if outcome.changed {
+        send_self_props(state, conn)?;
+    }
+    Ok(outcome)
+}
+
 /// `(x, y)` as a wire `Point`, which stores `(v, h)` = `(y, x)`.
 fn point(x: i32, y: i32) -> Point {
     Point::new(y as i16, x as i16)
@@ -2060,7 +2260,7 @@ fn set_self_name(state: &mut SessionState, name: &str) -> bool {
 /// Wear one more prop, appending it to the worn list. A prop already worn, or a
 /// tenth prop, is refused rather than evicting an older one.
 fn wear_prop(state: &mut SessionState, prop: u32) -> bool {
-    let Some(user) = state.users.get_mut(&state.banner.user_id) else {
+    let Some(user) = self_user_mut(state) else {
         return false;
     };
     if user.props.len() >= MAX_WORN_PROPS || user.props.contains(&prop) {
@@ -2071,14 +2271,11 @@ fn wear_prop(state: &mut SessionState, prop: u32) -> bool {
 }
 
 fn doff_prop(state: &mut SessionState) -> Option<u32> {
-    state
-        .users
-        .get_mut(&state.banner.user_id)
-        .and_then(|user| user.props.pop())
+    self_user_mut(state).and_then(|user| user.props.pop())
 }
 
 fn remove_worn_prop(state: &mut SessionState, prop: u32) -> bool {
-    let Some(user) = state.users.get_mut(&state.banner.user_id) else {
+    let Some(user) = self_user_mut(state) else {
         return false;
     };
     let Some(at) = user.props.iter().position(|worn| *worn == prop) else {
@@ -2542,6 +2739,53 @@ mod tests {
         assert!(!wear_prop(&mut orphan, 1));
         assert_eq!(doff_prop(&mut orphan), None);
         assert!(!remove_worn_prop(&mut orphan, 1));
+        assert!(!replace_self_props(&mut orphan, &[1]).changed);
+    }
+
+    #[test]
+    fn normalize_worn_props_drops_the_empty_slot_duplicates_and_the_overflow() {
+        assert_eq!(normalize_worn_props(&[]), (Vec::new(), 0));
+        assert_eq!(
+            normalize_worn_props(&[0, 7, 7, 0, 9]),
+            (vec![7, 9], 0),
+            "id 0 is the empty slot and a duplicate adds nothing"
+        );
+        let (worn, dropped) = normalize_worn_props(&(1..=11).collect::<Vec<u32>>());
+        assert_eq!(worn, (1..=9).collect::<Vec<u32>>());
+        assert_eq!(dropped, 2, "ids 10 and 11 are past the cap");
+    }
+
+    #[test]
+    fn replace_self_props_keeps_the_list_when_our_record_has_not_arrived() {
+        let mut state = SessionState::new("test", 1);
+        state.banner.user_id = SELF_ID;
+        assert!(!state.users.contains_key(&SELF_ID));
+
+        let outcome = replace_self_props(&mut state, &[10, 20]);
+        assert!(outcome.changed, "the list is not dropped on the floor");
+        assert_eq!(state.users[&SELF_ID].props, vec![10, 20]);
+        assert!(state.users[&SELF_ID].is_self);
+
+        assert!(!replace_self_props(&mut state, &[10, 20]).changed);
+        assert!(replace_self_props(&mut state, &[]).changed);
+        assert!(state.users[&SELF_ID].props.is_empty());
+
+        let mut orphan = SessionState::new("test", 1);
+        orphan.banner.user_id = SELF_ID;
+        assert!(!replace_self_props(&mut orphan, &[]).changed);
+        assert!(
+            !orphan.users.contains_key(&SELF_ID),
+            "an empty list creates no row"
+        );
+    }
+
+    #[test]
+    fn replace_self_props_reports_what_the_cap_ignored() {
+        let mut state = session_with_self();
+        let outcome = replace_self_props(&mut state, &(1..=10).collect::<Vec<u32>>());
+        assert!(outcome.changed);
+        assert_eq!(outcome.dropped, 1);
+        assert_eq!(state.users[&SELF_ID].props, (1..=9).collect::<Vec<u32>>());
     }
 
     fn find_hotspot(state: &SessionState, id: i32) -> &palace_room::Hotspot {

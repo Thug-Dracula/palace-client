@@ -27,7 +27,7 @@ use palace_client::{
 use palace_wire::byteorder::{ByteOrder, Reader, Writer};
 use palace_wire::fixture::{default_fixture_dir, Fixture};
 use palace_wire::frame::Frame;
-use palace_wire::messages::{reference_logon_record, AssetSpec, Message, Point, UserRec};
+use palace_wire::messages::{reference_logon_record, AssetSpec, Message, Point, UserProp, UserRec};
 use palace_wire::opcode;
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
 
@@ -4091,6 +4091,248 @@ fn set_avatar_sends_the_face_and_colour_frames_normalised() {
     assert!(
         handle.frames().version() > screen.version,
         "the change re-rendered the frame without waiting for a server echo"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+/// Every `USERPROP` the client sent, decoded in send order.
+fn sent_user_props(server: &MockServer, order: ByteOrder) -> Vec<UserProp> {
+    server
+        .received_frames(order)
+        .iter()
+        .filter(|frame| frame.opcode == opcode::USERPROP)
+        .map(|frame| {
+            match Message::decode(frame.opcode, frame.ref_num, &frame.payload, order)
+                .expect("usrP decodes")
+            {
+                Message::UserProp(prop) => prop,
+                other => panic!("expected UserProp, got {other:?}"),
+            }
+        })
+        .collect()
+}
+
+/// The asset ids of a decoded `USERPROP`, in order.
+fn ids_of(prop: &UserProp) -> Vec<i32> {
+    prop.props.iter().map(|spec| spec.id).collect()
+}
+
+#[test]
+fn set_props_sends_one_userprop_naming_us_and_the_worn_ids() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, _rx, initial, cache, seed) =
+        start_room_with_self(&fixture, "set-props-send");
+
+    handle.set_props(vec![10, 20, 30]);
+    assert!(
+        wait_for(
+            || !sent_user_props(&server, order).is_empty(),
+            Duration::from_secs(5)
+        ),
+        "set_props reached the server as a usrP frame"
+    );
+
+    let sent = sent_user_props(&server, order);
+    assert_eq!(sent.len(), 1, "exactly one USERPROP frame, not two");
+    assert_eq!(sent[0].user_id, SELF_ID, "refNum is our own user id");
+    let ids = ids_of(&sent[0]);
+    assert_eq!(
+        ids,
+        vec![10, 20, 30],
+        "the body carries the worn ids in order"
+    );
+    assert!(
+        sent[0].props.iter().all(|spec| spec.crc == 0),
+        "the reference sends crc 0 for the art it has not uploaded"
+    );
+
+    assert!(
+        wait_for(
+            || handle.frames().version() > initial.version,
+            Duration::from_secs(5)
+        ),
+        "the change re-rendered the frame without waiting for a server echo"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_script_hasprop_reads_the_locally_worn_list() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, mut rx, _initial, cache, seed) =
+        start_room_with_self(&fixture, "hasprop-script");
+
+    handle.set_props(vec![10, 20, 30]);
+    assert!(
+        wait_for(
+            || !sent_user_props(&server, order).is_empty(),
+            Duration::from_secs(5)
+        ),
+        "the worn list reached the server first"
+    );
+
+    // The branch body only runs when HASPROP reads the worn id as worn.
+    handle.run_script("{ \"worn-10\" SAY } 10 HASPROP IF");
+    let events = collect_events(
+        &mut rx,
+        |collected| chats(collected).contains(&"worn-10"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        chats(&events).contains(&"worn-10"),
+        "HASPROP saw the worn prop through the script engine: {:?}",
+        chats(&events)
+    );
+
+    handle.run_script("{ \"worn-99\" SAY } 99 HASPROP IF");
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("from the input box"))
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("from the input box")),
+        "the negative script ran: {:?}",
+        notes(&events)
+    );
+    assert!(
+        !chats(&events).contains(&"worn-99"),
+        "HASPROP is false for an id we do not wear: {:?}",
+        chats(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn setting_the_same_worn_list_twice_sends_one_userprop() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, _rx, _initial, cache, seed) =
+        start_room_with_self(&fixture, "set-props-idempotent");
+
+    handle.set_props(vec![10, 20]);
+    assert!(
+        wait_for(
+            || sent_user_props(&server, order).len() == 1,
+            Duration::from_secs(5)
+        ),
+        "the first set sent a frame"
+    );
+
+    // The commands are processed in order, so the third set's frame can only
+    // land after the middle, unchanged set has been handled. Waiting for that
+    // last frame (not a bare count) makes the check free of sleeps.
+    handle.set_props(vec![10, 20]);
+    handle.set_props(vec![10, 20, 30]);
+    assert!(
+        wait_for(
+            || {
+                sent_user_props(&server, order)
+                    .last()
+                    .is_some_and(|prop| ids_of(prop) == vec![10, 20, 30])
+            },
+            Duration::from_secs(5)
+        ),
+        "the changed set sent the second frame"
+    );
+    assert_eq!(
+        sent_user_props(&server, order).len(),
+        2,
+        "an unchanged set is not re-sent: the frame would carry no new information"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_worn_list_longer_than_nine_is_clamped_and_reported() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, mut rx, _initial, cache, seed) =
+        start_room_with_self(&fixture, "set-props-cap");
+
+    handle.set_props((1..=10).collect());
+    assert!(
+        wait_for(
+            || !sent_user_props(&server, order).is_empty(),
+            Duration::from_secs(5)
+        ),
+        "the capped list reached the server"
+    );
+    let sent = sent_user_props(&server, order);
+    assert_eq!(sent.len(), 1);
+    let ids = ids_of(&sent[0]);
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+        "only the first nine ids are worn; the tenth never reaches the wire"
+    );
+
+    // The clamp is not silent: the runtime says what it ignored.
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("ignored 1"))
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        notes(&events).iter().any(|text| text.contains("ignored 1")),
+        "the clamped id was reported: {:?}",
+        notes(&events)
+    );
+
+    // The model is capped too: the ninth is worn, the tenth is not.
+    handle.run_script("{ \"nine\" SAY } 9 HASPROP IF");
+    let events = collect_events(
+        &mut rx,
+        |collected| chats(collected).contains(&"nine"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        chats(&events).contains(&"nine"),
+        "the ninth prop is worn: {:?}",
+        chats(&events)
+    );
+    handle.run_script("{ \"ten\" SAY } 10 HASPROP IF");
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("from the input box"))
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        !chats(&events).contains(&"ten"),
+        "the tenth prop is not worn: {:?}",
+        chats(&events)
     );
 
     handle.disconnect();
