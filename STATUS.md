@@ -560,6 +560,40 @@ problem is path *semantics at runtime*, not anything the compiler can see. The W
 build has to be **launched**, not just compiled. Setup instructions for a fast Windows dev
 loop live in `~/Sync/palace-client-windows-dev-setup.md`.
 
+## Door locks (2026-09-17)
+
+The client could not tell that a door was locked, so clicking one tried to walk through it.
+`runtime.rs` carried an admitted TODO for exactly this ("a click does not yet refuse to open a
+locked door"). Three opcodes sat in the table with no decoder, falling into `Message::Unknown`:
+
+| Message | Opcode | Body |
+|---|---|---|
+| DOORLOCK / DOORUNLOCK | `lock` / `unlo` | `RoomID` + `HotspotID` (4 B) |
+| SPOTSTATE | `sSta` | `RoomID` + `HotspotID` + `sint16 state` (6 B) |
+
+Both ids are `sint16` (:222-223), bodies at :815 and :1952.
+
+**The load-bearing fact (:1677-1680):** a door's locked state *is* the hotspot's `state` field —
+`HS_Unlock = 0`, `HS_Lock = 1` — and doors are hotspot types 1 (door), 2 (shutable), 3
+(lockable). So no new model field was needed. The client already tracked `state`; it simply never
+heard about changes to it.
+
+Now decoded, applied only to the room we are actually in (a lock aimed at another room is
+ignored), and a click on a locked door is refused locally with a transcript note instead of
+dispatching `SELECT`. Decoded opcodes: 28 → 31.
+
+`HS_Bolt` (4) is deliberately excluded: a bolt locks the door named by its `dest` and is not
+itself a door, so clicking one is never refused.
+
+**Verified by inversion:** flipping the state test so that an *unlocked* door read as locked broke
+four tests — the two door tests, plus `a_real_room_hotspot_script_dimroom_darkens_the_frame` and
+`entering_a_new_room_resets_the_dim`, because their hotspot click was refused and the script
+therefore never ran. Unrelated tests failing is the proof that this check sits on the real click
+path rather than in dead code.
+
+**Still undecoded in this family:** `SPOTNEW`/`SPOTDEL`/`SPOTMOVE`/`SPOTSETDESC`
+(`opSn`/`opSd`/`coLs`/`opSs`) — spots appearing, vanishing and moving mid-session — and `DRAW`.
+
 ## Running it
 
 ```bash

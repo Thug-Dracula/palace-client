@@ -14,6 +14,7 @@ mod logon;
 mod props;
 mod room;
 mod server;
+mod spots;
 mod user;
 
 pub use chat::{Talk, Whisper};
@@ -22,6 +23,7 @@ pub use logon::{aux_flags, reference_logon_record, AuxRegistrationRec, Reference
 pub use props::{PropDel, PropMove, PropNew};
 pub use room::{RoomDescription, RoomRec};
 pub use server::{AltLogonReply, HttpServer, ServerInfo, ServerVersion, UserLog};
+pub use spots::{DoorLock, SpotState};
 pub use user::{
     AssetSpec, Point, UserColor, UserDesc, UserExit, UserFace, UserMove, UserNew, UserProp,
     UserRec, UserStatus,
@@ -79,6 +81,12 @@ pub enum Message {
     PropMove(PropMove),
     /// `dPrp` — a loose prop was deleted.
     PropDel(PropDel),
+    /// `lock` — a door was locked.
+    DoorLock(DoorLock),
+    /// `unlo` — a door was unlocked.
+    DoorUnlock(DoorLock),
+    /// `sSta` — a hotspot's state changed.
+    SpotState(SpotState),
     /// `endr` — end of room description.
     RoomDescEnd,
     /// `talk` — public chat.
@@ -145,6 +153,9 @@ impl Message {
             opcode::PROPNEW => Message::PropNew(PropNew::decode(r)?),
             opcode::PROPMOVE => Message::PropMove(PropMove::decode(r)?),
             opcode::PROPDEL => Message::PropDel(PropDel::decode(r)?),
+            opcode::DOORLOCK => Message::DoorLock(DoorLock::decode(r)?),
+            opcode::DOORUNLOCK => Message::DoorUnlock(DoorLock::decode(r)?),
+            opcode::SPOTSTATE => Message::SpotState(SpotState::decode(r)?),
             opcode::ROOMDESCEND => Message::RoomDescEnd,
             opcode::TALK => Message::Talk(Talk::decode(ref_num, r)?),
             opcode::WHISPER => Message::Whisper(Whisper::decode(ref_num, r)?),
@@ -243,6 +254,14 @@ impl Message {
                 p.prop_num, p.position.v, p.position.h
             ),
             Message::PropDel(p) => format!("delete prop: index={}", p.prop_num),
+            Message::DoorLock(d) => format!("lock door: room={} door={}", d.room_id, d.door_id),
+            Message::DoorUnlock(d) => {
+                format!("unlock door: room={} door={}", d.room_id, d.door_id)
+            }
+            Message::SpotState(s) => format!(
+                "spot state: room={} spot={} state={}",
+                s.room_id, s.spot_id, s.state
+            ),
             Message::Talk(t) => format!("talk: user_id={} {:?}", t.user_id, t.text),
             Message::Whisper(w) => format!(
                 "whisper: from={} to={} {:?}",
@@ -354,7 +373,10 @@ fn summarize_bits(value: u32, bits: &[(u32, &str)]) -> String {
 mod tests {
     use super::*;
     use crate::byteorder::Writer;
-    use crate::opcode::{LISTOFALLROOMS, LOGOFF, PING, PROPMOVE, TALK, USERFACE, USERPROP};
+    use crate::opcode::{
+        DOORLOCK, DOORUNLOCK, LISTOFALLROOMS, LOGOFF, PING, PROPMOVE, SPOTSTATE, TALK, USERFACE,
+        USERPROP,
+    };
 
     #[test]
     fn unknown_opcodes_decode_to_unknown_not_error() {
@@ -446,5 +468,48 @@ mod tests {
             })
         );
         assert!(mv.describe().contains("index=3"));
+    }
+
+    #[test]
+    fn the_door_and_spot_state_messages_reach_their_arms() {
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(901);
+        w.write_i16(1);
+        let door_body = w.into_vec();
+        assert_eq!(door_body.len(), 4);
+
+        let lock = Message::decode(DOORLOCK, 0, &door_body, ByteOrder::Little).unwrap();
+        assert_eq!(
+            lock,
+            Message::DoorLock(DoorLock {
+                room_id: 901,
+                door_id: 1
+            })
+        );
+        assert!(lock.describe().contains("door=1"));
+
+        let unlock = Message::decode(DOORUNLOCK, 0, &door_body, ByteOrder::Little).unwrap();
+        assert_eq!(
+            unlock,
+            Message::DoorUnlock(DoorLock {
+                room_id: 901,
+                door_id: 1
+            })
+        );
+
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(901);
+        w.write_i16(1);
+        w.write_i16(1);
+        let spot = Message::decode(SPOTSTATE, 0, &w.into_vec(), ByteOrder::Little).unwrap();
+        assert_eq!(
+            spot,
+            Message::SpotState(SpotState {
+                room_id: 901,
+                spot_id: 1,
+                state: 1
+            })
+        );
+        assert!(spot.describe().contains("state=1"));
     }
 }
