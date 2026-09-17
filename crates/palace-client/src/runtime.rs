@@ -1111,25 +1111,7 @@ fn compose(
     room.loose_props
         .retain(|prop| builder.props().contains(prop.spec.id));
 
-    let mut hidden_avatars = 0usize;
-    let avatars: Vec<AvatarSpec> = state
-        .users_in_room()
-        .iter()
-        .filter_map(|user| {
-            if user.props.is_empty() {
-                return None;
-            }
-            if !user.props.iter().any(|id| builder.props().contains(*id)) {
-                hidden_avatars += 1;
-                return None;
-            }
-            Some(AvatarSpec::new(
-                i32::from(user.x),
-                i32::from(user.y),
-                user.props.clone(),
-            ))
-        })
-        .collect();
+    let (avatars, hidden_avatars) = avatar_specs(&state.users_in_room(), builder.props());
 
     let mut scene = builder.build_with(&room, &avatars, &[]);
     scene.dim_level = state.room_dim;
@@ -1174,6 +1156,30 @@ fn compose(
         notes,
         geometry,
     })
+}
+
+/// The avatar specs to draw for the users in a room, plus how many were hidden.
+///
+/// A user with no worn props still becomes an avatar — their built-in face is
+/// always available — which is how the signed-in user finally becomes visible.
+/// Only a user who wears props none of which have arrived yet is skipped, and
+/// counted so the caller can report why.
+fn avatar_specs(users: &[UserInfo], props: &PropStore) -> (Vec<AvatarSpec>, usize) {
+    let mut hidden = 0usize;
+    let avatars = users
+        .iter()
+        .filter_map(|user| {
+            if !user.props.is_empty() && !user.props.iter().any(|id| props.contains(*id)) {
+                hidden += 1;
+                return None;
+            }
+            Some(
+                AvatarSpec::new(i32::from(user.x), i32::from(user.y), user.props.clone())
+                    .with_face_color(user.face, user.color),
+            )
+        })
+        .collect();
+    (avatars, hidden)
 }
 
 /// Build the snapshot a running script observes.
@@ -1584,4 +1590,51 @@ fn set_local_spot_state(state: &mut SessionState, spot: i32, value: i32) -> bool
     };
     hotspot.state = value.clamp(0, i32::from(i16::MAX)) as i16;
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(id: i32, props: Vec<u32>) -> UserInfo {
+        UserInfo {
+            id,
+            name: format!("user-{id}"),
+            face: 3,
+            color: 7,
+            room_id: 1,
+            x: 10,
+            y: 20,
+            props,
+            away: false,
+            is_self: false,
+        }
+    }
+
+    #[test]
+    fn a_prop_less_user_still_becomes_an_avatar_with_their_face() {
+        let (avatars, hidden) = avatar_specs(&[user(1, vec![])], &PropStore::new());
+        assert_eq!(hidden, 0, "a prop-less user is not hidden");
+        assert_eq!(avatars.len(), 1, "the user is drawn");
+        assert_eq!((avatars[0].face, avatars[0].color), (3, 7));
+        assert_eq!((avatars[0].x, avatars[0].y), (10, 20));
+        assert!(avatars[0].props.is_empty());
+    }
+
+    #[test]
+    fn a_user_whose_prop_art_has_not_arrived_is_counted_not_drawn() {
+        let (avatars, hidden) = avatar_specs(&[user(2, vec![123])], &PropStore::new());
+        assert!(avatars.is_empty());
+        assert_eq!(hidden, 1);
+    }
+
+    #[test]
+    fn a_user_with_a_present_prop_is_drawn_with_their_face() {
+        let mut props = PropStore::new();
+        let _ = props.insert_blob(123, vec![0; 16]);
+        let (avatars, hidden) = avatar_specs(&[user(3, vec![123])], &props);
+        assert_eq!(hidden, 0);
+        assert_eq!(avatars.len(), 1);
+        assert_eq!((avatars[0].face, avatars[0].color), (3, 7));
+    }
 }
