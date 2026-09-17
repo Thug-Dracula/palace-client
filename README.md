@@ -55,6 +55,12 @@ window, and the protocol is the same everywhere.
   nothing reaches an audio device.
 - **Draw commands, name tags and chat text are not rasterized** into the room
   image. The room's stored draw commands are decoded and kept, but not painted.
+- **Some script effects are recorded but not applied to the room**, so a script
+  appears to run while the room stays the same. Six of these change what you
+  should see: adding, moving or removing a **loose prop**, and changing your
+  **face or colour**. Room dimming (`DIMROOM`) was in the same state and is now
+  fixed. See the effect-application note in `STATUS.md` for the full list and the
+  pattern for fixing the rest.
 - **Avatar art for other users is untested live.** The compositor draws avatars,
   but the development server had no other users online, so the asset transfer
   that would supply their props was never exercised against a real peer.

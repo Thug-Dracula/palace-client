@@ -328,6 +328,64 @@ An aborted agent may have committed real work before dying. "No task_id" means t
 
 The correct method: use the reference registry (OpenPalace `IptDefaultCommands.as` + `PalaceIptscraeCommands.as`) as the command vocabulary, then compare against the **union** of both Rust registries. Any future coverage claim must do the same.
 
+## Known defect: the effect-application gap (found 2026-09-16)
+
+`apply_effect()` in `crates/palace-client/src/runtime.rs` ends with a catch-all:
+
+```rust
+other => vec![ClientEvent::Note { text: format!("script: {other}") }],
+```
+
+**Any `Effect` without an explicit match arm is logged and nothing else.** It is
+recorded, surfaced in the transcript as "script: X", and never applied to the
+room. So the script appears to run and the room does not change.
+
+Of 58 `Effect` variants, 42 have explicit arms. These 16 do not:
+
+| Variant | Visible in the room? |
+|---|---|
+| `AddLooseProp`, `RemoveLooseProp`, `MoveLooseProp`, `DonProp`, `DoffProp`, `DropProp` | **Yes** — `build.rs` draws `room.loose_props` |
+| `SetFace`, `SetColor` | **Yes** — the compositor draws avatars from `UserInfo.face` / `color` |
+| `SetPenColor`, `SetPenSize`, `MovePen`, `PaintLayer` | Not yet — draw commands are not rasterized |
+| `Lock`, `Unlock`, `SetSpotAlarm` | Not visual — state only |
+
+### The one already fixed: `DIMROOM`
+
+`DIMROOM` was the proof case. `palace-render` had `Scene.dim_level` and
+`Canvas::apply_dim` all along, but the builder hardcoded `dim_level = 1.0` and the
+runtime's `DimRoom` arm only emitted a note, so a script could dim a room and
+nothing happened. Three links were missing, now added:
+
+1. `state.rs`: `SessionState.room_dim: f64`, `1.0` = undimmed, reset to `1.0` when
+   a room descriptor arrives (a room you just entered is never dimmed).
+2. `runtime.rs` `apply_effect`: `DimRoom` sets
+   `room_dim = f64::from((*percent).clamp(0, 100)) / 100.0` and marks the render dirty.
+3. `runtime.rs` `compose`: `scene.dim_level = state.room_dim` after building.
+
+The scale is from the reference, not guessed: OpenPalace's
+`PalaceCurrentRoom.dimRoom` does `level = clamp(0, 100); dimLevel = level / 100`,
+and renders it as `alpha="{1 - dimLevel}"` black — the same maths as `apply_dim`.
+
+### Fixing the rest
+
+Follow the two patterns already in the file:
+
+* `set_local_spot_state(state, spot, value)` mutates `state.room_desc` and is the
+  template for room-local state (spot state, and the loose-prop variants, which
+  should mutate `room_desc.loose_props`).
+* `SetUserName` mutates `state.users` and is the template for user-local state
+  (`SetFace`, `SetColor` should update `state.users[self].face` / `.color`).
+
+Then set `*dirty_render = true`, and remove the variant from the catch-all by
+giving it an explicit arm.
+
+**Test it the way the renderer sees it.** Asserting `state.room_dim` is not enough:
+the defect was precisely that state and render were not connected. Assert the
+composited frame changes — a dimmed room is measurably darker, a removed loose prop
+disappears from `scene.loose_props`. `crates/palace-client/tests/mock_runtime.rs`
+can drive the real runtime against a mock server; a room script that calls the
+effect is the cleanest fixture.
+
 ## Running it
 
 ```bash
