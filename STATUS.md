@@ -670,8 +670,10 @@ authority and the decoder should be written from its bytes.
 
 ## Opcode coverage: what is left, and whether it matters (audited 2026-09-17)
 
-An audit of the **40 undecoded opcodes** (75 in the table, 35 decoded). Headline: **nothing still
-missing breaks using the client on a public server** — with one real exception, below.
+An audit of the **40 opcodes that were still undecoded when it was made** (75 in the table, 35 decoded
+at the time; `AUTHENTICATE` has since been decoded, so the split is now 36 decoded / 39 undecoded).
+Headline: **nothing still missing breaks using the client on a public server** — with one real
+exception, below.
 
 | Class | n | Meaning |
 |---|---|---|

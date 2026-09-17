@@ -241,11 +241,12 @@ copy is behind by roughly 8 commits. The Windows build in that release therefore
   found, a script's spot move is local to this client only.
 - [ ] **`durl` (DISPLAYURL) — the one unresolved opcode.** The spec documents a body; no server
   anywhere constructs it.
-- [ ] **`protocol.md` needs one correction.** Its loose-prop section says traversal order is the
-  reverse of prop numbering. It is not — traversal order **is** the numbering; that sentence describes
-  *byte offsets* and should say so.
-- [ ] **`STATUS.md` says "35 decoded" in the audit table; the count is 36** now that `AUTHENTICATE`
-  decodes. Small doc inconsistency introduced with `ec21f1e`.
+- [x] **`protocol.md` loose-prop traversal — already correct.** The section now reads "steps *backwards
+  through the buffer*. That is a fact about the byte offsets, **not** about the logical order", which is
+  exactly the correction this item asked for. Stale entry.
+- [x] **`STATUS.md` decoded count — fixed.** It said "40 undecoded opcodes (75 in the table, 35 decoded)"
+  while the same section said `AUTHENTICATE` is now decoded. Now states which snapshot the 40 refers to
+  and gives the current split (36 decoded / 39 undecoded).
 
 ### 2.4 Open questions from the door work (unchecked, not known-broken)
 
