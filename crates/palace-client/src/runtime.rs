@@ -801,6 +801,10 @@ fn run_session(
         if let Some((x, y)) = click_pending.take() {
             match click_room_point(shared, x, y) {
                 Some((rx, ry)) => {
+                    // Rooms hit-test themselves with MOUSEPOS inside their ON
+                    // SELECT handlers, so the pointer must be at the click before
+                    // the handler runs - Colosseum 7774 ejects when x is below 78.
+                    shared.set_mouse(rx, ry);
                     let view = host_view(&state, shared);
                     match view.spot_at(rx, ry).map(|spot| spot.id) {
                         Some(id) => {

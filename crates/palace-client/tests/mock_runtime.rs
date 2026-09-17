@@ -3101,6 +3101,76 @@ fn hotspot_click(spot: &palace_room::Hotspot, screen: &ScreenState) -> (f64, f64
     (point.x, point.y)
 }
 
+#[test]
+fn a_click_puts_the_pointer_where_the_click_landed() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("25567");
+    let room = palace_room::decode_payload(&payload, order).expect("room 25567 decodes");
+    let spot = room
+        .hotspots
+        .iter()
+        .find(|hotspot| hotspot.hotspot_type != 1 || hotspot.dest == 0)
+        .expect("room 25567 has a hotspot that does not change rooms");
+
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("mousepos-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 25567)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 25567)
+        .expect("a frame was composed for room 25567");
+
+    let (x, y) = hotspot_click(spot, screen);
+    handle.click(x, y);
+    handle.run_script("MOUSEPOS ITOA STATUSMSG ITOA STATUSMSG");
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .filter_map(|text| text.strip_prefix("script: "))
+                .filter(|text| text.trim().parse::<i32>().is_ok())
+                .count()
+                >= 2
+        },
+        Duration::from_secs(10),
+    );
+    let reported: Vec<i32> = notes(&events)
+        .iter()
+        .filter_map(|text| text.strip_prefix("script: "))
+        .filter_map(|text| text.trim().parse().ok())
+        .collect();
+
+    assert!(
+        reported.contains(&i32::from(spot.loc.h)) && reported.contains(&i32::from(spot.loc.v)),
+        "MOUSEPOS should report the click's room position ({}, {}), got {reported:?} from {:?}",
+        spot.loc.h,
+        spot.loc.v,
+        notes(&events)
+    );
+}
+
 /// The room id of the first `ROOMGOTO` (`navR`) frame the client sent, if any.
 /// The client sends it when a script's `GOTOROOM` becomes an effect, and the
 /// server answers it with the destination room's descriptor.
