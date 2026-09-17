@@ -494,17 +494,39 @@ directory, and `PropBag.bundle/` holds:
 | `PalaceChat.favs`, `Trash.favs` | favourites and trash |
 | `Version`, `macro` | version byte, macros |
 
-**`PalaceChat.pids` format — confirmed, not inferred.** 3844 records of 16 bytes big-endian
-`(a: u32, b: u32, offset: u32, size: u32)`:
+**`PalaceChat.pids` format — confirmed, not inferred.** 16-byte big-endian records
+`(a: u32, b: u32, offset: u32, size: u32)`. Figures below are from the first measurement (the file
+grows while the client runs):
 
 - 61504 / 16 = 3844 with remainder 0; every record satisfies `offset + size <= 8939938` (0 violations);
-- offsets are non-decreasing and the blobs **tile `.props` contiguously — 3843/3843 adjacent pairs
-  satisfy `off[i] + size[i] == off[i+1]`**;
-- early records are `a = 0x80000000 + n, b = n + 1`; later ones carry CRC-like values;
+- offsets are non-decreasing and the blobs **tile `.props` contiguously — every adjacent pair
+  satisfies `off[i] + size[i] == off[i+1]`**;
 - **`(a, b)` is the prop's identity** — `BagThumbCache/*.png` is named `<a:08X>_<b:08X>.png` and
-  **11/11** of those keys are present in `.pids`. The client's own cache is keyed by the same pair;
-- each blob is a **32-byte zero prefix** followed by a normal prop at `blob + 0x20` (verified on
-  blobs 0 and 1, where the header reads `00 2c 00 2c` = 44x44).
+  **11/11** of those keys are present in `.pids`. The client's own cache is keyed by the same pair,
+  which is why `(a, b)` is treated as the key rather than an index position;
+- each blob is a **fixed 32-byte metadata prefix** followed by a normal prop at `blob + 0x20`.
+  Verified across every record: **3846/3846 blobs have exactly `00 2c 00 2c` at offset 32** (a
+  big-endian 44x44 header). The prefix length is therefore constant; its *content* is not zero —
+  only **223/3846** are all-zero, the rest carry length-prefixed ASCII names (e.g. `explosion2`,
+  `NewProp`, `The Colosseum (1 vs 1)`).
+
+An earlier version of this section called that a "32-byte zero prefix", generalised from blobs 0 and
+1. That was wrong: it is a metadata prefix that happens to be empty on some props, and the fixed
+length is the part that matters. The reader skips 32 bytes.
+
+**`(a, b)` semantics — measured, not guessed.** `a` is the prop/asset **id** and `b` is the **payload
+CRC** (`asset_crc` over `prop[12..]`, the blob minus its 12-byte header):
+
+- `b == payload_crc(prop[12..])` for **3569/3846** records. Spot-check: record with
+  `a = 0x3a3ad1f7` has `b = 0xffa0f716`, which is exactly the CRC of its payload — and
+  `0x3a3ad1f7` is a real `.prp` record id the crate already documents.
+- The exceptions are the synthetic-id records (`a` in the `0x80000000` range with sequential small
+  `b`) plus ~66 large props with `0x400`/`0x800` flag bits set (sizes up to ~670 KB, evidently
+  animated/multi-frame) whose `b` is not the payload CRC over any slice tested. Undetermined for
+  those; do not assume.
+
+**The bag is live data.** It read 3844 records during the first measurement and 3846 minutes later,
+while the user's client was running. Read it read-only, and never hard-code a record count.
 
 Also on disk: `$MEDIA/Prop Files/` holds the source rosters (`Palace1.prp`, `AshFile*.prp`,
 `idk.prp`) — the same `.prp` container `prop-tool` already parses, ~180k props. The *bag* is the curated
