@@ -435,6 +435,49 @@ accept that it may be permanently blocked.
 - `HTTP` (75) — an opcode name (`HTTPSERVER`, `opcode.rs:137`), not a command. The bare uses are a variable.
 - `IDLE` — an event our VM lacks but Colosseum never uses (0 occurrences).
 
+### 2.14 How the HTTP extension actually works: the response *is* a script
+
+This resolves the open question in §2.11/§2.12 — what a handler does with a fetched body. It does not
+read the body, it **executes** it. From `$CORPUS/reference/repos/sparky/index.js`:
+
+```js
+executeScriptSource(source, spotId, url, source, eventName = "HTTPRECEIVED")
+runCachedScripts(event, data)          // CACHESCRIPT'd sources re-run when that event fires
+```
+
+The fetch handler branches on content type:
+
+```js
+const [type, sub] = splitContentType(contentType);
+type === "text" && (sub === "iptscrae" || sub === "ipt") && iptscraeEnabled && body
+  && executeScriptSource(body, spotId, url, body)
+```
+
+So **a fetched resource whose content type is `text/iptscrae` (or `text/ipt`) is run as IPTSCRAE**. That
+is the mechanism behind both `"ludo/" HTTPGET` in `ON ROOMREADY` and `LOADSCRIPT "big-script.txt"`:
+the room fetches its own logic and the client executes it. `CACHESCRIPT` caches such a source so it can
+be re-run later for a named event, and `HTTPCANCEL` aborts one in flight.
+
+Consequences for the plan:
+
+- §2.11 and §2.12 are **one feature, not two**: `HTTPGET`, `LOADSCRIPT` and the `text/iptscrae` branch
+  are the same fetch-and-execute path.
+- The media pipeline already fetches files (that is how `notebarw.gif` arrives), so the smallest useful
+  step is the **content-type branch**: execute a fetched `text/iptscrae` response instead of storing it
+  as media. That alone may be what rooms like 31000 are missing.
+- The camelCase properties `httpContents` / `httpHeaders` / `httpContentType` / `httpFilename` /
+  `httpUrl` (sparky) are for handlers that want the raw payload rather than executing it. Their
+  *accessor spelling inside a script* is still undetermined — no reference spells it in a script, the
+  protocol reference has no `HTTPGET` section, and Colosseum's handlers delegate to `preload`, which is
+  defined in the very external script we cannot fetch. Determine that before implementing raw-data
+  access; do not guess it.
+- The concurrency guard matters: sparky rejects a request when too many are in flight
+  (`Uc(url, method)` against a cap), so an implementation should bound in-flight requests.
+
+- [ ] Implement as one task: the `text/iptscrae` execute branch on the fetch path, then `HTTPGET`
+  (absolute URL, or relative joined to `state.banner.media_base`, scoped to the executing hotspot),
+  then `CACHESCRIPT`/`HTTPCANCEL`.
+
 ---
 
 ## Part 3 — How to verify
