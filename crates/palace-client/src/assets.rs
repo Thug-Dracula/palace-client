@@ -104,16 +104,44 @@ pub fn missing_props(store: &PropStore, ids: &[u32]) -> Vec<u32> {
         .collect()
 }
 
-/// Save fetched bytes under their base name in `dir`, refusing path escapes.
+/// Save fetched bytes under their base name in `dir`, refusing path escapes and
+/// names that cannot be a legal filename on every platform we support.
 pub fn write_media(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf> {
     let base = Path::new(name)
         .file_name()
         .and_then(|n| n.to_str())
         .filter(|n| !n.is_empty())
-        .ok_or_else(|| ClientError::Config(format!("unsafe media name {name:?}")))?;
+        .filter(|n| legal_file_name(n))
+        .ok_or_else(|| ClientError::Config(format!("unusable media name {name:?}")))?;
     let path = dir.join(base);
     std::fs::write(&path, bytes).map_err(ClientError::Io)?;
     Ok(path)
+}
+
+/// Whether `base` can name a file on every platform this client targets.
+///
+/// Enforced everywhere rather than only on Windows: the name is what the renderer
+/// later looks the file up by, so a name that works on one platform and not another
+/// is a bug wherever it runs. Windows forbids `: * ? " < > |` and control
+/// characters, strips a trailing dot or space, and reserves `CON`, `PRN`, `AUX`,
+/// `NUL`, `COM1`-`COM9` and `LPT1`-`LPT9` as device names even with an extension,
+/// so `aux.png` is not a file there. Escaping instead of refusing would change the
+/// name the renderer looks up, turning a crash into a silently missing image.
+fn legal_file_name(base: &str) -> bool {
+    let forbidden = |c: char| matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') || c < ' ';
+    !base.is_empty()
+        && !base.chars().any(forbidden)
+        && !base.ends_with('.')
+        && !base.ends_with(' ')
+        && !is_reserved_device_name(base)
+}
+
+fn is_reserved_device_name(base: &str) -> bool {
+    let stem = base.split('.').next().unwrap_or(base).to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
 /// Run the blocking media fetch loop until the job channel closes.
@@ -148,5 +176,71 @@ pub fn run_media_worker(dir: PathBuf, jobs: Receiver<MediaJob>, out: Sender<Medi
         if out.send(result).is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_name_a_windows_filesystem_cannot_hold_is_refused() {
+        for bad in [
+            "a:b.gif",
+            "a*b.gif",
+            "a?b.gif",
+            "a\"b.gif",
+            "a<b.gif",
+            "a>b.gif",
+            "a|b.gif",
+            "a\u{1}b.gif",
+            "con.gif",
+            "AUX.png",
+            "nul",
+            "com1.bin",
+            "lpt9.gif",
+            "trailing.",
+            "trailing ",
+            "",
+        ] {
+            assert!(!legal_file_name(bad), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_media_name_is_kept() {
+        for good in [
+            "bg-x.jpg",
+            "rainy-day.gif",
+            "a.b.c.png",
+            "apdata__media__bg.jpg",
+            "COM0.png",
+            "console.png",
+            "com.gif",
+        ] {
+            assert!(legal_file_name(good), "{good:?} must be allowed");
+        }
+    }
+
+    #[test]
+    fn writing_an_unusable_name_errors_instead_of_writing_it() {
+        let dir = std::env::temp_dir().join(format!("palace-media-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let refused = write_media(&dir, "aux.gif", b"bytes");
+        assert!(
+            matches!(&refused, Err(ClientError::Config(_))),
+            "expected a config error, got {refused:?}"
+        );
+        assert!(
+            !dir.join("aux.gif").exists(),
+            "a refused name must not be written"
+        );
+
+        let written = write_media(&dir, "bg-x.jpg", b"bytes").expect("a legal name is written");
+        assert!(written.ends_with("bg-x.jpg"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

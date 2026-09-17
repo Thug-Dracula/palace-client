@@ -547,12 +547,21 @@ repeats were the supervisor retry loop's 1500/3000/6000 ms backoff, not a fixed 
   `C` and `\props`, so the seeds silently vanished. It now uses `std::env::split_paths`,
   which knows the platform separator. `HOME` also falls back to `USERPROFILE`.
 
-**Still open — needs a decision, not a mechanical fix:** `assets.rs` `write_media` strips
-directories but does not escape Windows-illegal characters or reserved device names
-(`CON`, `NUL`, `COM1`), unlike the HTTP cache in the same pipeline which sanitises properly.
-Escaping on write changes the on-disk name, while the renderer later looks the file up by
-the room's *original* name — so a naive escape converts a crash into silently missing
-images. Skip-with-a-logged-note is the likely answer.
+**Closed (2026-09-17).** `assets.rs` `write_media` accepted any base name, so a media name Windows
+cannot hold — a `:`, a control character, or a reserved device name such as `aux.png` — would fail
+there with the same error 123. It now refuses those names via `legal_file_name`, and the caller
+skips the file with a logged error rather than failing the session.
+
+The rule is enforced on **every** platform, not only Windows, because the name is what the renderer
+later looks the file up by: a name that works on one platform and not another is a bug wherever it
+runs. Refusing rather than escaping is deliberate — escaping would change the name the renderer
+looks up and so convert a crash into a silently missing image.
+
+**Proven by a wiring test, not a helper test.** Removing the guard while leaving the predicate
+intact fails `writing_an_unusable_name_errors_instead_of_writing_it` with
+`expected a config error, got Ok("/tmp/.../aux.gif")`. The two tests against the predicate itself
+still passed — which is the point: a test on the helper alone would have missed the regression.
+This is the same trap as the `session_cache_dir` wiring above, and it has now bitten twice.
 
 **Lesson worth keeping:** a cross-compile check cannot catch this class of bug.
 `cargo check --target x86_64-pc-windows-gnu -p palace-app` passed cleanly throughout — the
