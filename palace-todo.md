@@ -400,6 +400,31 @@ So it is **ROOMLOAD → ENTER → ROOMREADY**. We fire only `ENTER`. Rooms put t
 - [ ] Implement in this order: the room lifecycle events, then `HTTPGET` + `HTTPRECEIVED`/`HTTPERROR`.
   With those, `LOADSCRIPT` (§2.11) is plausibly just "fetch, then execute" on the same mechanism.
 
+### 2.13 Every command Colosseum uses that this client does not implement, ranked
+
+Derived by counting uppercase tokens across `~/palace-corpus/scripts/` + `~/palace-corpus/animanic_walk/` and
+subtracting both the command table (`crates/iptscrae-palace/src/commands.rs`) and the interpreter's
+builtin registry (`crates/iptscrae/src/registry.rs`). Event names and RPG stat variables (`STR` 1454 =
+strength, `MAG`, `ATK`, `MDEF`, `ACC`, `EVADE`, `RES`, `CHARGE`) are noise and are excluded — do not be
+fooled by `STR`'s count, it is a stat.
+
+| Command | Uses | Status |
+|---|---|---|
+| `ADDPIC` | 115 | **blocked on an unknown** — needs the client→server "new picture" body, which §1.6 established is undocumented everywhere. Do not guess it |
+| `SETSPOTSCRIPT` | 82 | script-level; needs a spot-script wire body |
+| `ADDSPOT` | 81 | same class as `ADDPIC` |
+| `HTTP` | 75 | see §2.12 |
+| `SGLOBAL` | 74 | pserver server-globals; semantics not yet researched |
+| `LOADSCRIPT` | 51 | see §2.11 |
+| `HTTPGET` | 50 | see §2.12 |
+| `SETTOOLTIP` | 47 | hover text; needs ROLLOVER/ROLLOUT dispatch first (§2.2 events) |
+| `CLEARTOOLTIP` | 41 | as above |
+
+Ordering to work in, by what actually unblocks a room: **the room lifecycle + HTTP (§2.12)** first,
+because it gates both `HTTPGET`/`HTTP` and probably `LOADSCRIPT`; then the hover pair
+(ROLLOVER/ROLLOUT + tooltips); then `SGLOBAL`. The `ADDPIC`/`ADDSPOT` family may be permanently blocked —
+that is a finding, not a gap to fill by guessing.
+
 ---
 
 ## Part 3 — How to verify
