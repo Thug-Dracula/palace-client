@@ -11,11 +11,20 @@
 //! prop-tool png        <prop.bin> <out> dump a PNG for eyeballing
 //! prop-tool extract    <file.prp> <dir> [--limit N] [--format NAME] [--stride N]
 //!                                       split a roster into per-prop blobs
+//! prop-tool encode     <in.png> <out.prop> [--head] [--ghost]
+//!                                       [--h-offset N] [--v-offset N]
+//! prop-tool encode-batch <in-dir> <out-dir> [--head] [--ghost]
+//!                                       [--h-offset N] [--v-offset N]
 //! ```
 //!
 //! `inventory` accepts directories (recursed for `*.bin`) and `.prp` files. It
 //! prints a machine-readable summary so the numbers in the README can be
 //! regenerated rather than trusted.
+//!
+//! `encode` and `encode-batch` are the only paths that turn a PNG back into a
+//! prop. They emit S20 — the one format the reference client produces — and
+//! refuse odd widths up front, naming the file, because S20 packs pixels in
+//! pairs.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -23,7 +32,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 
-use palace_prop::{decode, decode_header, PropEndian, PropError, PropFormat};
+use palace_prop::{
+    decode, decode_header, encode_s20_blob, PropEndian, PropError, PropFormat, PropImage,
+    FLAG_GHOST, FLAG_HEAD,
+};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -38,6 +50,8 @@ fn main() -> ExitCode {
         "digests" => digests(&args[1..]),
         "png" => png(&args[1..]),
         "extract" => extract(&args[1..]),
+        "encode" => encode(&args[1..]),
+        "encode-batch" => encode_batch(&args[1..]),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS
@@ -58,7 +72,9 @@ fn usage() {
          prop-tool rgba-batch <manifest> <outdir>\n  \
          prop-tool digests <manifest> <outfile>\n  \
          prop-tool png <prop.bin> <out.png>\n  \
-         prop-tool extract <file.prp> <outdir> [--limit N] [--format NAME] [--stride N]"
+         prop-tool extract <file.prp> <outdir> [--limit N] [--format NAME] [--stride N]\n  \
+         prop-tool encode <in.png> <out.prop> [--head] [--ghost] [--h-offset N] [--v-offset N]\n  \
+         prop-tool encode-batch <in-dir> <out-dir> [--head] [--ghost] [--h-offset N] [--v-offset N]"
     );
 }
 
@@ -568,4 +584,236 @@ fn extract(args: &[String]) -> ExitCode {
     }
     println!("extracted {written} props to {outdir}");
     ExitCode::SUCCESS
+}
+
+/// The head/ghost/offset flags shared by `encode` and `encode-batch`.
+struct EncodeOptions {
+    head: bool,
+    ghost: bool,
+    h_offset: i16,
+    v_offset: i16,
+}
+
+impl EncodeOptions {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let mut options = EncodeOptions {
+            head: false,
+            ghost: false,
+            h_offset: 0,
+            v_offset: 0,
+        };
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--head" => options.head = true,
+                "--ghost" => options.ghost = true,
+                "--h-offset" => {
+                    i += 1;
+                    options.h_offset = parse_offset(args, i, "--h-offset")?;
+                }
+                "--v-offset" => {
+                    i += 1;
+                    options.v_offset = parse_offset(args, i, "--v-offset")?;
+                }
+                other => return Err(format!("unknown option {other:?}")),
+            }
+            i += 1;
+        }
+        Ok(options)
+    }
+
+    fn flags(&self) -> u16 {
+        (if self.head { FLAG_HEAD } else { 0 }) | (if self.ghost { FLAG_GHOST } else { 0 })
+    }
+}
+
+fn parse_offset(args: &[String], at: usize, name: &str) -> Result<i16, String> {
+    let raw = args
+        .get(at)
+        .ok_or_else(|| format!("{name} needs a value"))?;
+    raw.parse::<i16>()
+        .map_err(|_| format!("{name}: {raw:?} is not a 16-bit integer"))
+}
+
+fn encode(args: &[String]) -> ExitCode {
+    let (Some(input), Some(output)) = (args.first(), args.get(1)) else {
+        usage();
+        return ExitCode::from(2);
+    };
+    let options = match EncodeOptions::parse(&args[2..]) {
+        Ok(options) => options,
+        Err(e) => {
+            eprintln!("{e}");
+            usage();
+            return ExitCode::from(2);
+        }
+    };
+    match encode_file(Path::new(input), Path::new(output), &options) {
+        Ok((width, height)) => {
+            println!(
+                "{input} -> {output} {width}x{height} flags=0x{:04x}",
+                options.flags()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn encode_batch(args: &[String]) -> ExitCode {
+    let (Some(indir), Some(outdir)) = (args.first(), args.get(1)) else {
+        usage();
+        return ExitCode::from(2);
+    };
+    let options = match EncodeOptions::parse(&args[2..]) {
+        Ok(options) => options,
+        Err(e) => {
+            eprintln!("{e}");
+            usage();
+            return ExitCode::from(2);
+        }
+    };
+    let inputs = match sorted_pngs(Path::new(indir)) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{indir}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if inputs.is_empty() {
+        eprintln!("{indir}: no *.png files");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::create_dir_all(outdir) {
+        eprintln!("{outdir}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let (mut written, mut failed) = (0usize, 0usize);
+    for input in &inputs {
+        let mut output = Path::new(outdir).join(input.file_stem().unwrap_or_default());
+        output.set_extension("prop");
+        match encode_file(input, &output, &options) {
+            Ok((width, height)) => {
+                written += 1;
+                println!(
+                    "{} -> {} {width}x{height} flags=0x{:04x}",
+                    input.display(),
+                    output.display(),
+                    options.flags()
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                eprintln!("{e}");
+            }
+        }
+    }
+    println!("encode-batch: wrote {written}, failed {failed}, outdir {outdir}");
+    if failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Read one PNG as RGBA8 and encode it as an S20 blob.
+///
+/// The odd-width check runs before the codec so the error names the file and its
+/// dimensions: S20 packs pixels in pairs and cannot represent an odd width.
+fn encode_file(input: &Path, output: &Path, options: &EncodeOptions) -> Result<(u32, u32), String> {
+    let (width, height, rgba) = read_png_rgba(input)?;
+    if width == 0 || height == 0 || width % 2 != 0 {
+        return Err(format!(
+            "{}: cannot encode {width}x{height}: S20 packs pixels in pairs, so the width must be even and non-zero",
+            input.display()
+        ));
+    }
+    let image = PropImage::from_rgba(width, height, rgba)
+        .map_err(|e| format!("{}: {e}", input.display()))?;
+    let blob = encode_s20_blob(&image, options.h_offset, options.v_offset, options.flags())
+        .map_err(|e| format!("{}: {e}", input.display()))?;
+    std::fs::write(output, blob).map_err(|e| format!("{}: {e}", output.display()))?;
+    Ok((width, height))
+}
+
+/// `*.png` files in `dir`, sorted by path, so `encode-batch` is deterministic.
+fn sorted_pngs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+        })
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// Decode one PNG to RGBA8, converting any other colour type rather than
+/// letting the pixel layout silently mean something else.
+fn read_png_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
+    let label = path.display();
+    let file = std::fs::File::open(path).map_err(|e| format!("{label}: {e}"))?;
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    // Expand palettes, sub-8-bit depths and tRNS to packed 8-bit samples.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().map_err(|e| format!("{label}: {e}"))?;
+    let needed = reader
+        .output_buffer_size()
+        .ok_or_else(|| format!("{label}: image too large to decode"))?;
+    let mut raw = vec![0u8; needed];
+    let info = reader
+        .next_frame(&mut raw)
+        .map_err(|e| format!("{label}: {e}"))?;
+    let pixels = info.line_size * info.height as usize;
+    let data = raw
+        .get(..pixels)
+        .ok_or_else(|| format!("{label}: truncated PNG frame"))?;
+    let rgba = expand_to_rgba(info.color_type, info.bit_depth, data).ok_or_else(|| {
+        format!(
+            "{label}: unsupported PNG pixel format {:?}/{:?}",
+            info.color_type, info.bit_depth
+        )
+    })?;
+    Ok((info.width, info.height, rgba))
+}
+
+/// Widen 8-bit PNG samples to RGBA. `None` means the combination cannot be
+/// widened without guessing, which the caller reports instead of writing wrong
+/// pixels.
+fn expand_to_rgba(
+    color_type: png::ColorType,
+    bit_depth: png::BitDepth,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    if bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    let mut rgba = Vec::new();
+    match color_type {
+        png::ColorType::Rgba => rgba.extend_from_slice(data),
+        png::ColorType::Rgb => {
+            for px in data.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        png::ColorType::Grayscale => {
+            for &v in data {
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for px in data.chunks_exact(2) {
+                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+        }
+        png::ColorType::Indexed => return None,
+    }
+    Some(rgba)
 }
