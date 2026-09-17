@@ -30,6 +30,24 @@ pub enum WireError {
     UnknownBanner { banner: [u8; 4] },
     /// A fixed-size field was consumed but bytes were left over.
     TrailingBytes { remaining: usize },
+    /// A prop cannot be registered with `ASSET_REGI` because the reference
+    /// client refuses to upload anything that is not a standard wearable prop.
+    ///
+    /// `PalaceProp.as::assetData` is only ever reached through
+    /// `PalaceClient.as::sendPropToServer` (lines 800-818), which drops the
+    /// request — "web service big prop... ignore request" — unless the prop is
+    /// exactly 44x44 with both offsets in `-44..=88`. We report the rejection
+    /// instead of silently writing nothing.
+    UnwearableProp {
+        /// The rejected prop's width.
+        width: i16,
+        /// The rejected prop's height.
+        height: i16,
+        /// The rejected prop's horizontal offset.
+        h_offset: i16,
+        /// The rejected prop's vertical offset.
+        v_offset: i16,
+    },
     /// An underlying I/O failure.
     Io(std::io::Error),
 }
@@ -64,6 +82,16 @@ impl fmt::Display for WireError {
             WireError::TrailingBytes { remaining } => {
                 write!(f, "{remaining} unparsed byte(s) remained after decode")
             }
+            WireError::UnwearableProp {
+                width,
+                height,
+                h_offset,
+                v_offset,
+            } => write!(
+                f,
+                "prop {width}x{height} with offsets h={h_offset}, v={v_offset} cannot be \
+                 registered: a wearable prop must be 44x44 with offsets in -44..=88"
+            ),
             WireError::Io(e) => write!(f, "i/o error: {e}"),
         }
     }

@@ -1,8 +1,10 @@
 //! User-related message bodies: the full `UserRec` and the small
 //! notifications around it.
 
-use crate::byteorder::{Reader, Writer};
+use crate::byteorder::{ByteOrder, Reader, Writer};
 use crate::error::{Result, WireError};
+use crate::frame::Frame;
+use crate::opcode;
 
 /// A signed 16-bit screen coordinate pair.
 ///
@@ -343,6 +345,13 @@ impl UserName {
 /// worn list — `sint32 nbrProps` then `AssetSpec[nbrProps]` (:2170-2177). The
 /// body always carries the whole list and omits unused slots, so it replaces the
 /// previous props rather than extending them.
+///
+/// The opcode is used in **both** directions. Receiving, the body is exactly the
+/// same shape; sending, `PalaceClient.as::updateUserProps` (lines 824-842) writes
+/// the sender's own id into the frame `refNum`, then `count`, then one
+/// `(asset.id, 0)` pair per worn prop. [`UserProp::encode`] therefore zeroes
+/// every CRC: the reference sends `writeUnsignedInt(0)` where the CRC would go,
+/// because the server re-queries the prop by id anyway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserProp {
     /// The user whose worn props changed — the frame `refNum`.
@@ -359,6 +368,57 @@ impl UserProp {
             user_id: ref_num,
             props: decode_prop_list(r, nbr_props)?,
         })
+    }
+
+    /// Encode a `usrP` body: `sint32 nbrProps` then `(id, 0)` per prop.
+    ///
+    /// ## The 9-prop cap
+    ///
+    /// A worn list is capped at 9 entries. The reference caps the *loop* with
+    /// `Math.min(user.props.length, 9)` but still writes the **untruncated**
+    /// `length * 8 + 4` into the frame's size field — which would make the frame
+    /// claim bytes it does not carry and desynchronise a length-prefixed stream.
+    /// That branch is unreachable in the reference: `PalaceUser.addProp` and
+    /// `setProps` both refuse to grow `props` past 9, so `updateUserProps` never
+    /// sees a longer list.
+    ///
+    /// We do not mirror the inconsistency. A count above 9 is rejected with
+    /// [`WireError::ImplausibleLength`], the same error and limit
+    /// [`decode_prop_list`] uses, so every body this function produces can be
+    /// decoded by [`UserProp::decode`]. Silently dropping props would hide the
+    /// caller's bug; erring keeps the codec symmetric with its own decoder.
+    pub fn encode(&self, w: &mut Writer) -> Result<()> {
+        if self.props.len() > MAX_WIRE_PROPS as usize {
+            return Err(WireError::ImplausibleLength {
+                length: self.props.len() as u32,
+                max: MAX_WIRE_PROPS as u32,
+            });
+        }
+        w.write_i32(self.props.len() as i32);
+        for spec in &self.props {
+            w.write_i32(spec.id);
+            w.write_u32(0);
+        }
+        Ok(())
+    }
+
+    /// The encoded `usrP` body as a standalone buffer.
+    pub fn encode_to_vec(&self, order: ByteOrder) -> Result<Vec<u8>> {
+        let mut w = Writer::with_capacity(order, 4 + self.props.len() * 8);
+        self.encode(&mut w)?;
+        Ok(w.into_vec())
+    }
+
+    /// Build a complete `MSG_USERPROP` frame.
+    ///
+    /// `refNum` is the sender's own user id, exactly as the reference writes
+    /// `socket.writeInt(id)` between the size field and the count.
+    pub fn frame(&self, order: ByteOrder) -> Result<Frame> {
+        Ok(Frame::new(
+            opcode::USERPROP,
+            self.user_id,
+            self.encode_to_vec(order)?,
+        ))
     }
 }
 
@@ -633,5 +693,99 @@ mod tests {
         let msg = UserProp::decode(4, &mut r).unwrap();
         assert_eq!(msg.user_id, 4);
         assert!(msg.props.is_empty());
+    }
+
+    fn worn(ids: &[i32]) -> UserProp {
+        UserProp {
+            user_id: 42,
+            props: ids.iter().map(|&id| prop(id, 0)).collect(),
+        }
+    }
+
+    #[test]
+    fn user_prop_frame_matches_hand_built_reference_bytes() {
+        // Expected bytes typed out from PalaceClient.as::updateUserProps
+        // (824-842): id in refNum, then count, then (asset.id, 0) per prop. The
+        // stored CRC is deliberately replaced by 0.
+        let msg = UserProp {
+            user_id: 42,
+            props: vec![prop(0x1122_3344, 0xdead_beef), prop(0x5566_7788, 0)],
+        };
+        let bytes = msg
+            .frame(ByteOrder::Little)
+            .unwrap()
+            .encode(ByteOrder::Little)
+            .unwrap();
+        #[rustfmt::skip]
+        let expected: Vec<u8> = vec![
+            0x50, 0x72, 0x73, 0x75, // "usrP" little-endian wire spelling
+            0x14, 0x00, 0x00, 0x00, // length = 2 * 8 + 4
+            0x2a, 0x00, 0x00, 0x00, // refNum = sender id 42
+            0x02, 0x00, 0x00, 0x00, // nbrProps = 2
+            0x44, 0x33, 0x22, 0x11, // asset.id = 0x11223344
+            0x00, 0x00, 0x00, 0x00, // crc = 0, not the stored 0xdeadbeef
+            0x88, 0x77, 0x66, 0x55, // asset.id = 0x55667788
+            0x00, 0x00, 0x00, 0x00, // crc = 0
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn user_prop_is_big_endian_aware() {
+        let bytes = worn(&[0x1122_3344])
+            .frame(ByteOrder::Big)
+            .unwrap()
+            .encode(ByteOrder::Big)
+            .unwrap();
+        assert_eq!(&bytes[..4], b"usrP");
+        assert_eq!(&bytes[4..8], &12u32.to_be_bytes(), "1 * 8 + 4");
+        assert_eq!(&bytes[8..12], &42i32.to_be_bytes());
+        assert_eq!(&bytes[12..16], &1i32.to_be_bytes());
+        assert_eq!(&bytes[16..20], &0x1122_3344i32.to_be_bytes());
+        assert_eq!(&bytes[20..24], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn user_prop_size_field_is_count_times_eight_plus_four() {
+        for count in [0usize, 1, 9] {
+            let ids: Vec<i32> = (0..count as i32).collect();
+            let msg = worn(&ids);
+            let frame = msg.frame(ByteOrder::Little).unwrap();
+            assert_eq!(frame.payload.len(), count * 8 + 4, "body for {count} props");
+            let bytes = frame.encode(ByteOrder::Little).unwrap();
+            assert_eq!(
+                &bytes[4..8],
+                &(count as u32 * 8 + 4).to_le_bytes(),
+                "the frame length field is the reference's count * 8 + 4"
+            );
+        }
+    }
+
+    #[test]
+    fn user_prop_rejects_a_list_longer_than_nine() {
+        // The reference model never grows past 9 (PalaceUser.addProp/setProps),
+        // and its decoder here rejects > 9, so the encoder must too.
+        let msg = worn(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut w = Writer::new(order);
+            assert!(matches!(
+                msg.encode(&mut w),
+                Err(WireError::ImplausibleLength { length: 10, max: 9 })
+            ));
+            assert!(w.is_empty(), "a rejected list writes nothing");
+            assert!(msg.encode_to_vec(order).is_err());
+            assert!(msg.frame(order).is_err());
+        }
+    }
+
+    #[test]
+    fn user_prop_encode_then_decode_is_the_identity() {
+        let msg = worn(&[7, 8, 9]);
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let payload = msg.encode_to_vec(order).unwrap();
+            let mut r = Reader::new(&payload, order);
+            assert_eq!(UserProp::decode(msg.user_id, &mut r).unwrap(), msg);
+            assert!(r.is_empty());
+        }
     }
 }

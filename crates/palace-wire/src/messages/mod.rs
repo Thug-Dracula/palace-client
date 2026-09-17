@@ -8,6 +8,7 @@
 //! The single entry point is [`Message::decode`]. It never fails on an unknown
 //! opcode: it returns [`Message::Unknown`] so the caller can log and skip.
 
+mod asset;
 mod chat;
 mod lists;
 mod logon;
@@ -18,6 +19,7 @@ mod server;
 mod spots;
 mod user;
 
+pub use asset::PropUpload;
 pub use chat::{Talk, Whisper};
 pub use lists::{RoomList, RoomListRec, UserList, UserListRec};
 pub use logon::{
