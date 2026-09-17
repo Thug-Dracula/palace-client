@@ -8,6 +8,7 @@ import type {
   Settings,
   UserInfo,
 } from "./api";
+import * as api from "./api";
 
 const FACE_COLORS = [
   "#ff6b6b",
@@ -49,6 +50,8 @@ class PalaceStore {
 
   zoom = $state(1);
   native = $state(false);
+  showNames = $state(true);
+  showAvatars = $state(true);
 
   viewport = { width: 960, height: 540, dpr: 1 };
 
@@ -64,6 +67,16 @@ class PalaceStore {
 
   get connected(): boolean {
     return this.status === "connected";
+  }
+
+  get self(): UserInfo | null {
+    return this.users.find((user) => user.is_self) ?? null;
+  }
+
+  setVisibility(names: boolean, avatars: boolean): void {
+    this.showNames = names;
+    this.showAvatars = avatars;
+    void api.setVisibility(names, avatars).catch(() => {});
   }
 
   setZoom(value: number): void {
