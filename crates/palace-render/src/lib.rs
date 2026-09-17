@@ -57,6 +57,7 @@ pub mod build;
 pub mod canvas;
 pub mod compositor;
 pub mod corpus;
+pub mod draw;
 pub mod error;
 pub mod face;
 pub mod image_clut;
@@ -72,6 +73,10 @@ pub use build::{
 pub use canvas::Canvas;
 pub use compositor::{draw_into, render, sort_avatars, AnimationClock, RenderOptions};
 pub use corpus::RoomSource;
+pub use draw::{
+    absolute_points, ellipse_geometry, is_ellipse, layer_of, rasterize_back, rasterize_front,
+    rasterize_layer, DrawLayer, DrawList,
+};
 pub use error::{AssetNote, RenderError};
 pub use face::{face_sheet_png, smiley_cell, COLOR_VARIANTS, FACE_CELL, FACE_VARIANTS};
 pub use nametag::{

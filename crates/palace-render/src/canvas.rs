@@ -145,6 +145,27 @@ impl Canvas {
         }
     }
 
+    /// Paint one logical pixel with source-over compositing.
+    ///
+    /// The logical pixel expands to its `dpr × dpr` device footprint exactly as
+    /// a one-pixel [`Canvas::blit`] would, so draw commands stay expressed in
+    /// room pixels. A fully transparent `rgba` is a no-op.
+    pub fn paint_pixel(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
+        if rgba[3] == 0 {
+            return;
+        }
+        let dpr = self.dpr.as_f64();
+        let dx0 = (f64::from(x) * dpr).floor() as i64;
+        let dy0 = (f64::from(y) * dpr).floor() as i64;
+        let dx1 = ((f64::from(x) + 1.0) * dpr).floor() as i64;
+        let dy1 = ((f64::from(y) + 1.0) * dpr).floor() as i64;
+        for dy in dy0..dy1.max(dy0) {
+            for dx in dx0..dx1.max(dx0) {
+                self.write_device(dx, dy, rgba, 1.0);
+            }
+        }
+    }
+
     /// Draw an RGBA image with its top-left at logical `(x, y)`.
     ///
     /// The image keeps its intrinsic pixel size: one source pixel becomes one
@@ -347,6 +368,25 @@ mod tests {
         }
         assert_eq!(c.device_pixel(1, 1), Some([0, 0, 0, 0]));
         assert_eq!(c.device_pixel(4, 4), Some([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn paint_pixel_expands_to_the_dpr_footprint_and_clips_offscreen() {
+        let mut c = Canvas::for_room(4.0, 4.0, 2.0);
+        c.paint_pixel(1, 1, [200, 100, 50, 255]);
+        for (x, y) in [(2, 2), (3, 2), (2, 3), (3, 3)] {
+            assert_eq!(
+                c.device_pixel(x, y),
+                Some([200, 100, 50, 255]),
+                "device {x},{y}"
+            );
+        }
+        assert_eq!(c.device_pixel(1, 1), Some([0, 0, 0, 0]));
+        // A transparent source and an off-buffer coordinate are both no-ops.
+        c.paint_pixel(0, 0, [1, 2, 3, 0]);
+        assert_eq!(c.device_pixel(0, 0), Some([0, 0, 0, 0]));
+        c.paint_pixel(-5, -5, [1, 2, 3, 255]);
+        c.paint_pixel(99, 99, [1, 2, 3, 255]);
     }
 
     #[test]

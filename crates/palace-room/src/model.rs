@@ -367,6 +367,9 @@ pub enum RoomWarning {
     },
     /// A draw operand was too short to decode its geometry.
     DrawPayloadTruncated { index: usize, available: usize },
+    /// A standalone draw-record slice was shorter than the 10-byte header, so
+    /// no header fields could be read. The raw bytes are kept by the caller.
+    DrawHeaderTruncated { available: usize },
 }
 
 impl std::fmt::Display for RoomWarning {
@@ -442,6 +445,10 @@ impl std::fmt::Display for RoomWarning {
             RoomWarning::DrawPayloadTruncated { index, available } => write!(
                 f,
                 "draw[{index}] operand too short to decode ({available} bytes)"
+            ),
+            RoomWarning::DrawHeaderTruncated { available } => write!(
+                f,
+                "draw record is shorter than its 10-byte header ({available} bytes)"
             ),
         }
     }

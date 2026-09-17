@@ -279,6 +279,8 @@ impl SceneBuilder {
                 .push(self.build_avatar(x, y, spec, &mut notes));
         }
 
+        scene.draw = crate::draw::DrawList::from_commands(room.draw_cmds.iter().cloned());
+
         scene.background = background;
         scene.notes = notes;
         scene.name_tags_visible = self.name_tags_visible;

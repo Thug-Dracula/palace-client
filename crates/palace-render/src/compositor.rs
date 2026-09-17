@@ -20,10 +20,11 @@
 //! | 11 | chat text | `textGroup` |
 //! | 12 | hotspot-state overlays flagged *pictures above all* | `hotSpotAboveEverythingCanvas` |
 //!
-//! Layers 4, 8, 9 and 11 are **not rasterized in this milestone**: no room in the
-//! 799-payload corpus carries a draw command, and name tags and chat text are
-//! font-dependent and belong with the presentation layer. They are listed here
-//! so the ordering is on record rather than rediscovered.
+//! Layers 4 and 8 are rasterized by [`crate::draw`] from [`crate::scene::Scene::draw`].
+//! Layers 9 and 11 are **not rasterized here**: chat text is font-dependent and
+//! belongs with the presentation layer (name tags are drawn by [`crate::nametag`]
+//! at layer 9). The list stays here so the ordering is on record rather than
+//! rediscovered.
 //!
 //! ## Avatar y-sort
 //!
@@ -147,6 +148,7 @@ pub fn draw_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationClock) {
 
     blit_layer(canvas, &scene.overlays_above_nothing);
     canvas.apply_dim(scene.dim_level);
+    crate::draw::rasterize_back(canvas, &scene.draw);
     blit_layer(canvas, &scene.loose_props);
 
     let mut avatars = scene.avatars.clone();
@@ -156,6 +158,7 @@ pub fn draw_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationClock) {
     }
 
     blit_layer(canvas, &scene.overlays_above_avatars);
+    crate::draw::rasterize_front(canvas, &scene.draw);
     if scene.name_tags_visible {
         for avatar in &avatars {
             if let Some(name) = avatar.name.as_deref() {
