@@ -20,6 +20,8 @@
 //!   `hOffset`/`vOffset` relative to the anchor box (`Avatar.mxml`). Positions
 //!   are clamped to the room with a 22 px margin (`PalaceRoomView.updateSelfPosition`).
 
+use std::collections::BTreeMap;
+
 use palace_prop::PropImage;
 use palace_room::RoomDesc;
 
@@ -137,13 +139,30 @@ pub fn clamp_avatar_position(x: i32, y: i32, room_width: i32, room_height: i32) 
 pub struct SceneBuilder {
     media: MediaStore,
     props: PropStore,
+    pic_opacity: BTreeMap<(i16, i16), f64>,
 }
 
 impl SceneBuilder {
     /// A builder over the given media and prop stores.
     #[must_use]
     pub fn new(media: MediaStore, props: PropStore) -> Self {
-        SceneBuilder { media, props }
+        SceneBuilder {
+            media,
+            props,
+            pic_opacity: BTreeMap::new(),
+        }
+    }
+
+    /// Draw a hotspot's picture at `alpha`, keyed by hotspot id and state index.
+    /// `SETPICOPACITY` is a local-only effect, so this is a render input rather
+    /// than a field of the room record.
+    pub fn set_pic_opacity(&mut self, spot: i16, state: i16, alpha: f64) {
+        self.pic_opacity
+            .insert((spot, state), alpha.clamp(0.0, 1.0));
+    }
+
+    pub fn clear_pic_opacity(&mut self) {
+        self.pic_opacity.clear();
     }
 
     /// The media store (backgrounds and overlays).
@@ -324,11 +343,16 @@ impl SceneBuilder {
             }
         };
         apply_transparency_index(&mut image, overlay.trans_color);
+        let alpha = self
+            .pic_opacity
+            .get(&(hotspot.id, hotspot.state))
+            .copied()
+            .unwrap_or(1.0);
         let width = image.width() as i32;
         let height = image.height() as i32;
         let x = i32::from(hotspot.loc.h) + i32::from(state.pic_loc.h) - width / 2;
         let y = i32::from(hotspot.loc.v) + i32::from(state.pic_loc.v) - height / 2;
-        Some(Sprite::new(image, x, y, 0))
+        Some(Sprite::new(image, x, y, 0).with_alpha(alpha))
     }
 
     /// Stack an avatar's worn props around its anchor.
@@ -515,6 +539,63 @@ mod tests {
         apply_transparency_index(&mut image, 1);
         assert_eq!(image.pixel(0, 0).expect("px")[3], 0);
         assert_eq!(image.pixel(1, 0).expect("px")[3], 255);
+    }
+
+    #[test]
+    fn a_picture_opacity_override_reaches_the_overlay_sprite() {
+        let dir =
+            std::env::temp_dir().join(format!("palace-render-opacity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("over.png");
+        {
+            let file = std::fs::File::create(&path).expect("create png");
+            let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), 4, 4);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            let pixels = vec![255u8; 4 * 4 * 4];
+            writer.write_image_data(&pixels).expect("png data");
+        }
+
+        let mut media = MediaStore::default();
+        assert!(
+            !media.insert_path("over.png", path),
+            "a fresh store has not indexed this name yet"
+        );
+
+        let mut room = empty_room();
+        room.pictures.push(palace_room::PictureOverlay {
+            pic_id: 7,
+            name: Some("over.png".to_string()),
+            trans_color: -1,
+            ..palace_room::PictureOverlay::default()
+        });
+        room.hotspots.push(palace_room::Hotspot {
+            id: 3,
+            state: 0,
+            loc: palace_wire::messages::Point::new(100, 100),
+            states: vec![palace_room::HotspotState {
+                pict_id: 7,
+                ..palace_room::HotspotState::default()
+            }],
+            ..palace_room::Hotspot::default()
+        });
+
+        let mut builder = SceneBuilder::new(media, PropStore::new());
+        let before = builder.build(&room, &[]);
+        assert_eq!(
+            before.overlays_above_nothing[0].alpha, 1.0,
+            "a picture is opaque until a script says otherwise"
+        );
+
+        builder.set_pic_opacity(3, 0, 0.25);
+        let after = builder.build(&room, &[]);
+        assert_eq!(after.overlays_above_nothing[0].alpha, 0.25);
+
+        builder.clear_pic_opacity();
+        let cleared = builder.build(&room, &[]);
+        assert_eq!(cleared.overlays_above_nothing[0].alpha, 1.0);
     }
 
     #[test]

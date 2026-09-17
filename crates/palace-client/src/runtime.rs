@@ -953,7 +953,7 @@ fn run_session(
         }
 
         if dirty_render {
-            if let Some(screen) = compose(&state, &builder, shared, start) {
+            if let Some(screen) = compose(&state, &mut builder, shared, start) {
                 last_room_size = Some((screen.geometry.room_w, screen.geometry.room_h));
                 shared.emit(ClientEvent::Screen {
                     screen: screen.clone(),
@@ -1100,7 +1100,7 @@ fn request_assets(
 
 fn compose(
     state: &SessionState,
-    builder: &SceneBuilder,
+    builder: &mut SceneBuilder,
     shared: &Arc<Shared>,
     start: Instant,
 ) -> Option<ScreenState> {
@@ -1112,7 +1112,12 @@ fn compose(
     room.loose_props
         .retain(|prop| builder.props().contains(prop.spec.id));
 
-    let (avatars, hidden_avatars) = avatar_specs(&state.users_in_room(), builder.props());
+    let (avatars, hidden_avatars) = visible_avatars(state, builder.props());
+
+    builder.clear_pic_opacity();
+    for ((spot, index), alpha) in &state.pic_opacity {
+        builder.set_pic_opacity(*spot, *index, *alpha);
+    }
 
     let mut scene = builder.build_with(&room, &avatars, &[]);
     scene.dim_level = state.room_dim;
@@ -1181,6 +1186,14 @@ fn avatar_specs(users: &[UserInfo], props: &PropStore) -> (Vec<AvatarSpec>, usiz
         })
         .collect();
     (avatars, hidden)
+}
+
+fn visible_avatars(state: &SessionState, props: &PropStore) -> (Vec<AvatarSpec>, usize) {
+    if state.avatars_hidden {
+        (Vec::new(), 0)
+    } else {
+        avatar_specs(&state.users_in_room(), props)
+    }
 }
 
 /// Build the snapshot a running script observes.
@@ -1464,36 +1477,55 @@ fn apply_effect(
                 ),
             }]
         }
-        Effect::MoveSpot { spot, dx, dy } | Effect::MoveSpotLocal { spot, dx, dy } => {
-            *dirty_render = true;
+        Effect::MoveSpot { spot, dx: x, dy: y } | Effect::MoveSpotLocal { spot, dx: x, dy: y } => {
+            let changed = move_spot_to(state, *spot, *x, *y);
+            *dirty_render |= changed;
             vec![ClientEvent::Note {
-                text: format!("script: spot {spot} moved by ({dx},{dy})"),
+                text: format!(
+                    "script: spot {spot} moved to ({x},{y}){}",
+                    no_change_suffix(changed)
+                ),
             }]
         }
-        Effect::SetPicOffset { spot, dx, dy } => {
-            *dirty_render = true;
+        Effect::SetPicOffset { spot, dx: x, dy: y } => {
+            let changed = set_pic_offset(state, *spot, None, *x, *y);
+            *dirty_render |= changed;
             vec![ClientEvent::Note {
-                text: format!("script: spot {spot} picture offset ({dx},{dy})"),
+                text: format!(
+                    "script: spot {spot} picture offset ({x},{y}){}",
+                    no_change_suffix(changed)
+                ),
             }]
         }
         Effect::SetPicOffsetLocal {
             spot,
-            state: value,
-            dx,
-            dy,
+            state: index,
+            dx: x,
+            dy: y,
         } => {
-            *dirty_render = true;
+            let changed = set_pic_offset(state, *spot, Some(*index), *x, *y);
+            *dirty_render |= changed;
             vec![ClientEvent::Note {
-                text: format!("script: spot {spot} state {value} picture offset ({dx},{dy})"),
+                text: format!(
+                    "script: spot {spot} state {index} picture offset ({x},{y}){}",
+                    no_change_suffix(changed)
+                ),
             }]
         }
         Effect::SetPicOpacity {
             spot,
-            state: value,
+            state: index,
             opacity,
-        } => vec![ClientEvent::Note {
-            text: format!("script: spot {spot} state {value} opacity {opacity:.2}"),
-        }],
+        } => {
+            let changed = set_pic_opacity(state, *spot, *index, *opacity);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: spot {spot} state {index} opacity {opacity:.2}{}",
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
         Effect::MoveUserAbs { x, y } | Effect::MoveUserRel { dx: x, dy: y } => {
             *dirty_render = true;
             vec![ClientEvent::Note {
@@ -1518,13 +1550,17 @@ fn apply_effect(
             Vec::new()
         }
         Effect::HideAvatars => {
-            *dirty_render = true;
+            let changed = !state.avatars_hidden;
+            state.avatars_hidden = true;
+            *dirty_render |= changed;
             vec![ClientEvent::Note {
                 text: "script: HIDEAVATARS".to_string(),
             }]
         }
         Effect::ShowAvatars => {
-            *dirty_render = true;
+            let changed = state.avatars_hidden;
+            state.avatars_hidden = false;
+            *dirty_render |= changed;
             vec![ClientEvent::Note {
                 text: "script: SHOWAVATARS".to_string(),
             }]
@@ -1854,6 +1890,55 @@ fn drop_prop(state: &mut SessionState, x: i32, y: i32) -> Option<u32> {
     Some(prop)
 }
 
+fn hotspot_mut(state: &mut SessionState, spot: i32) -> Option<&mut palace_room::Hotspot> {
+    state
+        .room_desc
+        .as_mut()?
+        .hotspots
+        .iter_mut()
+        .find(|hotspot| i32::from(hotspot.id) == spot)
+}
+
+/// `SETLOC` / `SETLOCLOCAL`: `x y` are the spot's new absolute position, so this
+/// replaces `loc`. `MSG_SPOTMOVE` carries a position rather than a delta, the
+/// reference server assigns it, and OpenPalace changed its own implementation
+/// from relative to absolute to match.
+fn move_spot_to(state: &mut SessionState, spot: i32, x: i32, y: i32) -> bool {
+    let Some(hotspot) = hotspot_mut(state, spot) else {
+        return false;
+    };
+    hotspot.loc = point(x, y);
+    true
+}
+
+/// `SETPICLOC` / `SETPICLOCLOCAL`: the absolute picture offset of a state, or of
+/// the hotspot's current state when `index` is `None`. The manual's worked
+/// example proves these replace the offset rather than adding to it.
+fn set_pic_offset(state: &mut SessionState, spot: i32, index: Option<i32>, x: i32, y: i32) -> bool {
+    let Some(hotspot) = hotspot_mut(state, spot) else {
+        return false;
+    };
+    let index = match index {
+        Some(index) => usize::try_from(index).ok(),
+        None => usize::try_from(hotspot.state).ok(),
+    };
+    let Some(target) = index.and_then(|index| hotspot.states.get_mut(index)) else {
+        return false;
+    };
+    target.pic_loc = point(x, y);
+    true
+}
+
+fn set_pic_opacity(state: &mut SessionState, spot: i32, index: i32, opacity: f64) -> bool {
+    let (Ok(spot), Ok(index)) = (i16::try_from(spot), i16::try_from(index)) else {
+        return false;
+    };
+    state
+        .pic_opacity
+        .insert((spot, index), opacity.clamp(0.0, 1.0));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2066,6 +2151,118 @@ mod tests {
         assert!(!wear_prop(&mut orphan, 1));
         assert_eq!(doff_prop(&mut orphan), None);
         assert!(!remove_worn_prop(&mut orphan, 1));
+    }
+
+    fn find_hotspot(state: &SessionState, id: i32) -> &palace_room::Hotspot {
+        state
+            .room_desc
+            .as_ref()
+            .expect("a room")
+            .hotspots
+            .iter()
+            .find(|hotspot| i32::from(hotspot.id) == id)
+            .expect("the hotspot is in the room")
+    }
+
+    fn a_hotspot_showing_a_state(state: &SessionState) -> (i32, usize) {
+        let room = state.room_desc.as_ref().expect("a room");
+        let hotspot = room
+            .hotspots
+            .iter()
+            .find(|hotspot| {
+                usize::try_from(hotspot.state).is_ok_and(|index| index < hotspot.states.len())
+            })
+            .expect("the fixture room has a hotspot showing one of its states");
+        let index = usize::try_from(hotspot.state).expect("a state index");
+        (i32::from(hotspot.id), index)
+    }
+
+    #[test]
+    fn setloc_replaces_the_hotspot_position_with_absolute_coordinates() {
+        let mut state = session_in_room();
+        let (id, _) = a_hotspot_showing_a_state(&state);
+        assert!(move_spot_to(&mut state, id, 137, 219));
+        let hotspot = find_hotspot(&state, id);
+        assert_eq!(
+            (hotspot.loc.h, hotspot.loc.v),
+            (137, 219),
+            "SETLOC assigns the position rather than adding to it"
+        );
+        assert!(move_spot_to(&mut state, id, 142, 226));
+        assert_eq!(
+            (
+                find_hotspot(&state, id).loc.h,
+                find_hotspot(&state, id).loc.v
+            ),
+            (142, 226)
+        );
+        assert!(!move_spot_to(&mut state, 32_767, 1, 1), "no such spot");
+    }
+
+    #[test]
+    fn setpicloc_replaces_the_picture_offset_of_the_current_state() {
+        let mut state = session_in_room();
+        let (id, index) = a_hotspot_showing_a_state(&state);
+        assert!(set_pic_offset(&mut state, id, None, 54, -21));
+        let shown = &find_hotspot(&state, id).states[index];
+        assert_eq!(
+            (shown.pic_loc.h, shown.pic_loc.v),
+            (54, -21),
+            "SETPICLOC assigns the offset rather than adding to it"
+        );
+        assert!(set_pic_offset(&mut state, id, None, 8, 9));
+        let shown = &find_hotspot(&state, id).states[index];
+        assert_eq!((shown.pic_loc.h, shown.pic_loc.v), (8, 9));
+    }
+
+    #[test]
+    fn setpicloclocal_addresses_the_state_it_names() {
+        let mut state = session_in_room();
+        let (id, _) = a_hotspot_showing_a_state(&state);
+        assert!(set_pic_offset(&mut state, id, Some(0), -50, -50));
+        let first = &find_hotspot(&state, id).states[0];
+        assert_eq!((first.pic_loc.h, first.pic_loc.v), (-50, -50));
+        assert!(
+            !set_pic_offset(&mut state, id, Some(99), 0, 0),
+            "no such state"
+        );
+        assert!(
+            !set_pic_offset(&mut state, id, Some(-1), 0, 0),
+            "negative index"
+        );
+        assert!(
+            !set_pic_offset(&mut state, 32_767, None, 0, 0),
+            "no such spot"
+        );
+    }
+
+    #[test]
+    fn setpicopacity_records_a_clamped_alpha() {
+        let mut state = session_in_room();
+        assert!(set_pic_opacity(&mut state, 3, 1, 0.5));
+        assert_eq!(state.pic_opacity.get(&(3, 1)).copied(), Some(0.5));
+        assert!(set_pic_opacity(&mut state, 3, 2, 4.2));
+        assert_eq!(state.pic_opacity.get(&(3, 2)).copied(), Some(1.0));
+        assert!(set_pic_opacity(&mut state, 3, 3, -1.0));
+        assert_eq!(state.pic_opacity.get(&(3, 3)).copied(), Some(0.0));
+    }
+
+    #[test]
+    fn hideavatars_takes_the_avatars_out_of_the_scene() {
+        let mut state = session_in_room();
+        let props = PropStore::new();
+        assert_eq!(
+            visible_avatars(&state, &props).0.len(),
+            1,
+            "the user is drawn"
+        );
+        state.avatars_hidden = true;
+        assert!(
+            visible_avatars(&state, &props).0.is_empty(),
+            "and now is not"
+        );
+        state.avatars_hidden = false;
+        assert_eq!(visible_avatars(&state, &props).0.len(), 1, "and back again");
     }
 
     #[test]

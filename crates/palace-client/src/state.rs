@@ -109,6 +109,10 @@ pub struct SessionState {
     pub room_desc: Option<RoomDesc>,
     /// Client-side `DIMROOM` level for the current room; `1.0` is undimmed.
     pub room_dim: f64,
+    /// Client-side `HIDEAVATARS` flag; entering a room clears it.
+    pub avatars_hidden: bool,
+    /// Client-side `SETPICOPACITY`, keyed by hotspot id and state index.
+    pub pic_opacity: BTreeMap<(i16, i16), f64>,
     pub chat: Vec<ChatLine>,
     chat_seq: u64,
     last_error: Option<String>,
@@ -131,6 +135,8 @@ impl SessionState {
             current_room: None,
             room_desc: None,
             room_dim: 1.0,
+            avatars_hidden: false,
+            pic_opacity: BTreeMap::new(),
             chat: Vec::new(),
             chat_seq: 0,
             last_error: None,
@@ -404,6 +410,8 @@ impl SessionState {
                         });
                         self.room_desc = Some(room);
                         self.room_dim = 1.0;
+                        self.avatars_hidden = false;
+                        self.pic_opacity.clear();
                         applied.room_entered = true;
                         applied.render = true;
                     }
