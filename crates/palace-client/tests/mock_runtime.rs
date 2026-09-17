@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use palace_client::runtime::ClientRuntime;
 use palace_client::{
-    ChatKind, ClientConfig, ClientEvent, ConnectionStatus, RoomInfo, ScreenState, ServerBanner,
-    UserInfo,
+    ChatKind, ClientConfig, ClientEvent, ClientHandle, ConnectionStatus, RoomInfo, ScreenState,
+    ServerBanner, UserInfo,
 };
 use palace_wire::byteorder::ByteOrder;
 use palace_wire::fixture::{default_fixture_dir, Fixture};
@@ -51,6 +51,16 @@ fn server_bytes(fixture: &Fixture) -> Vec<Vec<u8>> {
                 .expect("server frame re-encodes")
         })
         .collect()
+}
+
+/// The raw `ROOMDESC` payload from the fixture, for a server that serves one
+/// room and nothing else.
+fn room_desc_payload(fixture: &Fixture) -> Vec<u8> {
+    fixture
+        .server_frames()
+        .find(|captured| captured.frame.opcode == opcode::ROOMDESC)
+        .map(|captured| captured.frame.payload.clone())
+        .expect("the fixture holds a room descriptor")
 }
 
 /// The room descriptor exactly as the server sent it.
@@ -94,6 +104,25 @@ impl MockServer {
     }
 
     fn start_with(frames: Vec<Vec<u8>>, half_close: bool) -> Self {
+        Self::start_inner(frames, half_close, None, Vec::new())
+    }
+
+    /// Like [`MockServer::start`], but holds back `tail` until the returned flag
+    /// is set — a server-side "and then..." the test controls.
+    fn start_gated(frames: Vec<Vec<u8>>, tail: Vec<Vec<u8>>) -> (Self, Arc<AtomicBool>) {
+        let gate = Arc::new(AtomicBool::new(false));
+        (
+            Self::start_inner(frames, false, Some(gate.clone()), tail),
+            gate,
+        )
+    }
+
+    fn start_inner(
+        frames: Vec<Vec<u8>>,
+        half_close: bool,
+        gate: Option<Arc<AtomicBool>>,
+        tail: Vec<Vec<u8>>,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         listener
@@ -118,8 +147,10 @@ impl MockServer {
                             let frames = frames.clone();
                             let stop = stop.clone();
                             let received = received.clone();
+                            let gate = gate.clone();
+                            let tail = tail.clone();
                             let handle = thread::spawn(move || {
-                                serve(stream, frames, half_close, stop, received);
+                                serve(stream, frames, half_close, stop, received, gate, tail);
                             });
                             workers.lock().expect("workers").push(handle);
                         }
@@ -176,6 +207,8 @@ fn serve(
     half_close: bool,
     stop: Arc<AtomicBool>,
     received: Arc<Mutex<Vec<u8>>>,
+    gate: Option<Arc<AtomicBool>>,
+    tail: Vec<Vec<u8>>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
     for bytes in &frames {
@@ -184,6 +217,21 @@ fn serve(
         }
     }
     let _ = stream.flush();
+
+    if let Some(gate) = gate {
+        while !gate.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        for bytes in &tail {
+            if stream.write_all(bytes).is_err() {
+                return;
+            }
+        }
+        let _ = stream.flush();
+    }
 
     let mut half_closed = false;
     let mut buf = [0u8; 8192];
@@ -1229,4 +1277,463 @@ fn a_refused_connection_is_reported_as_an_io_error() {
     handle.disconnect();
     cleanup(&cache);
     cleanup(&seed);
+}
+
+// ---------------------------------------------------------------------------
+// DIMROOM: a script dims the frame it renders
+// ---------------------------------------------------------------------------
+
+/// A plainly visible fill (200/255 grey) so a dim is a measurable change.
+const BRIGHT: [u8; 3] = [0xC8, 0xC8, 0xC8];
+
+fn solid_png(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            data.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+        writer.write_image_data(&data).expect("png data");
+    }
+    out
+}
+
+fn room_payload(name: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/rooms")
+        .join(format!("{name}.bin"));
+    fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// Seed every room's background, and only that, with one solid `rgb` fill.
+///
+/// Overlay pictures are left out on purpose: `build::build_with` draws them in a
+/// band that is *not* dimmed, so a bright overlay would hide a `DIMROOM`. The
+/// background is drawn under the dim, so it is the honest probe.
+fn seed_solid_media_dir(room: &palace_room::RoomDesc, rgb: [u8; 3]) -> PathBuf {
+    let dir = unique_temp_dir("seed-solid");
+    let png = solid_png(512, 384, rgb);
+    if let Some(base) = Path::new(&room.picture).file_name() {
+        if !base.is_empty() {
+            fs::write(dir.join(base), &png).expect("write seeded media");
+        }
+    }
+    dir
+}
+
+fn frame_rgba(png: &[u8]) -> Vec<u8> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(png));
+    let mut reader = decoder.read_info().expect("png info");
+    let mut buf = vec![0u8; reader.output_buffer_size().expect("png buffer size")];
+    let info = reader.next_frame(&mut buf).expect("png frame");
+    buf.truncate(info.buffer_size());
+    buf
+}
+
+fn mean_luma(rgba: &[u8]) -> f64 {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for px in rgba.chunks_exact(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        sum += 0.2126 * f64::from(px[0]) + 0.7152 * f64::from(px[1]) + 0.0722 * f64::from(px[2]);
+        count += 1;
+    }
+    assert!(count > 0, "frame has no opaque pixels");
+    sum / count as f64
+}
+
+fn frame_luma(handle: &ClientHandle) -> f64 {
+    let png = handle.frames().png().expect("the frame store holds a PNG");
+    mean_luma(&frame_rgba(&png))
+}
+
+/// The viewport point that hits the first hotspot whose script calls `DIMROOM`.
+fn dim_hotspot_click(room: &palace_room::RoomDesc, screen: &ScreenState) -> (f64, f64) {
+    let spot = room
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot
+                .script
+                .as_deref()
+                .is_some_and(|script| script.contains("DIMROOM"))
+        })
+        .expect("the room has a hotspot whose script calls DIMROOM");
+    let point = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(
+            f64::from(spot.loc.h),
+            f64::from(spot.loc.v),
+        ));
+    (point.x, point.y)
+}
+
+/// The seeded fill makes every opaque pixel the same brightness, so a change in
+/// the composited frame is a change in `DIMROOM` and nothing else.
+#[test]
+fn a_script_dimroom_darkens_the_composited_frame() {
+    let fixture = logon_fixture();
+    let room = room_desc(&fixture);
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, room_desc_payload(&fixture))
+            .encode(fixture.byte_order)
+            .expect("the room descriptor encodes"),
+    );
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("dim-script-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        !screens(&events).is_empty(),
+        "a frame was composited for the entered room"
+    );
+    let undimmed = frame_luma(&handle);
+    let baseline_version = handle.frames().version();
+    assert!(
+        undimmed > 100.0,
+        "the seeded room renders a bright frame (luma {undimmed})"
+    );
+
+    handle.run_script("40 DIMROOM");
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("script: DIMROOM 40%"))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("script: DIMROOM 40%")),
+        "the effect was applied and reported: {:?}",
+        notes(&events)
+    );
+    assert!(
+        wait_for(
+            || handle.frames().version() > baseline_version,
+            Duration::from_secs(5)
+        ),
+        "the dim was composited into a new frame"
+    );
+
+    let dimmed = frame_luma(&handle);
+    let ratio = dimmed / undimmed;
+    assert!(
+        (ratio - 0.4).abs() < 0.05,
+        "DIMROOM 40 multiplied the frame by ~0.4 (ratio {ratio}, {dimmed} vs {undimmed})"
+    );
+    assert!(
+        dimmed < undimmed * 0.6,
+        "the dimmed frame is measurably darker ({dimmed} vs {undimmed})"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn dimroom_percent_clamps_to_the_valid_range() {
+    let fixture = logon_fixture();
+    let room = room_desc(&fixture);
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, room_desc_payload(&fixture))
+            .encode(fixture.byte_order)
+            .expect("the room descriptor encodes"),
+    );
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("dim-clamp-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
+        Duration::from_secs(20),
+    );
+    assert!(!screens(&events).is_empty());
+    let baseline = frame_luma(&handle);
+    let mut version = handle.frames().version();
+
+    handle.run_script("150 DIMROOM");
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("script: DIMROOM 150%"))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("script: DIMROOM 150%")),
+        "the out-of-range value reached the effect: {:?}",
+        notes(&events)
+    );
+    assert!(wait_for(
+        || handle.frames().version() > version,
+        Duration::from_secs(5)
+    ));
+    let over = frame_luma(&handle);
+    assert!(
+        (over - baseline).abs() < baseline * 0.02,
+        "DIMROOM 150 saturates to undimmed ({over} vs {baseline})"
+    );
+    version = handle.frames().version();
+
+    handle.run_script("0 50 - DIMROOM");
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("script: DIMROOM -50%"))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("script: DIMROOM -50%")),
+        "the negative value reached the effect: {:?}",
+        notes(&events)
+    );
+    assert!(wait_for(
+        || handle.frames().version() > version,
+        Duration::from_secs(5)
+    ));
+    let under = frame_luma(&handle);
+    assert!(
+        under < baseline * 0.02,
+        "DIMROOM -50 saturates to fully dark ({under} vs {baseline})"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_real_room_hotspot_script_dimroom_darkens_the_frame() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("86");
+    let room = palace_room::decode_payload(&payload, order).expect("room 86 decodes");
+
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("dim-room-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| screens(collected).iter().any(|screen| screen.room_id == 86),
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 86)
+        .expect("a frame was composited for room 86");
+    let undimmed = frame_luma(&handle);
+    let baseline_version = handle.frames().version();
+    assert!(
+        undimmed > 100.0,
+        "the seeded room renders a bright frame (luma {undimmed})"
+    );
+
+    let (x, y) = dim_hotspot_click(&room, screen);
+    handle.click(x, y);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("script: DIMROOM 25%"))
+                && script_runs(collected).iter().any(|run| {
+                    run.event == "SELECT" && run.effects.iter().any(|effect| effect == "DIMROOM 25")
+                })
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        script_runs(&events).iter().any(|run| {
+            run.event == "SELECT" && run.effects.iter().any(|effect| effect == "DIMROOM 25")
+        }),
+        "the room's hotspot script ran DIMROOM 25: {:?}",
+        script_runs(&events)
+    );
+    assert!(
+        wait_for(
+            || handle.frames().version() > baseline_version,
+            Duration::from_secs(5)
+        ),
+        "the dim was composited into a new frame"
+    );
+
+    let dimmed = frame_luma(&handle);
+    let ratio = dimmed / undimmed;
+    assert!(
+        (ratio - 0.25).abs() < 0.05,
+        "the real hotspot's DIMROOM 25 dimmed the frame to ~0.25 (ratio {ratio}, {dimmed} vs {undimmed})"
+    );
+    assert!(
+        dimmed < undimmed * 0.5,
+        "the dimmed frame is measurably darker ({dimmed} vs {undimmed})"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn entering_a_new_room_resets_the_dim() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload_86 = room_payload("86");
+    let room_86 = palace_room::decode_payload(&payload_86, order).expect("room 86 decodes");
+    let payload_887 = room_payload("887");
+    let room_887 = palace_room::decode_payload(&payload_887, order).expect("room 887 decodes");
+
+    let mut initial = vec![server_bytes(&fixture)[0].clone()];
+    initial.push(
+        Frame::new(opcode::ROOMDESC, 0, payload_86)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let tail = vec![Frame::new(opcode::ROOMDESC, 0, payload_887)
+        .encode(order)
+        .expect("the room descriptor encodes")];
+    let (server, gate) = MockServer::start_gated(initial, tail);
+
+    let cache = unique_temp_dir("dim-reset-cache");
+    let seed_86 = seed_solid_media_dir(&room_86, BRIGHT);
+    let seed_887 = seed_solid_media_dir(&room_887, BRIGHT);
+    let mut cfg = config_for(server.port, cache.clone(), seed_86.clone());
+    cfg.seed_media.push(seed_887.clone());
+    let (handle, stream) = ClientRuntime::spawn(cfg);
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| screens(collected).iter().any(|screen| screen.room_id == 86),
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 86)
+        .expect("a frame was composited for room 86");
+    let undimmed = frame_luma(&handle);
+    assert!(
+        undimmed > 100.0,
+        "the seeded room renders a bright frame (luma {undimmed})"
+    );
+
+    let (x, y) = dim_hotspot_click(&room_86, screen);
+    handle.click(x, y);
+    let dim_version = handle.frames().version();
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("script: DIMROOM 25%"))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("script: DIMROOM 25%")),
+        "the room 86 hotspot dimmed the frame: {:?}",
+        notes(&events)
+    );
+    assert!(wait_for(
+        || handle.frames().version() > dim_version,
+        Duration::from_secs(5)
+    ));
+    let dimmed = frame_luma(&handle);
+    assert!(
+        dimmed < undimmed * 0.5,
+        "room 86 is dim before the room change ({dimmed} vs {undimmed})"
+    );
+    let dimmed_version = handle.frames().version();
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 887)
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        screens(&events).iter().any(|screen| screen.room_id == 887),
+        "the second room descriptor was entered: {:?}",
+        screens(&events)
+            .iter()
+            .map(|screen| screen.room_id)
+            .collect::<Vec<_>>()
+    );
+    assert!(wait_for(
+        || handle.frames().version() > dimmed_version,
+        Duration::from_secs(5)
+    ));
+    let after = frame_luma(&handle);
+    assert!(
+        after > undimmed * 0.9,
+        "entering a new room reset the dim to undimmed ({after} vs {undimmed})"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed_86);
+    cleanup(&seed_887);
 }
