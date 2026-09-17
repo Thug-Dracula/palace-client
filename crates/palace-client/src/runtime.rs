@@ -931,17 +931,6 @@ fn run_session(
                                     shared.emit(event);
                                 }
                             }
-                            for event in run_dispatch(
-                                &mut scripts,
-                                ScriptEvent::Enter,
-                                &mut state,
-                                shared,
-                                &mut conn,
-                                &mut dirty_render,
-                                None,
-                            ) {
-                                shared.emit(event);
-                            }
                         }
                         let wanted = shared.last_room.lock().ok().and_then(|guard| *guard);
                         if !restored_room {
@@ -3216,6 +3205,207 @@ mod tests {
             0,
             "our own exit must not run ON USERLEAVE: {:?}",
             note_texts(&own_exit)
+        );
+    }
+
+    fn room_frame(fixture: &str) -> Frame {
+        let body = match fixture {
+            "86" => include_bytes!("../../../fixtures/rooms/86.bin").to_vec(),
+            "887" => include_bytes!("../../../fixtures/rooms/887.bin").to_vec(),
+            other => panic!("no room fixture named {other}"),
+        };
+        Frame::new(opcode::ROOMDESC, 0, body)
+    }
+
+    fn script_events(events: &[ClientEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ClientEvent::Script { event, fired, .. } if *fired > 0 => Some(event.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Mirror the session loop's arrival order: decode the frame (which records
+    /// the lifecycle events), load the arrived room's scripts, then dispatch.
+    fn arrive_from_frame(
+        scripts: &mut ScriptEngine,
+        state: &mut SessionState,
+        harness: &mut Harness,
+        frame: &Frame,
+    ) -> Vec<ClientEvent> {
+        let applied = state.apply(frame, ByteOrder::Little);
+        if applied.room_entered {
+            if let Some(desc) = state.room_desc.clone() {
+                scripts.load_room(&desc);
+            }
+        }
+        let mut dirty_render = false;
+        dispatch_scripts(
+            scripts,
+            &applied.scripts,
+            state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty_render,
+        )
+    }
+
+    #[test]
+    fn a_room_arrival_fires_roomload_enter_and_roomready_in_order() {
+        let room = scripted_room(&[(
+            7,
+            "ON ROOMLOAD { \"life-roomload\" STATUSMSG } \
+             ON ENTER { \"life-enter\" STATUSMSG } \
+             ON ROOMREADY { \"life-roomready\" STATUSMSG }",
+        )]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        let mut state = SessionState::new("test", 1);
+        state.banner.user_id = HARNESS_SELF;
+        let mut harness = harness();
+
+        let applied = state.apply(&room_frame("86"), ByteOrder::Little);
+        assert!(applied.room_entered);
+        // The fixture carries no lifecycle handlers, so attach observable ones
+        // to the room this arrival loads.
+        state.room_desc = Some(room.clone());
+        scripts.load_room(&room);
+        let mut dirty_render = false;
+        let events = dispatch_scripts(
+            &mut scripts,
+            &applied.scripts,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty_render,
+        );
+
+        assert_eq!(
+            script_events(&events),
+            ["ROOMLOAD", "ENTER", "ROOMREADY"],
+            "the lifecycle runs in reference order"
+        );
+        let notes = note_texts(&events);
+        for expected in ["life-roomload", "life-enter", "life-roomready"] {
+            assert!(
+                notes.iter().any(|note| note.contains(expected)),
+                "{expected} ran: {notes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_roomready_handler_runs_with_the_rooms_hotspots_loaded() {
+        let mut room = scripted_room(&[(7, "ON ROOMREADY { 7 SPOTNAME STATUSMSG }")]);
+        room.hotspots[0].name = Some("ready-hotspot".to_string());
+
+        let mut state = SessionState::new("test", 1);
+        state.banner.user_id = HARNESS_SELF;
+        let mut harness = harness();
+        let applied = state.apply(&room_frame("86"), ByteOrder::Little);
+        assert!(applied.room_entered);
+        state.room_desc = Some(room.clone());
+
+        let mut dirty_render = false;
+        let unloaded = dispatch_scripts(
+            &mut ScriptEngine::with_palace_limits(),
+            &applied.scripts,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty_render,
+        );
+        assert_eq!(
+            fired(&unloaded, "ROOMREADY"),
+            0,
+            "a ROOMREADY handler cannot run before the room is loaded"
+        );
+
+        let mut scripts = ScriptEngine::with_palace_limits();
+        scripts.load_room(&room);
+        let after = dispatch_scripts(
+            &mut scripts,
+            &applied.scripts,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty_render,
+        );
+        assert_eq!(
+            fired(&after, "ROOMREADY"),
+            1,
+            "the loaded room's handler runs"
+        );
+        assert!(
+            note_texts(&after)
+                .iter()
+                .any(|note| note.contains("ready-hotspot")),
+            "the handler read the loaded hotspot: {:?}",
+            note_texts(&after)
+        );
+    }
+
+    #[test]
+    fn a_second_arrival_runs_the_lifecycle_again_and_a_redescription_does_not() {
+        let mut scripts = ScriptEngine::with_palace_limits();
+        let mut state = SessionState::new("test", 1);
+        state.banner.user_id = HARNESS_SELF;
+        let mut harness = harness();
+
+        let first = arrive_from_frame(&mut scripts, &mut state, &mut harness, &room_frame("86"));
+        assert!(
+            fired(&first, "ENTER") > 0,
+            "the first arrival runs ON ENTER: {:?}",
+            note_texts(&first)
+        );
+
+        let again = arrive_from_frame(&mut scripts, &mut state, &mut harness, &room_frame("86"));
+        assert_eq!(
+            fired(&again, "ENTER"),
+            0,
+            "re-describing the same room does not re-run the lifecycle"
+        );
+
+        state.begin_room_change();
+        let second = arrive_from_frame(&mut scripts, &mut state, &mut harness, &room_frame("887"));
+        assert!(
+            fired(&second, "ENTER") > 0,
+            "a second room runs the lifecycle again: {:?}",
+            note_texts(&second)
+        );
+    }
+
+    #[test]
+    fn the_corpus_roomready_handler_parses_and_runs() {
+        let room = scripted_room(&[(7, "ON ROOMREADY {\"ludo/\"HTTPGET}")]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        let mut state = SessionState::new("test", 1);
+        state.banner.user_id = HARNESS_SELF;
+        let mut harness = harness();
+
+        scripts.load_room(&room);
+        assert!(
+            scripts.has_handler(ScriptEvent::RoomReady),
+            "the corpus handler parses even though HTTPGET is not implemented"
+        );
+
+        let mut dirty_render = false;
+        let events = dispatch_scripts(
+            &mut scripts,
+            &[ScriptStimulus {
+                event: ScriptEvent::RoomReady,
+                spot: None,
+            }],
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty_render,
+        );
+        assert_eq!(
+            fired(&events, "ROOMREADY"),
+            1,
+            "the corpus handler runs on arrival"
         );
     }
 }

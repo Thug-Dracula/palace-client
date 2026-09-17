@@ -569,8 +569,14 @@ impl SessionState {
             Message::RoomDescription(_) => {
                 match palace_room::decode_payload(&frame.payload, order) {
                     Ok(room) => {
+                        // `room_entered` says a description arrived; `arrived`
+                        // says it is for a room we were not already in. A
+                        // repeated description or a spot update must not re-run
+                        // the lifecycle, so the two differ.
+                        let arrived = self.current_room.as_ref().map(|info| info.id)
+                            != Some(i32::from(room.header.room_id));
                         self.current_room = Some(RoomInfo {
-                            id: room.header.room_id as i32,
+                            id: i32::from(room.header.room_id),
                             name: room.name.clone(),
                             users: room.header.nbr_people.max(0) as u16,
                             flags: room.header.room_flags,
@@ -581,6 +587,28 @@ impl SessionState {
                         self.pic_opacity.clear();
                         applied.room_entered = true;
                         applied.render = true;
+                        if arrived {
+                            // The reference client runs the room lifecycle in
+                            // this order once per arrival, after the room is set
+                            // and its spots are available: ROOMLOAD, ENTER,
+                            // ROOMREADY. Recording them here keeps the meaning in
+                            // the decoder and lets the runtime dispatch them in
+                            // order through `dispatch_scripts`.
+                            applied.scripts.extend([
+                                ScriptStimulus {
+                                    event: ScriptEvent::RoomLoad,
+                                    spot: None,
+                                },
+                                ScriptStimulus {
+                                    event: ScriptEvent::Enter,
+                                    spot: None,
+                                },
+                                ScriptStimulus {
+                                    event: ScriptEvent::RoomReady,
+                                    spot: None,
+                                },
+                            ]);
+                        }
                     }
                     Err(err) => {
                         let line = self.system_line(
@@ -1615,6 +1643,89 @@ mod tests {
         assert!(
             !applied.render,
             "deleting an absent hotspot changes nothing"
+        );
+    }
+
+    fn room_frame(fixture: &str) -> Frame {
+        let body = match fixture {
+            "86" => include_bytes!("../../../fixtures/rooms/86.bin").to_vec(),
+            "887" => include_bytes!("../../../fixtures/rooms/887.bin").to_vec(),
+            other => panic!("no room fixture named {other}"),
+        };
+        Frame::new(opcode::ROOMDESC, 0, body)
+    }
+
+    fn lifecycle() -> Vec<ScriptStimulus> {
+        vec![
+            ScriptStimulus {
+                event: ScriptEvent::RoomLoad,
+                spot: None,
+            },
+            ScriptStimulus {
+                event: ScriptEvent::Enter,
+                spot: None,
+            },
+            ScriptStimulus {
+                event: ScriptEvent::RoomReady,
+                spot: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_room_arrival_records_roomload_enter_and_roomready_in_order() {
+        let mut state = SessionState::new("test", 1);
+        let applied = state.apply(&room_frame("86"), ByteOrder::Little);
+        assert!(
+            applied.room_entered,
+            "the arrival is reported to the runtime"
+        );
+        assert_eq!(
+            applied.scripts,
+            lifecycle(),
+            "the reference order is ROOMLOAD, ENTER, ROOMREADY"
+        );
+    }
+
+    #[test]
+    fn redescribing_the_same_room_records_no_lifecycle() {
+        let mut state = SessionState::new("test", 1);
+        state.apply(&room_frame("86"), ByteOrder::Little);
+        let again = state.apply(&room_frame("86"), ByteOrder::Little);
+        assert!(again.room_entered, "the description still arrives");
+        assert!(
+            again.scripts.is_empty(),
+            "a repeated description must not re-run the lifecycle"
+        );
+    }
+
+    #[test]
+    fn arriving_in_a_second_room_records_a_fresh_lifecycle() {
+        let mut state = SessionState::new("test", 1);
+        assert_eq!(
+            state.apply(&room_frame("86"), ByteOrder::Little).scripts,
+            lifecycle()
+        );
+        state.begin_room_change();
+        assert_eq!(
+            state.apply(&room_frame("887"), ByteOrder::Little).scripts,
+            lifecycle(),
+            "a different room is a new arrival"
+        );
+    }
+
+    #[test]
+    fn re_entering_the_same_room_after_leaving_records_a_fresh_lifecycle() {
+        let mut state = SessionState::new("test", 1);
+        assert_eq!(
+            state.apply(&room_frame("86"), ByteOrder::Little).scripts,
+            lifecycle()
+        );
+        state.begin_room_change();
+        assert_eq!(
+            state.apply(&room_frame("86"), ByteOrder::Little).scripts,
+            lifecycle(),
+            "leaving clears the room, so coming back is an arrival"
         );
     }
 
