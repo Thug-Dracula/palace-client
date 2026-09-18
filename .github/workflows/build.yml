@@ -1,0 +1,149 @@
+name: Build (rolling latest)
+
+# What this does, in plain terms: every time a commit lands on the published
+# `main`, GitHub compiles the Windows installer/portable exe and the Linux
+# AppImage on its own machines and refreshes a PRE-RELEASE called "latest".
+# That gives one permanent download link that always points at the newest
+# build, and you never compile on your PC.
+#
+#   https://github.com/<owner>/<repo>/releases/download/latest/<file>
+#
+# Tagged releases (v0.2.0) are handled separately by release.yml and are never
+# touched from here. This workflow only ever edits the "latest" pre-release.
+#
+# If the *pre-release* rather than the binaries is what you want to drop, this
+# is the file to delete.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer commit supersedes an older build of the same branch.
+concurrency:
+  group: build-latest-${{ github.ref }}
+  cancel-in-progress: true
+
+# Needed to create the pre-release and upload files to it.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build the NSIS installer
+        run: bun run tauri build --bundles nsis
+
+      - name: Package the portable zip
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          New-Item -ItemType Directory -Force -Path target/portable | Out-Null
+          Compress-Archive -Path target/release/palace-app.exe `
+            -DestinationPath "target/portable/palace-client_${version}_x64-portable.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-installer
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-portable
+          path: target/portable/*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  linux:
+    name: Linux
+    runs-on: ubuntu-24.04
+
+    # Deliberately built inside Ubuntu 22.04, exactly as release.yml does: an
+    # AppImage is dynamically linked, so the glibc of the build machine becomes
+    # the oldest system it will start on. The runner itself is 24.04 because
+    # GitHub retired the 22.04 runner image on 2026-09-17.
+    container: ubuntu:22.04
+
+    steps:
+      # This image has no git, and checkout needs it. Must run before checkout.
+      - name: Install git
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git ca-certificates unzip
+
+      - uses: actions/checkout@v7
+
+      # libasound2-dev is not optional: palace-audio -> rodio -> cpal ->
+      # alsa-sys, whose build script runs pkg-config for the ALSA headers.
+      - name: Tauri and ALSA system dependencies
+        run: |
+          apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf xdg-utils libasound2-dev pkg-config
+
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # If this ever fails in linuxdeploy with "unknown type [0x13] section
+      # .relr.dyn", add NO_STRIP: "true" to this step's env.
+      - name: Build the AppImage
+        run: bun run tauri build --bundles appimage
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-appimage
+          path: target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          compression-level: 0
+
+  publish-latest:
+    name: Refresh the "latest" pre-release
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List what was collected
+        run: ls -lh dist
+
+      # gh is preinstalled on the runner. The release is recreated rather than
+      # uploaded into, so the "latest" tag always points at this commit and no
+      # asset from a previous version lingers beside the new one.
+      - name: Point "latest" at this build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --yes --cleanup-tag || true
+
+          gh release create latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --title "Latest build" \
+            --target "$GITHUB_SHA" \
+            --notes "Automated build of \`$GITHUB_SHA\` on $(date -u +%Y-%m-%d). This is not a tagged release; expect breakage." \
+            dist/*
