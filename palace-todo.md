@@ -9,10 +9,12 @@ A working checklist for the Palace client. Companion files:
 | `$CORPUS/TAURI-CLIENT-SCOPE.md` | Design authority (scope and decisions). Read-only reference. |
 | `protocol.md` | The protocol notes we keep ourselves. |
 
-**Snapshot:** 84 commits on `master` · no git remote (publication is a scrubbed copy, see below) ·
-last full measurement in STATUS.md: 621 tests passing, clippy clean.
-**Plus uncommitted work** (see §1.9): name tags, click-to-walk, visibility toggles and the avatar
-picker — gates green, nothing committed yet.
+**Snapshot:** 133 commits on `master` · no git remote (publication is a scrubbed copy, see below).
+**Uncommitted in the tree:** the arena work — `ADDSPOT`/`ADDPIC`/`SETSPOTOPTIONS`, the
+`comma_separator` lexer extension, and `SETSPOTSCRIPT` with `Chunk::source` (§2.24, and the latest
+update in `STATUS.md`). Gates green: `fmt` clean, clippy clean, **785 tests**, corpus unchanged at
+2396/2400 with zero tokenizer gaps. The §1.9 items (name tags, click-to-walk, visibility toggles, the
+avatar picker) have since been committed.
 
 ---
 
@@ -371,7 +373,10 @@ Both settle cheaply by reading how a reference client handles a click on those t
 - [ ] `feat/palace-ui`, `feat/events`, `feat/iptscrae` branches are kept as a safety net (all
   contained in `master`). Delete once publication makes them redundant.
 
-### 2.11 Colosseum rooms load their logic from server-hosted scripts (`LOADSCRIPT`) — unimplemented
+### 2.11 Colosseum rooms load their logic from server-hosted scripts (`LOADSCRIPT`) — DONE
+
+**Superseded — see §2.24.** `LOADSCRIPT` is implemented as an HTTP fetch-and-execute (`b62de07`), not
+through the legacy file-transfer path this section assumes: the response *is* the script (§2.14).
 
 Colosseum rooms call `"big-script.txt" LOADSCRIPT` on entry and define their important functions in
 that file, not in the room payload. Verified against room 31000 ("The Colosseum (5v5)"): the room
@@ -392,10 +397,10 @@ check whether the function it calls is defined in the room payload at all:
 grep -c "bouncedef DEF" $CORPUS/animanic_walk/room_31000.txt   # 0 = it lives in big-script.txt
 ```
 
-- [ ] Implementing this means the legacy file-transfer path plus loading a fetched script into the VM.
-  Scope it deliberately; it is the difference between "Colosseum rooms mostly work" and "they work".
+- [x] Implemented as fetch-and-execute on the HTTP path (`b62de07`), not the legacy file-transfer path
+  this section predicted. §2.24 records what the arena additionally needed.
 
-### 2.12 Colosseum rooms fetch their logic over HTTP, after a room lifecycle we never fire
+### 2.12 Colosseum rooms fetch their logic over HTTP — DONE (lifecycle + fetch)
 
 The other half of §2.11, and larger. Counted across `$CORPUS/scripts/` and
 `$CORPUS/animanic_walk/`:
@@ -430,8 +435,9 @@ So it is **ROOMLOAD → ENTER → ROOMREADY**. We fire only `ENTER`. Rooms put t
 - Events the reference has that our enum lacks entirely: `USERENTER`, `FACECHANGE`, `COLORCHANGE`,
   `USERMOVE`, `PROPCHANGE`, `IDLE`, `LOOSEPROPADDED`/`LOOSEPROPMOVED`/`LOOSEPROPDELETED`.
 
-- [ ] Implement in this order: the room lifecycle events, then `HTTPGET` + `HTTPRECEIVED`/`HTTPERROR`.
-  With those, `LOADSCRIPT` (§2.11) is plausibly just "fetch, then execute" on the same mechanism.
+- [x] Done in that order (`b62de07`): the room lifecycle events, then `HTTPGET` +
+  `HTTPRECEIVED`/`HTTPERROR`. `LOADSCRIPT` (§2.11) turned out to be exactly "fetch, then execute" on
+  the same mechanism, as predicted here.
 
 ### 2.13 Commands Colosseum uses that this client does not act on, ranked
 
@@ -447,17 +453,18 @@ nothing happens.** It is not "unknown to the VM".
 
 | Command | Uses | Note |
 |---|---|---|
-| `ADDPIC` | 115 | needs the client→server picture body, undocumented everywhere (§1.6). May be permanently blocked — do not guess it |
-| `SETSPOTSCRIPT` | 82 | needs a spot-script wire body |
-| `ADDSPOT` | 81 | as `ADDPIC` |
-| `LOADSCRIPT` | 51 | §2.11 |
-| `HTTPGET` | 50 | §2.12 |
+| `ADDPIC` | 115 | **done** — a local scene mutation, not a wire body (§2.24). The "undocumented client→server body" reading was wrong |
+| `SETSPOTSCRIPT` | 82 | **done** — merges `ON <EVENT> { … }` into the spot's source locally (§2.24); needs `Chunk::source` |
+| `ADDSPOT` | 81 | **done** — as `ADDPIC`, and returns the new id |
+| `LOADSCRIPT` | 51 | **done** — `b62de07` (§2.11 is stale) |
+| `HTTPGET` | 50 | **done** — `b62de07` (§2.12 is stale) |
 | `SETTOOLTIP` | 47 | hover text; needs ROLLOVER/ROLLOUT dispatch first |
 | `CLEARTOOLTIP` | 41 | as above |
 
-Work order: **room lifecycle + HTTP (§2.12)** first — it gates `HTTPGET` and probably `LOADSCRIPT`;
-then the hover pair (ROLLOVER/ROLLOUT + the tooltip commands); then the `ADDPIC`/`ADDSPOT` family, and
-accept that it may be permanently blocked.
+Work order, updated: the room lifecycle + HTTP (done, `b62de07`), and the
+`ADDPIC`/`ADDSPOT` family with `SETSPOTSCRIPT` (done — §2.24) are behind us. What is left from this
+list is the **hover pair** (ROLLOVER/ROLLOUT dispatch + the `SETTOOLTIP`/`CLEARTOOLTIP` commands),
+which is now the top of it.
 
 **Checked and NOT gaps** — recorded so nobody re-derives them as missing, which is what happened here:
 
@@ -934,15 +941,29 @@ So the room is not rejecting the click; it is rejecting a session whose interfac
 `in69` appears nowhere in the room's own scripts, which is consistent with it arriving from a fetched
 one. The same mechanism explains the 5v5's `ON ROOMREADY {"ludo/" HTTPGET}` (§2.14).
 
-**Fix, in two parts, both now the top of the queue:**
+**The fix was three parts, not two, and all three are implemented.** The latest update in `STATUS.md`
+has the evidence; the real 25,620-byte `media_custo2.txt` runs through the host and emits the
+interface-building effects.
 
-- [ ] `LOADSCRIPT` + `HTTPGET` — fetch the URL, and when the response type is `text/iptscrae` execute
-  the body as a script, firing `HTTPRECEIVED` spot-scoped (§2.14 has the mechanism).
-- [ ] `ADDPIC`/`ADDSPOT`/`SETSPOTOPTIONS`/`SETPICLOCLOCAL` — the commands that script uses to build the
-  interface.
+- [x] `LOADSCRIPT` + `HTTPGET` — fetch the URL, and when the response type is `text/iptscrae` execute
+  the body as a script, firing `HTTPRECEIVED` spot-scoped (§2.14 has the mechanism). Since `b62de07`.
+- [x] `ADDPIC`/`ADDSPOT`/`SETSPOTOPTIONS`/`SETPICLOCLOCAL` — the commands that script uses to build the
+  interface. **Local-only scene mutations**, not wire effects: the reference mutates its own store and
+  sends nothing, so §2.13's "needs the client→server body, may be permanently blocked" was wrong.
+  Arg order is push order, which the table's prose reads backwards (`ADDPIC`'s `args[0]` is the
+  filename; `SETSPOTOPTIONS` is `flags, topLayer, type, spot`), and `ADDSPOT` returns `max(id,0)+1`,
+  so the host carries a counter for two `ADDSPOT`s in one handler.
+- [x] **A third part §2.24 did not have: the `comma_separator` lexer extension.** The served body
+  separates values with `,` and the lexer rejected `,`, so the script could not parse at all and the
+  two parts above were unreachable. Long recorded in `$CORPUS/tools/grammar_check.py` (~:292) as an
+  extension the tokenizer "is forced to handle explicitly". Now handled.
+- [x] **And a fourth the plan also missed: `SETSPOTSCRIPT`** attaches the panel's
+  `MOUSEMOVE`/`ROLLOUT`/`SELECT` handlers to the spots `ADDSPOT` created. It needed a core-VM addition
+  (`Chunk::source`, the text between a block's braces) because the reference re-emits the block's
+  original source, plus a per-spot re-parse (`ScriptEngine::set_spot_script`) or the merged handler
+  never fires.
 
-Neither is useful alone: without the fetch the script never arrives, and without the content commands
-the script cannot build anything.
+**Not yet verified live**, and `SETTOOLTIP`/`CLEARTOOLTIP` remain unimplemented.
 
 ---
 

@@ -1,9 +1,65 @@
 # Status / handoff — Palace Tauri client
 
-**Last updated:** 2026-09-16 (interactive client milestone)
+**Last updated:** 2026-09-17 (the arena's fetched interface now builds)
 **Scope, decisions and design:** `$CORPUS/TAURI-CLIENT-SCOPE.md` ← read that too. It is the design authority; this file is only "where things stand right now". (Left untouched per the read-only rule for `$CORPUS/`.)
 
 This file exists so a **fresh session** can resume without carrying a long conversation.
+
+---
+
+## Update 2026-09-17 (latest) — the arena's three missing pieces
+
+**This is the most recent state; the two update blocks below predate it.** Room 7774's arena
+interface script now runs end to end.
+
+§2.24 said the arena fix was **two** parts. It was **three**, and the third was the actual blocker.
+All three are in the tree, uncommitted.
+
+1. **`ADDSPOT` / `ADDPIC` / `SETSPOTOPTIONS`** (`SETPICLOCLOCAL` already worked) — **local-only scene
+   mutations**, not wire effects. The reference mutates its own hotspot/picture store and sends
+   nothing, so §2.13's "needs the client→server body … may be permanently blocked" was wrong and they
+   are deliberately absent from `is_wire_effect`. Verified against Sparky's command classes
+   (`k1`/`C1`/`vb`/`Nb`). Two traps: **arg order is push order, and the table's prose reads it
+   backwards** — `ADDPIC`'s `args[0]` is the *filename*, and `SETSPOTOPTIONS` is
+   `flags, topLayer, type, spot`. And `ADDSPOT` returns `max(id, 0) + 1` synchronously, so the host
+   carries a counter: two `ADDSPOT`s in one handler must get distinct ids.
+2. **The `comma_separator` lexer extension — the real blocker.** The served body separates values with
+   `,` (`[1000,0 537,0 …] 0,0 ADDSPOT`, `768,198 0 but1 SETPICLOCLOCAL`) and the lexer rejected `,`
+   outright, so **nothing in that script could ever run** and parts 1 and 3 were unreachable. This was
+   **already documented and never implemented**: `$CORPUS/tools/grammar_check.py` (~:292) records
+   it as a corpus extension that the production tokenizer "is forced to handle explicitly", and the raw
+   capture `$CORPUS/pcap_extract/animanic_pass1_dump.txt` shows the commas are genuinely on the
+   wire. The 2400-file corpus never caught it because its 351 comma-bearing files use commas only
+   inside strings and comments — the arena scripts are not in that corpus. Now `separates_tokens` =
+   whitespace + `,` at the three separation sites; `is_whitespace` is untouched for the `ON` lookahead,
+   and strings/comments are unchanged.
+3. **`SETSPOTSCRIPT`** — the four calls that attach the panel's own `MOUSEMOVE`/`ROLLOUT`/`SELECT`
+   handlers to the spots `ADDSPOT` created. Not a host arm: the reference re-emits the block's
+   *original source*, and `ChunkData` carried only ops+offset, so this needed a core-VM addition
+   (`Chunk::source`, the text captured between a block's braces) plus a per-spot re-parse
+   (`ScriptEngine::set_spot_script`) — without which the merged handler never fires.
+
+**Evidence.** `crates/palace-host/tests/arena_interface.rs` runs the **real 25,620-byte harvest**
+through the host: `error=None`, and the effects include `AddSpot` (6-point polygon),
+`AddPic("cust.gif")`, `SetPicOffsetLocal(768,198)`, `SetSpotOptions`, and `SetSpotScript` for
+`MOUSEMOVE`/`ROLLOUT`/`SELECT`. `fmt` clean; clippy `-D warnings` clean across the six
+protocol/render/client crates; **785 tests green**; corpus unchanged (2396/2400, **zero tokenizer
+gaps**). Every new test was mutation-proven (cut the arm → fail → restore).
+
+**Still open, and not claimed as working:**
+
+- **No live run.** The script-level chain is proven; nobody has watched the arena accept a player.
+  That needs a human at the app, which this project forbids driving.
+- `SETTOOLTIP`/`CLEARTOOLTIP` (the fetched script calls each once) remain unimplemented. They are now
+  the top of §2.13's work order.
+- `ADDSPOT` reads its points through `props_arg`, which keeps integers only; the reference also accepts
+  quoted numeric strings. Correct for the real script, wrong for a hypothetical one.
+- `SETSPOTSCRIPT` matches a literal uppercase `ON`, like the reference parser; a lowercase `on` in an
+  existing source is not a handler to either.
+
+**Uncommitted in the tree:** `crates/iptscrae/src/{lexer,value}.rs`,
+`crates/palace-host/src/{effect,host,engine}.rs`, `crates/palace-client/src/{runtime,state}.rs`, plus
+tests (`arena_interface.rs`, `comma_separator.rs`, its fixtures, and the host/client test files).
 
 ---
 
