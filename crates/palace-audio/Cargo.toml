@@ -1,0 +1,18 @@
+[package]
+name = "palace-audio"
+description = "Palace audio engine: script sounds, MIDI playback through a SoundFont, and BEEP, with a headless null-device default."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The media HTTP fetch and disk cache live here. Audible media is fetched by
+# name exactly like a background; this crate does not own a second HTTP client.
+palace-asset = { workspace = true }
+# Output (cpal), mixing and decoding (symphonia). `playback` is cpal; `mp3` and
+# `wav` cover the reference client's fetched sounds and the documented `.wav`.
+rodio = { workspace = true }
+# SoundFont synthesis for MIDI. Pure Rust, no system synthesizer or daemon.
+rustysynth = { workspace = true }

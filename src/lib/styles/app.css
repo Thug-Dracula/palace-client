@@ -980,3 +980,59 @@ input[type="range"]::-webkit-slider-thumb {
   image-rendering: pixelated;
 }
 
+/* ---------- Audio & SoundFont dialog ---------- */
+
+.audio-dialog {
+  width: min(460px, calc(100vw - 32px));
+}
+
+.soundfont {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
+  background: var(--bg-void);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+
+.soundfont-path {
+  font-size: var(--fs-sm);
+  color: var(--text-0);
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+.audio-note {
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+
+.audio-note.warn {
+  color: var(--amber);
+}
+
+.audio-note.ok {
+  color: var(--green);
+}
+
+.audio-actions {
+  display: flex;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+
+.audio-block {
+  margin-top: var(--sp-4);
+}
+
+.audio-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.audio-saved {
+  margin: var(--sp-3) 0 0;
+}
+

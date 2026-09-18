@@ -11,14 +11,16 @@ members = [
     "crates/iptscrae",
     "crates/iptscrae-palace",
     "crates/palace-host",
+    "crates/palace-audio",
     "src-tauri",
 ]
 
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-# `ureq` 3.x (used by `palace-asset` for the media fetch) requires 1.85.
-rust-version = "1.85"
+# `ureq` 3.x (used by `palace-asset` for the media fetch) requires 1.85;
+# `rodio` 0.22 (used by `palace-audio`) requires 1.87.
+rust-version = "1.87"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Thug-Dracula/palace-client"
 
@@ -32,7 +34,13 @@ palace-client = { path = "crates/palace-client" }
 iptscrae = { path = "crates/iptscrae" }
 iptscrae-palace = { path = "crates/iptscrae-palace" }
 palace-host = { path = "crates/palace-host" }
+palace-audio = { path = "crates/palace-audio" }
 serde = { version = "1", features = ["derive"] }
+# Audio output and decoding. `rodio` owns cpal and symphonia; no system daemon
+# is required beyond the normal desktop audio server, and ALSA needs only its
+# build-time headers, which every desktop image already ships.
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp3", "wav"] }
+rustysynth = "1.3.6"
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 flate2 = "1.1"

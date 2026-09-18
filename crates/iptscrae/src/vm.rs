@@ -900,7 +900,11 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 }
                 Ok(())
             }
-            Builtin::Breakpoint | Builtin::Beep => Ok(()),
+            Builtin::Breakpoint => Ok(()),
+            Builtin::Beep => {
+                self.host.request_beep();
+                Ok(())
+            }
             Builtin::Delay => {
                 self.pop_int()?;
                 Ok(())

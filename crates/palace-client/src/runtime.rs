@@ -214,6 +214,23 @@ pub enum ClientEvent {
     Note {
         text: String,
     },
+    /// `SOUND name` — play a sound effect.
+    Sound {
+        name: String,
+    },
+    /// `MIDIPLAY name` — play a MIDI file once.
+    MidiPlay {
+        name: String,
+    },
+    /// `MIDILOOP name loops` — play a MIDI file up to `loops` times.
+    MidiLoop {
+        name: String,
+        loops: i32,
+    },
+    /// `MIDISTOP` — stop MIDI playback.
+    MidiStop,
+    /// `BEEP` — a short synthesized tone.
+    Beep,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2093,21 +2110,14 @@ fn apply_effect(
         Effect::LaunchApp { app } => vec![ClientEvent::Note {
             text: format!("script: LAUNCHAPP {app} (reported, not launched)"),
         }],
-        Effect::PlaySound { name } => vec![ClientEvent::Note {
-            text: format!("script: SOUND {name}"),
+        Effect::PlaySound { name } => vec![ClientEvent::Sound { name: name.clone() }],
+        Effect::MidiPlay { name } => vec![ClientEvent::MidiPlay { name: name.clone() }],
+        Effect::MidiLoop { name, loops } => vec![ClientEvent::MidiLoop {
+            name: name.clone(),
+            loops: *loops,
         }],
-        Effect::MidiPlay { name } => vec![ClientEvent::Note {
-            text: format!("script: MIDIPLAY {name}"),
-        }],
-        Effect::MidiLoop { name, loops } => vec![ClientEvent::Note {
-            text: format!("script: MIDILOOP {name} x{loops}"),
-        }],
-        Effect::MidiStop => vec![ClientEvent::Note {
-            text: "script: MIDISTOP".to_string(),
-        }],
-        Effect::Beep => vec![ClientEvent::Note {
-            text: "script: BEEP".to_string(),
-        }],
+        Effect::MidiStop => vec![ClientEvent::MidiStop],
+        Effect::Beep => vec![ClientEvent::Beep],
         Effect::DimRoom { percent } => {
             state.room_dim = f64::from((*percent).clamp(0, 100)) / 100.0;
             *dirty_render = true;

@@ -53,6 +53,13 @@ pub trait Host {
         let _ = message;
     }
 
+    /// A `BEEP`.
+    ///
+    /// The default does nothing, which is the reference's own `BEEPCommand`
+    /// ("do nothing...") and what keeps a minimal host silent. A host with an
+    /// output device may override it.
+    fn request_beep(&mut self) {}
+
     /// Run `pattern` against `text` for `GREPSTR`.
     ///
     /// `Ok(Some(captures))` means "matched", with `captures[0]` the whole match

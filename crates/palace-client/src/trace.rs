@@ -436,6 +436,11 @@ pub fn describe_client_event(event: &ClientEvent) -> String {
             problems.join("; ")
         ),
         ClientEvent::Note { text } => format!("[note] {text}"),
+        ClientEvent::Sound { name } => format!("[sound] {name:?}"),
+        ClientEvent::MidiPlay { name } => format!("[midi] play {name:?}"),
+        ClientEvent::MidiLoop { name, loops } => format!("[midi] loop {name:?} x{loops}"),
+        ClientEvent::MidiStop => "[midi] stop".to_string(),
+        ClientEvent::Beep => "[beep]".to_string(),
         ClientEvent::Tooltip { text } => match text {
             Some(text) => format!("[tooltip] {text:?}"),
             None => "[tooltip] cleared".to_string(),

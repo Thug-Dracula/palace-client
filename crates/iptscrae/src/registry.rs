@@ -176,7 +176,8 @@ pub enum Builtin {
     Breakpoint,
     /// `DELAY` — consumes ticks (a no-op here; scheduling is the host's job).
     Delay,
-    /// `BEEP` — a no-op, as in the reference.
+    /// `BEEP` — asks the host to beep. The default host is a no-op, as in the
+    /// reference's `BEEPCommand`.
     Beep,
 }
 

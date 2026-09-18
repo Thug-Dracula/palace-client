@@ -5,6 +5,7 @@
 use palace_client::ClientHandle;
 use tauri::{AppHandle, State};
 
+use crate::settings;
 use crate::{start_client, AppState, Settings};
 
 /// The event name runtime events are emitted under.
@@ -37,12 +38,21 @@ pub fn connect(
     } else {
         username.trim().to_string()
     };
-    let settings = Settings {
-        host: host.trim().to_string(),
-        port,
-        username,
-    };
-    let handle = start_client(&app, &settings)?;
+    let audio = state
+        .audio
+        .lock()
+        .map(|engine| engine.handle())
+        .map_err(|error| error.to_string())?;
+    let mut settings = state
+        .settings
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    settings.host = host.trim().to_string();
+    settings.port = port;
+    settings.username = username;
+    persist_best_effort(&app, &settings);
+    let handle = start_client(&app, &settings, audio)?;
     let mut guard = state.client.lock().map_err(|error| error.to_string())?;
     if let Some(previous) = guard.replace(handle) {
         previous.disconnect();
@@ -110,6 +120,15 @@ pub fn set_avatar(state: State<'_, AppState>, face: i16, color: i16) -> Result<(
     with_client(&state, |client| client.set_avatar(face, color))
 }
 
+/// Replace the signed-in user's worn props, locally and on the server.
+///
+/// Accepts more than the nine-prop limit: the runtime keeps the first nine and
+/// reports the rest, so the caller does not need to know the cap.
+#[tauri::command]
+pub fn set_props(state: State<'_, AppState>, props: Vec<u32>) -> Result<(), String> {
+    with_client(&state, |client| client.set_props(props))
+}
+
 /// Report the viewport size, device pixel ratio, zoom and scale mode.
 #[tauri::command]
 pub fn set_viewport(
@@ -140,4 +159,121 @@ fn with_client<T>(
         .as_ref()
         .ok_or_else(|| "no client is running".to_string())?;
     Ok(action(client))
+}
+
+/// What the audio panel shows: mute, volume and the chosen SoundFont.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AudioState {
+    pub enabled: bool,
+    pub volume: f32,
+    pub soundfont: Option<std::path::PathBuf>,
+    pub soundfont_exists: bool,
+}
+
+/// The audio engine's state, as the stored settings record it.
+#[tauri::command]
+pub fn get_audio_state(state: State<'_, AppState>) -> Result<AudioState, String> {
+    let settings = state.settings.lock().map_err(|error| error.to_string())?;
+    Ok(AudioState {
+        enabled: settings.audio_enabled,
+        volume: settings.audio_volume,
+        soundfont: settings.soundfont.clone(),
+        soundfont_exists: settings
+            .soundfont
+            .as_deref()
+            .is_some_and(std::path::Path::is_file),
+    })
+}
+
+/// Choose the SoundFont MIDI is synthesized with; `None` clears it.
+///
+/// The path is validated (an existing `.sf2`) before anything changes, then the
+/// new setting is persisted and only afterwards handed to the live engine, so a
+/// rejected path leaves both the engine and the file untouched.
+#[tauri::command]
+pub fn set_soundfont(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: Option<String>,
+) -> Result<(), String> {
+    let chosen = settings::validate_soundfont(path.as_deref())?;
+    update_settings(&app, &state, |settings| {
+        settings.soundfont.clone_from(&chosen);
+    })?;
+    let audio = state.audio.lock().map_err(|error| error.to_string())?;
+    match &chosen {
+        Some(path) => audio.handle().set_soundfont(path.clone()),
+        None => audio.handle().clear_soundfont(),
+    }
+    Ok(())
+}
+
+/// Mute or unmute the audio engine.
+#[tauri::command]
+pub fn set_audio_enabled(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    update_settings(&app, &state, |settings| settings.audio_enabled = enabled)?;
+    state
+        .audio
+        .lock()
+        .map_err(|error| error.to_string())?
+        .handle()
+        .set_enabled(enabled);
+    Ok(())
+}
+
+/// Set the master volume, clamped to `0.0..=1.0`; returns what was applied.
+#[tauri::command]
+pub fn set_volume(app: AppHandle, state: State<'_, AppState>, volume: f32) -> Result<f32, String> {
+    let volume = clamp_volume(volume);
+    update_settings(&app, &state, |settings| settings.audio_volume = volume)?;
+    state
+        .audio
+        .lock()
+        .map_err(|error| error.to_string())?
+        .handle()
+        .set_volume(volume);
+    Ok(volume)
+}
+
+fn clamp_volume(volume: f32) -> f32 {
+    if volume.is_finite() {
+        volume.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Apply a settings change, persisting it before the caller touches the engine.
+fn update_settings(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    mutate: impl FnOnce(&mut Settings),
+) -> Result<(), String> {
+    let mut settings = state
+        .settings
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    mutate(&mut settings);
+    let path =
+        settings::config_path(app).ok_or_else(|| "no config directory is available".to_string())?;
+    settings::save(&path, &settings)?;
+    *state.settings.lock().map_err(|error| error.to_string())? = settings;
+    Ok(())
+}
+
+/// Persist settings without failing the caller; used where connecting matters
+/// more than the write.
+fn persist_best_effort(app: &AppHandle, settings: &Settings) {
+    let Some(path) = settings::config_path(app) else {
+        eprintln!("palace: no config directory is available; settings will not persist");
+        return;
+    };
+    if let Err(error) = settings::save(&path, settings) {
+        eprintln!("palace: could not save settings: {error}");
+    }
 }

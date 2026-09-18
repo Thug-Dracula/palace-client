@@ -6,79 +6,23 @@
 
 pub mod commands;
 pub mod protocol;
+pub mod settings;
+
+pub use settings::Settings;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use palace_client::{ClientConfig, ClientEventStream, ClientHandle, ClientRuntime};
+use palace_audio::{AudioConfig, AudioEngine, AudioHandle};
+use palace_client::{ClientConfig, ClientEvent, ClientEventStream, ClientHandle, ClientRuntime};
 use tauri::{Emitter, Manager};
 
 /// Shared app state: the running client and the settings it was built from.
 pub struct AppState {
     pub client: Mutex<Option<ClientHandle>>,
     pub settings: Mutex<Settings>,
-}
-
-/// Where to connect and who to be.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Settings {
-    pub host: String,
-    pub port: u16,
-    pub username: String,
-}
-
-impl Settings {
-    /// Defaults from the environment, matching a launchable-out-of-the-box config.
-    #[must_use]
-    pub fn from_env() -> Self {
-        Settings {
-            host: std::env::var("PALACE_HOST").unwrap_or_else(|_| "localhost".to_string()),
-            port: std::env::var("PALACE_PORT")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(9998),
-            username: std::env::var("PALACE_USER").unwrap_or_else(|_| "Guest".to_string()),
-        }
-    }
-
-    /// Apply `--host` / `--port` / `--user` from the command line.
-    #[must_use]
-    pub fn with_args(mut self, args: impl Iterator<Item = String>) -> Self {
-        let mut pending: Option<String> = None;
-        for arg in args {
-            if let Some(key) = pending.take() {
-                match key.as_str() {
-                    "host" => self.host = arg,
-                    "port" => {
-                        if let Ok(port) = arg.parse() {
-                            self.port = port;
-                        }
-                    }
-                    "user" => self.username = arg,
-                    _ => {}
-                }
-                continue;
-            }
-            match arg.as_str() {
-                "--host" => pending = Some("host".to_string()),
-                "--port" => pending = Some("port".to_string()),
-                "--user" => pending = Some("user".to_string()),
-                other => {
-                    if let Some(value) = other.strip_prefix("--host=") {
-                        self.host = value.to_string();
-                    } else if let Some(value) = other.strip_prefix("--port=") {
-                        if let Ok(port) = value.parse() {
-                            self.port = port;
-                        }
-                    } else if let Some(value) = other.strip_prefix("--user=") {
-                        self.username = value.to_string();
-                    }
-                }
-            }
-        }
-        self
-    }
+    pub audio: Mutex<AudioEngine>,
 }
 
 /// Split a search path using the platform's own separator.
@@ -131,10 +75,41 @@ pub fn config_for(settings: &Settings) -> ClientConfig {
     }
 }
 
-/// Forward runtime events to the webview.
-pub fn spawn_pump(app: tauri::AppHandle, mut stream: ClientEventStream) {
+/// The audio engine config the shell runs with.
+///
+/// The shell, unlike a test harness, wants sound, so it selects
+/// [`AudioConfig::desktop`]; the library default stays silent.
+#[must_use]
+pub fn audio_config_for(settings: &Settings) -> AudioConfig {
+    AudioConfig {
+        soundfont: settings.soundfont.clone(),
+        enabled: settings.audio_enabled,
+        volume: settings.audio_volume,
+        ..AudioConfig::desktop()
+    }
+}
+
+/// Forward runtime events to the webview, routing sound effects to the engine.
+pub fn spawn_pump(app: tauri::AppHandle, mut stream: ClientEventStream, audio: AudioHandle) {
     tauri::async_runtime::spawn(async move {
+        let mut media_base: Option<String> = None;
         while let Some(event) = stream.recv().await {
+            match &event {
+                ClientEvent::Banner { banner } => {
+                    if let Some(base) = &banner.media_base {
+                        if media_base.as_deref() != Some(base.as_str()) {
+                            media_base = Some(base.clone());
+                            audio.set_media_base(base.clone());
+                        }
+                    }
+                }
+                ClientEvent::Sound { name } => audio.play_sound(name.clone()),
+                ClientEvent::MidiPlay { name } => audio.midi_play(name.clone()),
+                ClientEvent::MidiLoop { name, loops } => audio.midi_loop(name.clone(), *loops),
+                ClientEvent::MidiStop => audio.midi_stop(),
+                ClientEvent::Beep => audio.beep(),
+                _ => {}
+            }
             if app.emit(commands::EVENT_NAME, &event).is_err() {
                 break;
             }
@@ -143,12 +118,16 @@ pub fn spawn_pump(app: tauri::AppHandle, mut stream: ClientEventStream) {
 }
 
 /// Start a runtime and wire it to the frame protocol and the event pump.
-pub fn start_client(app: &tauri::AppHandle, settings: &Settings) -> Result<ClientHandle, String> {
+pub fn start_client(
+    app: &tauri::AppHandle,
+    settings: &Settings,
+    audio: AudioHandle,
+) -> Result<ClientHandle, String> {
     let (handle, stream) = ClientRuntime::spawn(config_for(settings));
     if let Some(slot) = app.try_state::<protocol::FrameSlot>() {
         slot.set(handle.frames());
     }
-    spawn_pump(app.clone(), stream);
+    spawn_pump(app.clone(), stream, audio);
     Ok(handle)
 }
 
@@ -156,13 +135,11 @@ pub fn start_client(app: &tauri::AppHandle, settings: &Settings) -> Result<Clien
 pub fn run() {
     let slot = protocol::FrameSlot::default();
     let handler_slot = slot.clone();
-    let settings = Settings::from_env().with_args(std::env::args().skip(1));
+    let defaults = Settings::from_env();
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
     tauri::Builder::default()
-        .manage(AppState {
-            client: Mutex::new(None),
-            settings: Mutex::new(settings.clone()),
-        })
+        .plugin(tauri_plugin_dialog::init())
         .manage(slot)
         .register_asynchronous_uri_scheme_protocol("palace", move |_ctx, request, responder| {
             protocol::handle(&handler_slot, &request, responder);
@@ -178,12 +155,26 @@ pub fn run() {
             commands::mouse_leave,
             commands::set_visibility,
             commands::set_avatar,
+            commands::set_props,
             commands::set_viewport,
             commands::refresh,
+            commands::get_audio_state,
+            commands::set_soundfont,
+            commands::set_audio_enabled,
+            commands::set_volume,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
-            match start_client(&handle, &settings) {
+            let saved = settings::config_path(&handle).and_then(|path| settings::load(&path));
+            let settings = Settings::resolve(defaults, saved, args.into_iter());
+            let audio = AudioEngine::spawn(audio_config_for(&settings));
+            let audio_handle = audio.handle();
+            app.manage(AppState {
+                client: Mutex::new(None),
+                settings: Mutex::new(settings.clone()),
+                audio: Mutex::new(audio),
+            });
+            match start_client(&handle, &settings, audio_handle) {
                 Ok(client) => {
                     if let Some(state) = handle.try_state::<AppState>() {
                         if let Ok(mut guard) = state.client.lock() {
@@ -215,53 +206,40 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    fn args(list: &[&str]) -> std::vec::IntoIter<String> {
-        list.iter()
-            .map(|value| (*value).to_string())
-            .collect::<Vec<_>>()
-            .into_iter()
+    fn sample() -> Settings {
+        Settings {
+            host: "h.test".to_string(),
+            port: 4444,
+            username: "Someone".to_string(),
+            soundfont: None,
+            audio_enabled: true,
+            audio_volume: 1.0,
+        }
     }
 
     #[test]
-    fn cli_flags_override_settings() {
-        let base = Settings {
-            host: "localhost".to_string(),
-            port: 9998,
-            username: "Guest".to_string(),
+    fn the_audio_config_carries_the_soundfont_and_audio_preferences() {
+        let settings = Settings {
+            soundfont: Some(PathBuf::from("/tmp/font.sf2")),
+            audio_enabled: false,
+            audio_volume: 0.25,
+            ..sample()
         };
-        let parsed = base.with_args(args(&[
-            "--host",
-            "example.org",
-            "--port",
-            "1234",
-            "--user",
-            "Tester",
-        ]));
-        assert_eq!(parsed.host, "example.org");
-        assert_eq!(parsed.port, 1234);
-        assert_eq!(parsed.username, "Tester");
+        let audio = audio_config_for(&settings);
+        assert_eq!(audio.soundfont, Some(PathBuf::from("/tmp/font.sf2")));
+        assert!(!audio.enabled);
+        assert_eq!(audio.volume, 0.25);
     }
 
     #[test]
-    fn cli_flags_accept_equals_form_and_ignore_junk() {
-        let base = Settings {
-            host: "localhost".to_string(),
-            port: 9998,
-            username: "Guest".to_string(),
-        };
-        let parsed = base.with_args(args(&["--port=bogus", "--host=x.test", "--nonsense", "-v"]));
-        assert_eq!(parsed.host, "x.test");
-        assert_eq!(parsed.port, 9998, "an unparsable port leaves the default");
+    fn the_desktop_shell_still_opens_a_device() {
+        let audio = audio_config_for(&sample());
+        assert_eq!(audio.device, palace_audio::DeviceMode::Open);
     }
 
     #[test]
     fn config_carries_the_settings() {
-        let settings = Settings {
-            host: "h.test".to_string(),
-            port: 4444,
-            username: "Someone".to_string(),
-        };
-        let cfg = config_for(&settings);
+        let cfg = config_for(&sample());
         assert_eq!(cfg.host, "h.test");
         assert_eq!(cfg.port, 4444);
         assert_eq!(cfg.username, "Someone");

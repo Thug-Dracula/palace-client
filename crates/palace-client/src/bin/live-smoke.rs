@@ -58,6 +58,11 @@ fn report(event: &ClientEvent) -> bool {
         | ClientEvent::RoomEntered { .. }
         | ClientEvent::Chat { .. }
         | ClientEvent::Note { .. }
+        | ClientEvent::Sound { .. }
+        | ClientEvent::MidiPlay { .. }
+        | ClientEvent::MidiLoop { .. }
+        | ClientEvent::MidiStop
+        | ClientEvent::Beep
         | ClientEvent::Tooltip { .. } => {}
     }
     matches!(event, ClientEvent::Screen { .. })

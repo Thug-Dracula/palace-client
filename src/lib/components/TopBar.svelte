@@ -2,9 +2,11 @@
   import { onMount } from "svelte";
   import * as api from "../api";
   import { store } from "../store.svelte";
+  import AudioDialog from "./AudioDialog.svelte";
 
   let busy = $state(false);
   let error = $state<string | null>(null);
+  let audioOpen = $state(false);
 
   onMount(() => {
     void api
@@ -66,6 +68,11 @@
     <button class="btn ghost" type="button" onclick={() => api.refresh()} disabled={!store.connected}>
       Refresh
     </button>
+    <button class="btn" type="button" onclick={() => (audioOpen = true)}>Audio…</button>
     {#if error}<span class="topbar-error">{error}</span>{/if}
   </form>
+
+  {#if audioOpen}
+    <AudioDialog onclose={() => (audioOpen = false)} />
+  {/if}
 </header>

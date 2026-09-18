@@ -259,6 +259,10 @@ impl Host for ScriptHost {
         self.trace.push(message.to_owned());
     }
 
+    fn request_beep(&mut self) {
+        let _ = PalaceHost::beep(self);
+    }
+
     fn grep_match(&mut self, pattern: &str, text: &str) -> Result<Option<Vec<String>>> {
         Ok(iptscrae::regex::find(pattern, text))
     }

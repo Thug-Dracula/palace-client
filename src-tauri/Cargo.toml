@@ -21,8 +21,11 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["test"] }
+tauri-plugin-dialog = "2.7.3"
 palace-client = { workspace = true }
 palace-render = { workspace = true }
+palace-audio = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
