@@ -269,14 +269,18 @@ fn server_down_frame(order: ByteOrder, reason: i32, message: Option<&str>) -> Ve
         .expect("down encodes")
 }
 
+fn talk_from_frame(order: ByteOrder, user_id: i32, text: &str) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_cstring(text);
+    Frame::new(opcode::TALK, user_id, w.into_vec())
+        .encode(order)
+        .expect("talk encodes")
+}
+
 /// A server-side `talk` frame, used as an ordered marker: frames are processed
 /// in arrival order, so seeing this chat line proves every earlier frame ran.
 fn talk_marker_frame(order: ByteOrder, text: &str) -> Vec<u8> {
-    let mut w = Writer::new(order);
-    w.write_cstring(text);
-    Frame::new(opcode::TALK, SELF_ID, w.into_vec())
-        .encode(order)
-        .expect("talk encodes")
+    talk_from_frame(order, SELF_ID, text)
 }
 
 /// Write a decodable solid prop blob named `<id>.bin` for each id, so the prop
@@ -654,6 +658,36 @@ fn notes(events: &[ClientEvent]) -> Vec<&str> {
         .collect()
 }
 
+fn sound_events(events: &[ClientEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Sound { name } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn midi_play_events(events: &[ClientEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::MidiPlay { name } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn midi_loop_events(events: &[ClientEvent]) -> Vec<(&str, i32)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::MidiLoop { name, loops } => Some((name.as_str(), *loops)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Every tooltip report, `Some(text)` to show and `None` to hide.
 fn tooltips(events: &[ClientEvent]) -> Vec<Option<&str>> {
     events
@@ -837,11 +871,14 @@ fn the_runtime_replays_the_recorded_logon_burst() {
         enter.effects
     );
     assert!(
-        notes(&events)
+        events
             .iter()
-            .any(|text| text.contains("SOUND garden")),
-        "the effect was applied and reported: {:?}",
-        notes(&events)
+            .any(|event| matches!(event, ClientEvent::Sound { name } if name == "garden")),
+        "the effect was applied as a structured sound event: {:?}",
+        events
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::Sound { .. }))
+            .collect::<Vec<_>>()
     );
 
     // The real bytes of the client's reply went out over the socket: the runtime
@@ -1156,6 +1193,55 @@ fn commands_drive_the_live_session() {
             .any(|text| text.contains("script: status from a test")),
         "the STATUSMSG effect was applied: {:?}",
         notes(&events)
+    );
+
+    // Every sound effect now emits a structured event rather than a note string.
+    // One source, because the runtime keeps only the last queued script.
+    handle.run_script("\"garden\" SOUND \"garden\" MIDIPLAY 99 \"garden\" MIDILOOP MIDISTOP BEEP");
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            !sound_events(collected).is_empty()
+                && !midi_play_events(collected).is_empty()
+                && !midi_loop_events(collected).is_empty()
+                && collected
+                    .iter()
+                    .any(|event| matches!(event, ClientEvent::MidiStop))
+                && collected
+                    .iter()
+                    .any(|event| matches!(event, ClientEvent::Beep))
+        },
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        sound_events(&events).first().copied(),
+        Some("garden"),
+        "SOUND produced a sound event: {:?}",
+        sound_events(&events)
+    );
+    assert_eq!(
+        midi_play_events(&events).first().copied(),
+        Some("garden"),
+        "MIDIPLAY produced a midi_play event: {:?}",
+        midi_play_events(&events)
+    );
+    assert_eq!(
+        midi_loop_events(&events).first().copied(),
+        Some(("garden", 99)),
+        "MIDILOOP carried its name and loop count: {:?}",
+        midi_loop_events(&events)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::MidiStop)),
+        "MIDISTOP produced a midi_stop event"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Beep)),
+        "BEEP produced a beep event"
     );
 
     // A script that does not parse is reported as a transcript error.
@@ -4930,6 +5016,136 @@ fn a_named_user_reaches_the_frame_as_a_name_tag() {
     assert_eq!(
         ghost_matched, 0,
         "a user whose prop art never arrived must not be tagged"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_chat_message_reaches_the_frame_as_chat_text() {
+    const SPEAKER: &str = "Alpha";
+    const SPEAKER_ID: i32 = 77;
+    const MESSAGE: &str = "hello there";
+
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(user_new_frame(
+        order,
+        SPEAKER_ID,
+        SPEAKER,
+        3,
+        5,
+        &[],
+        Point::new(200, 240),
+    ));
+    // The chat line is held back until a settled, chat-free frame exists.
+    let tail = vec![talk_from_frame(order, SPEAKER_ID, MESSAGE)];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("chat-text-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901 && screen.avatars == 1)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901 && screen.avatars == 1)
+        .expect("the speaker was drawn")
+        .clone();
+
+    let before_version = settled_frame_version(&handle, Duration::from_secs(5));
+    let before = frame_rgba(&handle.frames().png().expect("a composed frame"));
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| chats(collected).contains(&MESSAGE),
+        Duration::from_secs(10),
+    );
+    assert!(
+        chats(&events).contains(&MESSAGE),
+        "the wire chat line reached the transcript: {:?}",
+        chats(&events)
+    );
+    assert!(
+        wait_for(
+            || handle.frames().version() > before_version,
+            Duration::from_secs(5)
+        ),
+        "the chat line recomposed the frame"
+    );
+    settled_frame_version(&handle, Duration::from_secs(5));
+    let after = frame_rgba(&handle.frames().png().expect("a composed frame"));
+    assert_ne!(before, after, "the chat text changed the composed frame");
+
+    // The chat text must appear at exactly the reference placement: the
+    // speaker's clamped avatar anchor, the 20 px gap, and the rasterized image.
+    let width = screen.geometry.bitmap_w as usize;
+    let height = screen.geometry.bitmap_h as i64;
+    let anchor = palace_render::clamp_avatar_position(
+        240,
+        200,
+        screen.geometry.room_w as i32,
+        screen.geometry.room_h as i32,
+    );
+    let item = palace_render::ChatText {
+        text: MESSAGE.to_string(),
+        x: anchor.0,
+        y: anchor.1,
+        style: palace_render::ChatStyle::Talk,
+    };
+    let render = palace_render::chat_text(&item).expect("the message rasterizes");
+    let (text_x, text_y) = palace_render::chat_position(
+        item.x,
+        item.y,
+        render.text_width,
+        render.text_height,
+        screen.geometry.room_w,
+        screen.geometry.room_h,
+    );
+    let blit_x = (text_x - f64::from(render.origin_x)).floor() as i64;
+    let blit_y = (text_y - f64::from(render.origin_y)).floor() as i64;
+
+    let mut opaque = 0usize;
+    for sy in 0..render.image.height() {
+        for sx in 0..render.image.width() {
+            let Some(pixel) = render.image.pixel(sx, sy) else {
+                continue;
+            };
+            if pixel[3] != 255 {
+                continue;
+            }
+            let dx = blit_x + i64::from(sx);
+            let dy = blit_y + i64::from(sy);
+            if dx < 0 || dy < 0 || dx >= width as i64 || dy >= height {
+                continue;
+            }
+            let at = (dy as usize * width + dx as usize) * 4;
+            opaque += 1;
+            assert_eq!(
+                after[at..at + 4],
+                pixel,
+                "the chat text for {MESSAGE} must be drawn at ({dx},{dy})"
+            );
+        }
+    }
+    assert!(
+        opaque > 0,
+        "the message has fully opaque glyph pixels to find"
     );
 
     handle.disconnect();

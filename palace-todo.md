@@ -15,6 +15,33 @@ this file is only what is still open.
 
 ---
 
+## 0. What 1.0 means
+
+The classic client, complete. The two items that were left are resolved or
+re-scoped, and nothing else is required for the release line:
+
+- [x] **Worn props are settable.** `set_props` is a Tauri command, registered and
+  wrapped end to end. The rendering layer no longer needs new Rust to change
+  what the signed-in user wears.
+- [x] **A data-driven face grid.** The picker reads `faces`, `colors`, `cell` and
+  the row grouping from `palace://faces.json`; the renderer derives that payload
+  from the constants it crops with, so the two cannot disagree.
+
+**Open, and small.** No component calls `set_props` yet, so "settable" is true of
+the command and not of the interface. A minimal props control — list the worn
+props, remove one — would use the `UserInfo.props` / `is_self` data the interface
+already has and needs no Rust. Whether it belongs in 1.0 or with the rest of the
+props work is a product call.
+
+**Deliberately not in 1.0.** A prop bag browser (a tile grid over `PropBag.bundle`
+with saved outfits) is PalaceChat 5 work, as is the rest of that tier: Type 1
+avatars, the prop editor, extended IPTSCRAE, animated backgrounds, video doors,
+embedded web panes, the translator. `$CORPUS/TAURI-CLIENT-SCOPE.md` estimates
+the tier at +8–12 person-weeks and calls the web panes the hardest item in it. The
+items in §1–§7 below are wanted but do not gate 1.0.
+
+---
+
 ## 1. Top of queue
 
 - [ ] **Authentication — blocked on a decision.** A server that requires it sends
@@ -61,8 +88,6 @@ this file is only what is still open.
 
 ## 3. Rendering and presentation
 
-- [ ] **Chat text rasterization.** Draw commands and name tags are rasterized;
-  chat text is the one layer that is not.
 - [ ] **The remaining draw commands.** `CIRCLE`, `FILL`, `PAINT` and `TEXT` are
   not implemented, and `DRAW`'s text operands have a layout the references leave
   undetermined.
@@ -77,12 +102,12 @@ this file is only what is still open.
 
 ## 4. Audio
 
-- [ ] **`SOUND`** is surfaced but never reaches an audio device. The reference
-  plays a bundled name from a built-in map, and otherwise fetches
-  `mediaServer + name + ".mp3"`; the media pipeline already fetches and caches
-  arbitrary media by name, so the fetch-by-name path is the one that matters.
-- [ ] **`MIDIPLAY`/`MIDILOOP`/`MIDISTOP`** need a synthesizer, not just a decoder,
-  and are a follow-up to `SOUND`.
+- [ ] **The bundled sound assets are not shipped.** `SOUND` consults a built-in
+  table first and otherwise fetches `mediaServer + name + ".mp3"`; the table is
+  empty because the reference client's MP3s are not ours to redistribute, so
+  every name currently takes the media path. Filling the table is all that is
+  left. The engine, its SoundFont path and its fallback tone are in
+  `crates/palace-audio`.
 
 ---
 
@@ -105,10 +130,16 @@ dialect. What remains:
 
 ## 6. Props
 
-- [ ] **A props panel.** Worn props are sent to the server, but nothing in the
-  interface can set them, so the feature is only half reachable. The bag reader
-  in `palace-prop` parses `PropBag.bundle` already; the panel needs a tile grid,
-  toggle-wear, delete and saved outfits.
+- [x] **`set_props` is reachable.** Exposed as a Tauri command
+  (`src-tauri/src/commands.rs`), registered, wrapped in `api.ts` and surfaced as a
+  store action, so the interface can change worn props without new Rust. Nothing
+  calls it yet — see §0 for the open question of whether a minimal control is 1.0.
+- [ ] **A prop bag browser is Tier B, not 1.0.** A tile grid over
+  `PropBag.bundle` with saved outfits is PalaceChat 5 territory
+  (`$CORPUS/TAURI-CLIENT-SCOPE.md`, Tier B). Classic-client prop wearing is
+  the 9-prop Type 0 limit, which is already implemented. A browser would also
+  need a prop roster the project does not ship — the only full roster is the
+  read-only reference `pserver.prp`.
 - [ ] **`ASSET_REGI`.** Decide whether uploading a worn prop's art is required
   for the server to accept the prop, or whether `USER_PROP` alone suffices.
 - [ ] **The constant prop stubs.** `GETPICDIMENSIONS` returns `(0, 0)`;

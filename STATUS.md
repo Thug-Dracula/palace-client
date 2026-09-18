@@ -8,6 +8,33 @@ format is `protocol.md`; the work queue is `palace-todo.md`.
 
 ---
 
+## What 1.0 means
+
+The classic client, complete. Nothing blocks the release line: the two items that
+were open are resolved or re-scoped.
+
+- **Worn props are settable, not just scriptable.** `set_props` is exposed as a
+  Tauri command, so the rendering layer no longer needs new Rust to change what
+  the signed-in user wears. There is still no panel driving it — see below.
+- **The face grid is data.** The picker reads `faces`, `colors`, `cell` and the
+  row grouping from `palace://faces.json`, which the renderer derives from the
+  same constants it crops with, so the two can no longer disagree.
+
+**Not in 1.0.** A prop bag browser — a tile grid over `PropBag.bundle` with saved
+outfits — is PalaceChat 5 work (Tier B in the scope document). So is everything
+else in that tier: Type 1 avatars, the prop editor, extended IPTSCRAE, animated
+backgrounds, video doors, embedded web panes, the translator. The scope document
+estimates the tier at +8–12 person-weeks. The gaps in *Known gaps and unverified
+edges* are wanted but do not gate 1.0.
+
+**Open, and small.** Nothing in the interface calls `set_props` yet: the command
+is reachable but unused. A minimal props control (list the worn props, remove one)
+would use the `UserInfo.props` / `is_self` data the interface already has, and is
+frontend-only work. Whether that belongs in 1.0 or with the rest of the props
+work is a product call, not a technical one.
+
+---
+
 ## Verifying the interface
 
 The interface can be checked without touching the mouse: drive the app's own
@@ -72,12 +99,12 @@ Doctests are included.
 | `palace-prop` | 162 | 2 |
 | `palace-asset` | 146 | 1 |
 | `palace-probe` | 21 | 0 |
-| `palace-render` | 116 | 0 |
-| `palace-client` | 164 | 0 |
+| `palace-render` | 125 | 0 |
+| `palace-client` | 169 | 0 |
 | `iptscrae` | 155 | 0 |
 | `iptscrae-palace` | 96 | 0 |
 | `palace-host` | 128 | 0 |
-| **Total** | **1138** | **3** |
+| **Total** | **1152** | **3** |
 
 The three ignored tests are opt-in: `palace-asset/tests/live_server.rs` needs a
 live pserver, and `palace-prop`'s corpus and bag tests need the local corpora.
@@ -100,9 +127,9 @@ real payloads (804 records) with zero errors and zero warnings, and pins
 disagreements; the seven rejections are props the reference rejects too.
 
 **Compositor.** `palace-render` turns a `RoomDesc` plus local assets into an RGBA
-frame, with the room↔viewport↔buffer mapping round-trip tested. Draw commands,
-name tags, loose props, avatars and overlays all rasterize; chat text is the one
-layer that does not (see *Known gaps*).
+frame, with the room↔viewport↔buffer mapping round-trip tested. The background,
+draw commands, loose props, avatars, name tags, chat text and all four overlay
+bands rasterize into the single frame.
 
 **Script engine.** `iptscrae` implements the language; `iptscrae-palace` adds the
 Palace command surface; `palace-host` splits the `ON <event> { … }` blocks,
@@ -234,13 +261,20 @@ local to this client only.
 
 ## Known gaps and unverified edges
 
-- **Audio.** `SOUND`, `MIDIPLAY`, `MIDILOOP`, `MIDISTOP` and `BEEP` are surfaced,
-  but no audio device is reached.
-- **Chat text** is not rasterized into the frame. Draw commands and name tags are.
+- **Audio assets.** `SOUND`, `MIDIPLAY`, `MIDILOOP`, `MIDISTOP` and `BEEP` reach
+  the output device through `crates/palace-audio`, but the reference client's 17
+  bundled sounds are not shipped: the built-in table is empty, so every `SOUND`
+  name takes the media path (`mediaServer/name.mp3`). MIDI needs a SoundFont: the
+  audio panel picks one with a native file dialog, and it also comes from
+  `--soundfont` or `PALACE_SOUNDFONT`. With none set, or when the font will not
+  load, MIDI plays a synthesized fallback tone rather than going silent. No font
+  is bundled, because the licence for one is still undecided. Audibility is proven
+  headlessly; hearing it needs a human once.
 - **Constant stubs.** `GETPICDIMENSIONS` returns `(0, 0)`, `PROPDIMENSIONS` and
   `PROPOFFSETS` push zeros, and `has_prop_by_name` returns false.
-- **A props panel.** Worn props are sent to the server, but the interface cannot
-  set them yet.
+- **No prop panel.** `set_props` is exposed and reachable, but nothing in the
+  interface calls it, so worn props are still changed only from the console or a
+  script.
 - **Authentication.** `AUTHENTICATE` is decoded and reported rather than silently
   ignored, but the `AUTHRESPONSE` reply is not implemented. The logon clears the
   `Authenticate` `auxFlags` bit (the application advertises `0x00000008`), so the
@@ -326,6 +360,14 @@ PALACE_DEBUG_FRAMES=1 cargo run -p palace-client --bin live-smoke            # r
 Defaults: `localhost:9998`, user `Guest`. Override with `--host/--port/--user`
 or `PALACE_HOST`/`PALACE_PORT`/`PALACE_USER`. `PALACE_SEED_MEDIA` /
 `PALACE_SEED_PROPS` add read-only local fallback roots (colon-separated).
+
+Settings are saved to `settings.json` in the platform app-config directory
+(`%APPDATA%` on Windows, `~/.config` on Linux) whenever the interface changes
+them — the SoundFont and the audio preferences land there. On startup the three
+sources merge as **command line > saved file > environment defaults**, so a flag
+always wins and a saved choice outranks an inherited variable. The file is
+user-editable, so a missing or malformed one is not an error: the app falls back
+to defaults and reports it once.
 
 **Trap:** a debug `cargo build`/`cargo run -p palace-app` loads `devUrl`
 (`http://localhost:1420`), not the bundled frontend. Without Vite running you get
