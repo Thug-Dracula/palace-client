@@ -969,8 +969,13 @@ impl PalaceHost for ScriptHost {
         Ok(())
     }
 
-    fn is_locked(&self, _door: i64) -> bool {
-        false
+    /// Locked means a shuttable (2) or lockable (3) door whose state is 1.
+    /// Every other kind answers `false` however its state reads, as does an id
+    /// that is not in the room.
+    fn is_locked(&self, door: i64) -> bool {
+        self.view
+            .spot(door as i32)
+            .is_some_and(|spot| matches!(spot.kind, 2 | 3) && spot.state == 1)
     }
 
     fn in_spot(&self, spot: i64) -> bool {

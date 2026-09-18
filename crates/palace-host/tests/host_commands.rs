@@ -12,7 +12,8 @@ mod common;
 use common::*;
 use iptscrae::value::Value;
 use iptscrae::{Chunk, Host, IptError};
-use palace_host::{AlarmKind, Effect, PendingAlarm};
+use palace_host::view::{HostView, SpotView};
+use palace_host::{AlarmKind, Effect, PendingAlarm, ScriptHost};
 
 // --------------------------------------------------------------- state getters
 
@@ -122,6 +123,45 @@ fn lookups_clamp_bad_indices_instead_of_panicking() {
     assert_eq!(pushed("INSPOT", &ints(&[2])), ints(&[0]));
     assert_eq!(pushed("INSPOT", &ints(&[99])), ints(&[0]));
     assert_eq!(pushed("ISLOCKED", &ints(&[5])), ints(&[0]));
+}
+
+/// Needs its own view because the shared fixture's door is kind 1, which the
+/// reference says can never be locked however its state reads.
+#[test]
+fn islocked_needs_a_lockable_kind_and_the_locked_state() {
+    let answer = |kind: i32, state: i32, room_id: i32, query: i32| {
+        let view = HostView {
+            spots: vec![SpotView {
+                id: room_id,
+                kind,
+                state,
+                ..SpotView::default()
+            }],
+            ..HostView::default()
+        };
+        let mut host = ScriptHost::new(view);
+        host.command("ISLOCKED", &ints(&[query]))
+            .expect("command succeeds")
+    };
+
+    assert_eq!(answer(3, 1, 7, 7), ints(&[1]), "lockable door, locked");
+    assert_eq!(answer(2, 1, 7, 7), ints(&[1]), "shuttable door, locked");
+    assert_eq!(answer(3, 0, 7, 7), ints(&[0]), "lockable door, unlocked");
+    assert_eq!(
+        answer(1, 1, 7, 7),
+        ints(&[0]),
+        "a plain door cannot be locked"
+    );
+    assert_eq!(
+        answer(0, 1, 7, 7),
+        ints(&[0]),
+        "a normal spot cannot be locked"
+    );
+    assert_eq!(
+        answer(3, 1, 7, 99),
+        ints(&[0]),
+        "an id absent from the room"
+    );
 }
 
 #[test]
