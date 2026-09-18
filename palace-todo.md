@@ -735,6 +735,18 @@ Work order for "fully implemented":
 - [ ] `LOADSCRIPT` + `HTTPGET` (+ `CACHESCRIPT`) — the §2.14 fetch-and-execute path.
 - [ ] `SETTOOLTIP`/`CLEARTOOLTIP`; `CIRCLE`/`FILL`/`PAINT`/`TEXT`; local rasterization for `LINE`.
 - [ ] The constant stubs: `ISLOCKED`, `GETPICDIMENSIONS`, `PROPDIMENSIONS`/`PROPOFFSETS`,
+  **`ISLOCKED` is done** (commit `7802e8e`): it answers from the room now - the id must name a
+  hotspot, its kind must be a shuttable (2) or lockable (3) door, and its state must be 1.
+  **`GETPICDIMENSIONS` is not a one-liner like that one.** The reference pops `(state, id)` - state
+  deepest - and returns the *drawn picture's* width and height for that state, substituting the
+  hotspot's current state when the requested state is negative (`GETPICDIMENSIONSCommand.as`,
+  `PalaceController.getPicDimensions` :590). That is the size of the image asset whose id is the
+  state's `pict_id`, and we track image dimensions nowhere: `SpotView::state_pics` carries
+  `(pict_id, dx, dy)` only, and `palace-asset` never records a decoded size. So it needs a source of
+  picture dimensions (the PNG `IHDR`, or the decode we already do), a way to carry `pict_id -> (w, h)`
+  into `HostView`, and the runtime populating it before dispatch. Leave the zeros until all three
+  exist - a guessed size would be worse than a known stub, because rooms branch on it.
+  `PROPDIMENSIONS`/`PROPOFFSETS` and `has_prop_by_name` will need the equivalent for props.
   `has_prop_by_name`, `LOADPROPS`, `PAINTUNDO`.
 - [ ] Fix the `SHELLCMD` doc/dispatch mismatch and the `ClearLooseProps` wire classification.
 
