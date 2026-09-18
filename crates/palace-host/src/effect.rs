@@ -237,7 +237,6 @@ impl Effect {
                 | Effect::AddLooseProp { .. }
                 | Effect::RemoveLooseProp { .. }
                 | Effect::MoveLooseProp { .. }
-                | Effect::ClearLooseProps
                 | Effect::DrawLine { .. }
                 | Effect::DrawLineRel { .. }
                 | Effect::PaintClear

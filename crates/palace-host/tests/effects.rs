@@ -257,7 +257,7 @@ fn every_effect() -> Vec<(Effect, &'static str, bool, &'static str)> {
         (
             Effect::ClearLooseProps,
             "CLEARLOOSEPROPS",
-            true,
+            false,
             "CLEARLOOSEPROPS",
         ),
         (
@@ -415,13 +415,13 @@ fn an_unsupported_effect_keeps_the_offending_command() {
 }
 
 #[test]
-fn the_wire_set_is_exactly_the_twenty_encodable_effects() {
+fn the_wire_set_is_exactly_the_nineteen_encodable_effects() {
     let wire: Vec<String> = every_effect()
         .into_iter()
         .filter(|(effect, _, _, _)| effect.is_wire_effect())
         .map(|(effect, _, _, _)| effect.command().to_owned())
         .collect();
-    assert_eq!(wire.len(), 20, "wire effects: {wire:?}");
+    assert_eq!(wire.len(), 19, "wire effects: {wire:?}");
     for command in [
         "SAY",
         "SAYAT",
@@ -439,7 +439,6 @@ fn the_wire_set_is_exactly_the_twenty_encodable_effects() {
         "ADDLOOSEPROP",
         "REMOVELOOSEPROP",
         "MOVELOOSEPROP",
-        "CLEARLOOSEPROPS",
         "LINE",
         "LINETO",
         "PAINTCLEAR",
