@@ -245,8 +245,11 @@ which is *rolling*, while this machine was on `rustc 1.95.0` and CI was on `1.98
 `unneeded_wildcard_pattern`, so `Effect::FetchScript { url: _, .. }` passed every local gate and failed
 CI — which failed the first `v0.2.0-alpha` release attempt. **A local clippy pass is not sufficient
 verification here; CI is the authority, and a green local run means only that this toolchain has
-nothing to say.** Either update the local toolchain before trusting it, or expect a fix-and-retry cycle
-per push. Nothing else in the tree carries that particular pattern.
+nothing to say.** **Resolved 2026-09-17: the local toolchain was updated to `rustc 1.98.1` / `clippy 0.1.98`,
+matching CI, and clippy is clean across every crate except the Tauri app (`palace-app`, which
+needs the 20-40 minute build). Local gates are trustworthy again. The lesson stands though: CI
+runs rolling stable, so this drifts back with time and the update is worth repeating periodically -
+and a green local run still only means *this* toolchain has nothing to say. Nothing else in the tree carries that particular pattern.
 
 **Cutting a release, in order**, because the order is load-bearing:
 1. Bump `version` in `src-tauri/tauri.conf.json` **and** `Cargo.toml`'s `[workspace.package]` (and
