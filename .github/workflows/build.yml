@@ -52,8 +52,21 @@ jobs:
         shell: pwsh
         run: |
           $version = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+
+          # The app resolves its SoundFont at $RESOURCE/resources/soundfonts/,
+          # and on Windows $RESOURCE is the executable's own directory. Zip the
+          # resource tree the build stages beside the exe, exactly as the
+          # installer lays it down; the exe alone ships a silent client.
+          $resources = "target/release/resources"
+          if (-not (Test-Path "$resources/soundfonts/GeneralUser-GS.sf2")) {
+            $resources = "src-tauri/resources"
+          }
+          if (-not (Test-Path "$resources/soundfonts/GeneralUser-GS.sf2")) {
+            throw "the SoundFont was not staged; refusing to ship a silent portable build"
+          }
+
           New-Item -ItemType Directory -Force -Path target/portable | Out-Null
-          Compress-Archive -Path target/release/palace-app.exe `
+          Compress-Archive -Path target/release/palace-app.exe, $resources `
             -DestinationPath "target/portable/palace-client_${version}_x64-portable.zip"
 
       - uses: actions/upload-artifact@v7
