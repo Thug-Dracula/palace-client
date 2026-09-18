@@ -753,6 +753,12 @@ Work order for "fully implemented":
   into `HostView`, and the runtime populating it before dispatch. Leave the zeros until all three
   exist - a guessed size would be worse than a known stub, because rooms branch on it.
   `PROPDIMENSIONS`/`PROPOFFSETS` and `has_prop_by_name` will need the equivalent for props.
+  **`LOADPROPS` pushes nothing *by design*, so "make it push a real effect" was the wrong goal.**
+  The reference pops one array, throws `"You may only load up to 500 props at a time."` above 500
+  ids, and otherwise loads each integer id into the prop store *as a prefetch* with no further effect
+  (`LOADPROPSCommand.as`). So the real gaps are the 500-limit error (we accept anything silently) and
+  the prefetch itself - and the prefetch needs a prop store the host cannot reach yet, which is the
+  same plumbing the dimension work needs. Do these together or not at all.
   `has_prop_by_name`, `LOADPROPS`, `PAINTUNDO`.
 - [x] Fix the `SHELLCMD` doc/dispatch mismatch and the `ClearLooseProps` wire classification.
 
