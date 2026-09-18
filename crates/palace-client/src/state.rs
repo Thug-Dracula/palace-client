@@ -14,13 +14,14 @@ use palace_render::{DrawList, RoomDesc};
 use palace_room::{LooseProp, LoosePropSpec};
 use palace_wire::byteorder::ByteOrder;
 use palace_wire::frame::{navr_frame, Frame};
-use palace_wire::messages::{self, AssetSpec, Message, Point};
+use palace_wire::messages::{self, authresponse_frame, AssetSpec, Message, Point};
 use palace_wire::opcode;
 use serde::Serialize;
 
 use crate::runtime::{
     move_spot_in_room, remove_local_hotspot, set_local_spot_state, set_pic_offset_in_room,
 };
+use crate::secret::Secret;
 use crate::xtlk;
 
 /// A door hotspot's `state` field is its lock: `HS_Unlock` is 0 and `HS_Lock`
@@ -132,6 +133,13 @@ pub struct Applied {
     pub disconnect: Option<messages::ServerDown>,
 }
 
+/// The sign-in name and password used to answer an `auth` challenge.
+#[derive(Debug)]
+struct Credential {
+    user_name: String,
+    password: Secret,
+}
+
 /// The live model of one session.
 #[derive(Debug)]
 pub struct SessionState {
@@ -168,6 +176,8 @@ pub struct SessionState {
     pub chat: Vec<ChatLine>,
     chat_seq: u64,
     last_error: Option<String>,
+    /// The credential that answers an `auth` challenge, when one is configured.
+    credential: Option<Credential>,
 }
 
 impl SessionState {
@@ -197,7 +207,17 @@ impl SessionState {
             chat: Vec::new(),
             chat_seq: 0,
             last_error: None,
+            credential: None,
         }
+    }
+
+    /// Arm the session to answer an `auth` challenge from `user_name` with
+    /// `password`.
+    pub fn set_credential(&mut self, user_name: impl Into<String>, password: Secret) {
+        self.credential = Some(Credential {
+            user_name: user_name.into(),
+            password,
+        });
     }
 
     /// The most recent error, if any.
@@ -608,12 +628,19 @@ impl SessionState {
                 applied.render = true;
             }
             Message::Draw(_) => {}
-            Message::Authenticate => {
-                applied.chat.push(self.system_line(
-                    ChatKind::Error,
-                    "server asked this client to authenticate; it cannot answer yet, so logon will not complete",
-                ));
-            }
+            Message::Authenticate => match &self.credential {
+                Some(credential) => applied.outbound.push(authresponse_frame(
+                    &credential.user_name,
+                    credential.password.expose(),
+                    order,
+                )),
+                None => {
+                    applied.chat.push(self.system_line(
+                        ChatKind::Error,
+                        "server asked this client to authenticate; it cannot answer yet, so logon will not complete",
+                    ));
+                }
+            },
             Message::NavError(err) => {
                 applied
                     .chat
@@ -1069,6 +1096,55 @@ mod tests {
                 .any(|line| line.text.contains("authenticate")),
             "a server asking for authentication must be reported, because silence here is an unexplained stall: {:?}",
             applied.chat
+        );
+    }
+
+    #[test]
+    fn a_configured_credential_answers_an_authenticate_challenge() {
+        let mut state = room_state();
+        state.set_credential("Rico", Secret::new("hunter2"));
+
+        let applied = state.apply(
+            &Frame::new(opcode::AUTHENTICATE, 0, Vec::new()),
+            ByteOrder::Little,
+        );
+
+        assert!(
+            applied.chat.is_empty(),
+            "an answerable challenge is answered, not reported: {:?}",
+            applied.chat
+        );
+        assert_eq!(applied.outbound.len(), 1, "exactly one reply frame");
+        let frame = &applied.outbound[0];
+        assert_eq!(frame.opcode, opcode::AUTHRESPONSE);
+        assert_eq!(frame.ref_num, 0);
+        assert_eq!(
+            frame.payload, b"\x0cRico:hunter2",
+            "the body is the PString user:password"
+        );
+    }
+
+    #[test]
+    fn without_a_credential_an_authenticate_challenge_is_reported_and_not_answered() {
+        let mut state = room_state();
+
+        let applied = state.apply(
+            &Frame::new(opcode::AUTHENTICATE, 0, Vec::new()),
+            ByteOrder::Little,
+        );
+
+        assert!(
+            applied.outbound.is_empty(),
+            "with no credential there is nothing to send"
+        );
+        let line = applied
+            .chat
+            .iter()
+            .find(|line| line.kind == ChatKind::Error)
+            .expect("the stall must still be reported");
+        assert_eq!(
+            line.text,
+            "server asked this client to authenticate; it cannot answer yet, so logon will not complete"
         );
     }
 

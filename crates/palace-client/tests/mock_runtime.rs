@@ -545,6 +545,7 @@ fn config_for(port: u16, cache_root: PathBuf, seed_media: PathBuf) -> ClientConf
         cache_root,
         seed_media: vec![seed_media],
         seed_props: Vec::new(),
+        password: None,
     }
 }
 

@@ -29,7 +29,10 @@ use palace_render::{
 use palace_wire::byteorder::Writer;
 use palace_wire::error::WireError;
 use palace_wire::frame::{user_color_frame, user_face_frame, user_move_frame, Frame};
-use palace_wire::messages::{client_logon_record, AssetSpec, Point, Talk, UserProp};
+use palace_wire::messages::{
+    authenticating_logon_record, client_logon_record, AssetSpec, AuxRegistrationRec, Point, Talk,
+    UserProp,
+};
 use palace_wire::opcode;
 use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -39,6 +42,7 @@ use crate::assets::{
 };
 use crate::error::{ClientError, Result};
 use crate::frame::{FrameStore, ScreenState, ViewGeometry};
+use crate::secret::Secret;
 use crate::session::{Connection, POLL_SLICE};
 use crate::state::{
     ChatKind, ChatLine, ConnectionStatus, RoomInfo, ScriptStimulus, ServerBanner, SessionState,
@@ -68,6 +72,9 @@ pub struct ClientConfig {
     pub cache_root: PathBuf,
     pub seed_media: Vec<PathBuf>,
     pub seed_props: Vec<PathBuf>,
+    /// The credential to answer an `auth` challenge with. `None` leaves the
+    /// client unable to authenticate, exactly as before.
+    pub password: Option<Secret>,
 }
 
 impl Default for ClientConfig {
@@ -80,6 +87,7 @@ impl Default for ClientConfig {
             cache_root: default_cache_root(),
             seed_media: Vec::new(),
             seed_props: Vec::new(),
+            password: None,
         }
     }
 }
@@ -128,6 +136,16 @@ fn session_dir_name(host: &str, port: u16) -> String {
 
 fn session_cache_dir(cfg: &ClientConfig) -> PathBuf {
     cfg.cache_root.join(session_dir_name(&cfg.host, cfg.port))
+}
+
+/// The logon record for `cfg`: the authenticating profile when a credential is
+/// configured, the plain one otherwise.
+fn logon_record(cfg: &ClientConfig) -> AuxRegistrationRec {
+    if cfg.password.is_some() {
+        authenticating_logon_record(&cfg.username, cfg.desired_room)
+    } else {
+        client_logon_record(&cfg.username, cfg.desired_room)
+    }
 }
 
 /// What the UI can ask the runtime to do.
@@ -711,13 +729,16 @@ fn run_session(
     let mut occupied_room = false;
 
     let mut state = SessionState::new(&cfg.host, cfg.port);
+    if let Some(password) = cfg.password.clone() {
+        state.set_credential(&cfg.username, password);
+    }
     state.banner.byte_order = order.label().to_string();
     state.banner.user_id = user_id;
     shared.emit(ClientEvent::Banner {
         banner: state.banner.clone(),
     });
 
-    let record = client_logon_record(&cfg.username, cfg.desired_room);
+    let record = logon_record(cfg);
     conn.send(&record.logon_frame(order))?;
     let _ = conn.send(&Frame::empty(opcode::LISTOFALLROOMS, 0));
     let _ = conn.send(&Frame::empty(opcode::LISTOFALLUSERS, 0));
@@ -3423,6 +3444,23 @@ mod tests {
                 "type {other} state 1 is a picture selector, not a lock, so its click must not be refused"
             );
         }
+    }
+
+    #[test]
+    fn the_advertised_logon_authenticates_only_when_a_credential_is_configured() {
+        use palace_wire::messages::aux_flags;
+
+        let plain = ClientConfig::default();
+        assert_eq!(logon_record(&plain).aux_flags & aux_flags::AUTHENTICATE, 0);
+
+        let armed = ClientConfig {
+            password: Some(Secret::new("hunter2")),
+            ..ClientConfig::default()
+        };
+        assert_eq!(
+            logon_record(&armed).aux_flags & aux_flags::AUTHENTICATE,
+            aux_flags::AUTHENTICATE
+        );
     }
 
     #[test]

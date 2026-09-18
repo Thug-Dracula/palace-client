@@ -72,6 +72,7 @@ pub fn config_for(settings: &Settings) -> ClientConfig {
         host: settings.host.clone(),
         port: settings.port,
         username: settings.username.clone(),
+        password: settings.password.clone(),
         seed_media: seed_media(),
         seed_props: seed_props(),
         ..ClientConfig::default()
@@ -240,6 +241,7 @@ mod tests {
             soundfont: None,
             audio_enabled: true,
             audio_volume: 1.0,
+            password: None,
         }
     }
 
@@ -288,5 +290,20 @@ mod tests {
         assert_eq!(cfg.host, "h.test");
         assert_eq!(cfg.port, 4444);
         assert_eq!(cfg.username, "Someone");
+        assert_eq!(cfg.password, None);
+    }
+
+    #[test]
+    fn config_carries_the_credential_without_exposing_it() {
+        let settings = Settings {
+            password: Some(palace_client::Secret::new("hunter2")),
+            ..sample()
+        };
+        let cfg = config_for(&settings);
+        assert_eq!(cfg.password, Some(palace_client::Secret::new("hunter2")));
+        assert!(
+            !format!("{cfg:?}").contains("hunter2"),
+            "the credential must not render in Debug"
+        );
     }
 }

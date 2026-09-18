@@ -44,19 +44,15 @@ items in §1–§7 below are wanted but do not gate 1.0.
 
 ## 1. Top of queue
 
-- [ ] **Authentication — blocked on a decision.** A server that requires it sends
-  `auth` (`AUTHENTICATE`) after logon and waits for `autr` (`AUTHRESPONSE`). The
-  request is decoded and reported; the reply is not implemented, so an
-  auth-requiring server refuses this client.
-  - **Done — the capability is no longer advertised.** The application sends
-    `aux_flags` `0x0000_0008` (via `ClientProfile`); `ReferenceProfile` keeps
-    `0x8000_0008` for the walker-oracle tests. A server is no longer told this
-    client can answer a challenge it cannot.
-  - **Open — implement the reply.** `AUTHRESPONSE` is a PString of
-    `user:password`, so it needs a credential source. There is no password field
-    anywhere in `ClientConfig` or `Settings`, so this first needs a decision
-    about where a credential lives (config file, interactive prompt, system
-    keyring).
+- [x] **Authentication.** A server that requires it sends `auth` (`AUTHENTICATE`)
+  after logon and waits for `autr` (`AUTHRESPONSE`). The client now answers with
+  the `PString` `user:password` when a credential is configured, and the logon
+  advertises the capability only in that case: a plain logon still clears the bit
+  (via `ClientProfile`), so a server is never promised a reply this client cannot
+  give. `ReferenceProfile` keeps `0x8000_0008` for the walker-oracle tests.
+  - **Credential source: environment or command line.** `PALACE_PASSWORD`, or
+    `--password`/`--password=`. It is never read from or written to
+    `settings.json`, and it renders redacted in `Debug`.
 
 ---
 

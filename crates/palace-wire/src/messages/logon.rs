@@ -252,15 +252,14 @@ pub fn reference_logon_record(user_name: &str, desired_room: i16) -> AuxRegistra
     ReferenceProfile::default().to_record(user_name, desired_room)
 }
 
-/// The logon profile this client actually advertises.
+/// The logon profile this client advertises when no credential is configured.
 ///
-/// It is the [`ReferenceProfile`] with [`aux_flags::AUTHENTICATE`] cleared. That
-/// bit promises the server an authentication challenge will be answered, but
-/// `AUTHRESPONSE` is not implemented: a server that believes the advertisement
-/// sends `AUTHENTICATE` and then waits in silence. The application sends this
-/// profile so it never claims a capability it cannot honour. The reference
-/// profile keeps the bit because it mirrors the captured client byte for byte;
-/// see its documentation for why that matters.
+/// It is the [`ReferenceProfile`] with [`aux_flags::AUTHENTICATE`] cleared: with
+/// no credential there is no reply to give, and a server that believed the
+/// advertisement would send `AUTHENTICATE` and then wait in silence. With a
+/// credential, [`authenticating_logon_record`] keeps the bit so the challenge
+/// arrives. The reference profile keeps the bit because it mirrors the captured
+/// client byte for byte; see its documentation for why that matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientProfile(ReferenceProfile);
 
@@ -282,21 +281,50 @@ impl ClientProfile {
     }
 }
 
-/// Build the logon record this client sends for `user_name`.
+/// Build the logon record this client sends for `user_name` without a
+/// credential.
 ///
-/// Unlike [`reference_logon_record`] it does not advertise
-/// [`aux_flags::AUTHENTICATE`], because the reply is not implemented.
+/// Unlike [`reference_logon_record`] and [`authenticating_logon_record`] it does
+/// not advertise [`aux_flags::AUTHENTICATE`], because without a credential the
+/// reply cannot be sent.
 pub fn client_logon_record(user_name: &str, desired_room: i16) -> AuxRegistrationRec {
     ClientProfile::default().to_record(user_name, desired_room)
+}
+
+/// Build the logon record this client sends for `user_name` when it can answer
+/// an authentication challenge.
+///
+/// It is the [`ReferenceProfile`], so it advertises
+/// [`aux_flags::AUTHENTICATE`] and is byte-identical to the captured client;
+/// [`authresponse_frame`] supplies the reply that bit promises.
+pub fn authenticating_logon_record(user_name: &str, desired_room: i16) -> AuxRegistrationRec {
+    ReferenceProfile::default().to_record(user_name, desired_room)
+}
+
+/// Build the `MSG_AUTHRESPONSE` (`autr`) frame that answers a server's
+/// `MSG_AUTHENTICATE` (`auth`) challenge for `user_name`.
+///
+/// The body is the `PString` `user:password` (:744). The reference client writes
+/// exactly that string and the server splits it on the first `:`; the frame
+/// `refNum` is unused (:737).
+pub fn authresponse_frame(user_name: &str, password: &str, order: ByteOrder) -> Frame {
+    let mut credential = String::with_capacity(user_name.len() + password.len() + 1);
+    credential.push_str(user_name);
+    credential.push(':');
+    credential.push_str(password);
+    let mut w = Writer::with_capacity(order, credential.len() + 1);
+    w.write_pstring(&credential);
+    Frame::new(opcode::AUTHRESPONSE, 0, w.into_vec())
 }
 
 /// `MSG_AUTHENTICATE` (`auth`): the server asking the client to authenticate.
 ///
 /// The body is empty — "there are no parameters in this message, so the length
 /// field should be 0 and the msg field should be empty" (:739-742). The reply is
-/// `MSG_AUTHRESPONSE` (:744), a PString of `user:password`, which this client does
-/// not send; knowing the request arrived is what lets it say so instead of stalling
-/// in silence. The frame `refNum` is unused (:737).
+/// [`authresponse_frame`], a PString of `user:password` (:744); when the client
+/// has a credential it sends that, and when it does not, knowing the request
+/// arrived is what lets it say so instead of stalling in silence. The frame
+/// `refNum` is unused (:737).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Authenticate;
 
@@ -423,6 +451,46 @@ mod tests {
             &(aux_flags::AUTHENTICATE | OS_TAG_8).to_le_bytes()
         );
         assert_eq!(&client_bytes[72..76], &OS_TAG_8.to_le_bytes());
+    }
+
+    #[test]
+    fn authresponse_body_is_the_pstring_user_colon_password() {
+        let frame = authresponse_frame("Rico", "hunter2", ByteOrder::Little);
+        assert_eq!(frame.opcode, opcode::AUTHRESPONSE);
+        assert_eq!(frame.ref_num, 0);
+        assert_eq!(frame.payload, b"\x0cRico:hunter2");
+        #[rustfmt::skip]
+        let expected_le: Vec<u8> = vec![
+            0x72, 0x74, 0x75, 0x61, // "rtua" = autr, little-endian
+            0x0d, 0x00, 0x00, 0x00, // length = 13
+            0x00, 0x00, 0x00, 0x00, // refNum = 0
+            0x0c, b'R', b'i', b'c', b'o', b':', b'h', b'u', b'n', b't', b'e', b'r', b'2',
+        ];
+        assert_eq!(frame.encode(ByteOrder::Little).unwrap(), expected_le);
+
+        let be = authresponse_frame("Rico", "hunter2", ByteOrder::Big)
+            .encode(ByteOrder::Big)
+            .unwrap();
+        assert_eq!(&be[..4], b"autr");
+        assert_eq!(&be[4..8], &13u32.to_be_bytes());
+        assert_eq!(&be[8..12], &0i32.to_be_bytes());
+        assert_eq!(&be[12..], b"\x0cRico:hunter2");
+    }
+
+    #[test]
+    fn an_authenticating_logon_keeps_the_authenticate_bit_a_plain_one_clears() {
+        let authenticating = authenticating_logon_record("Rico", 0);
+        let plain = client_logon_record("Rico", 0);
+        assert_eq!(
+            authenticating.aux_flags & aux_flags::AUTHENTICATE,
+            aux_flags::AUTHENTICATE
+        );
+        assert_eq!(plain.aux_flags & aux_flags::AUTHENTICATE, 0);
+        assert_eq!(
+            authenticating,
+            reference_logon_record("Rico", 0),
+            "the authenticating record is the reference profile, byte for byte"
+        );
     }
 
     #[test]

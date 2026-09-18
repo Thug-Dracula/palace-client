@@ -285,10 +285,12 @@ local to this client only.
 - **No prop panel.** `set_props` is exposed and reachable, but nothing in the
   interface calls it, so worn props are still changed only from the console or a
   script.
-- **Authentication.** `AUTHENTICATE` is decoded and reported rather than silently
-  ignored, but the `AUTHRESPONSE` reply is not implemented. The logon clears the
-  `Authenticate` `auxFlags` bit (the application advertises `0x00000008`), so the
-  client does not claim a capability it cannot honour.
+- **Authentication.** `AUTHENTICATE` is answered with `AUTHRESPONSE` — the
+  `PString` `user:password` — when a credential is configured through
+  `PALACE_PASSWORD` or `--password`. The logon advertises the `Authenticate`
+  `auxFlags` bit only when the client can answer; without a credential it clears
+  the bit (sending `0x00000008`) and reports the challenge instead of stalling.
+  The credential is never persisted or logged.
 - **Live verification is thinner than the unit tests.** Several receive paths are
   proven against a mock harness; no live big-endian or HTTP-tunnel server has been
   reachable; asset transfer for other users' avatars is untested against a real
@@ -322,12 +324,6 @@ tiltleft, tiltup, tiltright, sad, blotto, angry`.
 
 ## Open decisions
 
-- **Where does a credential live?** Implementing `AUTHRESPONSE` (a PString of
-  `user:password`) needs a credential source, so the choice of config file,
-  prompt or keyring comes first. The logon no longer advertises the capability:
-  the application sends `aux_flags` `0x00000008`, while `ReferenceProfile`
-  retains `0x80000008` so the reference logon stays byte-for-byte. An
-  auth-requiring server therefore yields an explained failure, not a hang.
 - **`SETLOC`/`SETPICLOC` broadcast** waits on a verified body layout for
   `SPOTMOVE`/`PICTMOVE`.
 - **`durl`** waits on any real server that constructs it.

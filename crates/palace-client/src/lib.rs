@@ -27,6 +27,7 @@ pub mod assets;
 pub mod error;
 pub mod frame;
 pub mod runtime;
+pub mod secret;
 pub mod session;
 pub mod state;
 pub mod trace;
@@ -37,6 +38,7 @@ pub use frame::{FrameStore, ScreenState, ViewGeometry};
 pub use runtime::{
     ClientCommand, ClientConfig, ClientEvent, ClientEventStream, ClientHandle, ClientRuntime,
 };
+pub use secret::Secret;
 pub use state::{ChatKind, ChatLine, ConnectionStatus, RoomInfo, ServerBanner, UserInfo};
 pub use trace::Tracer;
 pub use xtlk::{decrypt, encrypt};

@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use palace_client::Secret;
 use tauri::Manager;
 
 /// The settings file's name inside the platform app-config directory.
@@ -25,6 +26,11 @@ pub struct Settings {
     pub audio_enabled: bool,
     #[serde(default = "audio_volume_default")]
     pub audio_volume: f32,
+    /// The credential for an `auth` challenge. Sourced only from
+    /// `PALACE_PASSWORD` or `--password`, so it is never read from or written to
+    /// the config file.
+    #[serde(skip)]
+    pub password: Option<Secret>,
 }
 
 fn audio_enabled_default() -> bool {
@@ -49,10 +55,15 @@ impl Settings {
             soundfont: std::env::var_os("PALACE_SOUNDFONT").map(PathBuf::from),
             audio_enabled: audio_enabled_default(),
             audio_volume: audio_volume_default(),
+            password: std::env::var("PALACE_PASSWORD")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(Secret::new),
         }
     }
 
-    /// Apply `--host` / `--port` / `--user` / `--soundfont` from the command line.
+    /// Apply `--host` / `--port` / `--user` / `--soundfont` / `--password` from
+    /// the command line.
     #[must_use]
     pub fn with_args(mut self, args: impl Iterator<Item = String>) -> Self {
         let mut pending: Option<String> = None;
@@ -67,6 +78,7 @@ impl Settings {
                     }
                     "user" => self.username = arg,
                     "soundfont" => self.soundfont = Some(PathBuf::from(arg)),
+                    "password" => self.password = Some(Secret::new(arg)),
                     _ => {}
                 }
                 continue;
@@ -76,6 +88,7 @@ impl Settings {
                 "--port" => pending = Some("port".to_string()),
                 "--user" => pending = Some("user".to_string()),
                 "--soundfont" => pending = Some("soundfont".to_string()),
+                "--password" => pending = Some("password".to_string()),
                 other => {
                     if let Some(value) = other.strip_prefix("--host=") {
                         self.host = value.to_string();
@@ -87,6 +100,8 @@ impl Settings {
                         self.username = value.to_string();
                     } else if let Some(value) = other.strip_prefix("--soundfont=") {
                         self.soundfont = Some(PathBuf::from(value));
+                    } else if let Some(value) = other.strip_prefix("--password=") {
+                        self.password = Some(Secret::new(value));
                     }
                 }
             }
@@ -100,13 +115,18 @@ impl Settings {
     /// saved config file, then the command line. The file is the user's
     /// persisted intent across restarts; the flags are the most specific
     /// instruction for this particular launch and win.
+    ///
+    /// The credential is exempt: it is never in the file, so the environment's
+    /// value survives the merge and only the command line can override it.
     #[must_use]
     pub fn resolve(
         defaults: Settings,
         saved: Option<Settings>,
         args: impl Iterator<Item = String>,
     ) -> Settings {
-        saved.unwrap_or(defaults).with_args(args)
+        let mut resolved = saved.unwrap_or_else(|| defaults.clone());
+        resolved.password = defaults.password;
+        resolved.with_args(args)
     }
 }
 
@@ -223,6 +243,7 @@ mod tests {
             soundfont: None,
             audio_enabled: true,
             audio_volume: 1.0,
+            password: None,
         }
     }
 
@@ -273,10 +294,67 @@ mod tests {
             soundfont: Some(PathBuf::from("/fonts/tim.sf2")),
             audio_enabled: false,
             audio_volume: 0.4,
+            password: None,
         };
         save(&path, &original).expect("the settings are writable");
         let loaded = load(&path).expect("the settings are readable again");
         assert_eq!(loaded, original);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_password_comes_from_the_environment_and_the_command_line_wins() {
+        std::env::set_var("PALACE_PASSWORD", "envpass");
+        let env = Settings::from_env();
+        std::env::remove_var("PALACE_PASSWORD");
+        assert_eq!(env.password, Some(Secret::new("envpass")));
+
+        let cli = env.with_args(args(&["--password", "clipass"]));
+        assert_eq!(
+            cli.password,
+            Some(Secret::new("clipass")),
+            "the command line beats the environment"
+        );
+
+        let equals = sample().with_args(args(&["--password=eqpass"]));
+        assert_eq!(equals.password, Some(Secret::new("eqpass")));
+    }
+
+    #[test]
+    fn the_config_file_neither_supplies_nor_clears_a_credential() {
+        let env = Settings {
+            password: Some(Secret::new("envpass")),
+            ..sample()
+        };
+        let resolved = Settings::resolve(env, Some(sample()), args(&[]));
+        assert_eq!(
+            resolved.password,
+            Some(Secret::new("envpass")),
+            "a saved file must not become a source of, or a sink for, the credential"
+        );
+
+        let resolved =
+            Settings::resolve(sample(), Some(sample()), args(&["--password", "clipass"]));
+        assert_eq!(resolved.password, Some(Secret::new("clipass")));
+    }
+
+    #[test]
+    fn a_password_is_never_written_to_the_config_file() {
+        let directory = scratch("password");
+        let path = directory.join(CONFIG_FILE);
+        let original = Settings {
+            password: Some(Secret::new("hunter2")),
+            ..sample()
+        };
+        save(&path, &original).expect("the settings are writable");
+        let raw = std::fs::read_to_string(&path).expect("the file is readable");
+        assert!(!raw.contains("hunter2"), "the password reached disk: {raw}");
+        assert!(
+            !raw.contains("password"),
+            "the field must not even be named: {raw}"
+        );
+        let loaded = load(&path).expect("the settings are readable again");
+        assert_eq!(loaded.password, None, "the file never populates a password");
         let _ = std::fs::remove_dir_all(&directory);
     }
 

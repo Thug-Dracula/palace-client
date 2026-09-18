@@ -106,6 +106,8 @@ pub const SPOTMOVE: Opcode = Opcode(0x636f_4c73);
 pub const PICTMOVE: Opcode = Opcode(0x704c_6f63);
 /// `0x61757468` — the server asking the client to authenticate; empty body.
 pub const AUTHENTICATE: Opcode = Opcode(0x6175_7468);
+/// `0x61757472` — the client's answer to `auth`: a `PString` of `user:password`.
+pub const AUTHRESPONSE: Opcode = Opcode(0x6175_7472);
 /// `0x7345_7272` — the server refused a room change; the failure code is the
 /// frame's `refNum` and the body is empty (protocol reference :1371).
 pub const NAVERROR: Opcode = Opcode(0x7345_7272);

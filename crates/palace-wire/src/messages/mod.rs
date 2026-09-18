@@ -25,8 +25,8 @@ pub use chat::{Talk, Whisper};
 pub use draw::Draw;
 pub use lists::{RoomList, RoomListRec, UserList, UserListRec};
 pub use logon::{
-    aux_flags, client_logon_record, reference_logon_record, Authenticate, AuxRegistrationRec,
-    ClientProfile, ReferenceProfile,
+    authenticating_logon_record, authresponse_frame, aux_flags, client_logon_record,
+    reference_logon_record, Authenticate, AuxRegistrationRec, ClientProfile, ReferenceProfile,
 };
 pub use pictures::PictMove;
 pub use props::{PropDel, PropMove, PropNew};
