@@ -174,22 +174,25 @@ pub struct AudioState {
 #[tauri::command]
 pub fn get_audio_state(state: State<'_, AppState>) -> Result<AudioState, String> {
     let settings = state.settings.lock().map_err(|error| error.to_string())?;
+    let soundfont = settings
+        .soundfont
+        .clone()
+        .or_else(|| state.bundled_soundfont.clone());
     Ok(AudioState {
         enabled: settings.audio_enabled,
         volume: settings.audio_volume,
-        soundfont: settings.soundfont.clone(),
-        soundfont_exists: settings
-            .soundfont
-            .as_deref()
-            .is_some_and(std::path::Path::is_file),
+        soundfont_exists: soundfont.as_deref().is_some_and(std::path::Path::is_file),
+        soundfont,
     })
 }
 
-/// Choose the SoundFont MIDI is synthesized with; `None` clears it.
+/// Choose the SoundFont MIDI is synthesized with; `None` clears the choice.
 ///
 /// The path is validated (an existing `.sf2`) before anything changes, then the
 /// new setting is persisted and only afterwards handed to the live engine, so a
-/// rejected path leaves both the engine and the file untouched.
+/// rejected path leaves both the engine and the file untouched. Clearing the
+/// choice reverts the engine to the vendored font, or to the fallback tone when
+/// the bundle supplies none.
 #[tauri::command]
 pub fn set_soundfont(
     app: AppHandle,
@@ -201,8 +204,8 @@ pub fn set_soundfont(
         settings.soundfont.clone_from(&chosen);
     })?;
     let audio = state.audio.lock().map_err(|error| error.to_string())?;
-    match &chosen {
-        Some(path) => audio.handle().set_soundfont(path.clone()),
+    match chosen.or_else(|| state.bundled_soundfont.clone()) {
+        Some(path) => audio.handle().set_soundfont(path),
         None => audio.handle().clear_soundfont(),
     }
     Ok(())

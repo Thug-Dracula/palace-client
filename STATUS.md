@@ -27,11 +27,11 @@ backgrounds, video doors, embedded web panes, the translator. The scope document
 estimates the tier at +8–12 person-weeks. The gaps in *Known gaps and unverified
 edges* are wanted but do not gate 1.0.
 
-**Open, and small.** Nothing in the interface calls `set_props` yet: the command
-is reachable but unused. A minimal props control (list the worn props, remove one)
-would use the `UserInfo.props` / `is_self` data the interface already has, and is
-frontend-only work. Whether that belongs in 1.0 or with the rest of the props
-work is a product call, not a technical one.
+**Decided.** Nothing in the interface calls `set_props` yet: the command is
+reachable but unused. A minimal props control (list the worn props, remove one)
+would use the `UserInfo.props` / `is_self` data the interface already has and is
+frontend-only work, but it ships with the rest of the props work: it is deferred
+to Tier B rather than built for 1.0.
 
 ---
 
@@ -264,12 +264,16 @@ local to this client only.
 - **Audio assets.** `SOUND`, `MIDIPLAY`, `MIDILOOP`, `MIDISTOP` and `BEEP` reach
   the output device through `crates/palace-audio`, but the reference client's 17
   bundled sounds are not shipped: the built-in table is empty, so every `SOUND`
-  name takes the media path (`mediaServer/name.mp3`). MIDI needs a SoundFont: the
-  audio panel picks one with a native file dialog, and it also comes from
-  `--soundfont` or `PALACE_SOUNDFONT`. With none set, or when the font will not
-  load, MIDI plays a synthesized fallback tone rather than going silent. No font
-  is bundled, because the licence for one is still undecided. Audibility is proven
-  headlessly; hearing it needs a human once.
+  name takes the media path (`mediaServer/name.mp3`). MIDI is synthesized with
+  **GeneralUser GS 2.0.3 BETA**, vendored at
+  `src-tauri/resources/soundfonts/GeneralUser-GS.sf2` and shipped through
+  `bundle.resources`; its licence sits beside it as
+  `GeneralUser-GS-LICENSE.txt` and permits use in software projects, so MIDI is
+  audible out of the box. A font chosen in the audio panel, or given through
+  `--soundfont` / `PALACE_SOUNDFONT`, overrides the vendored default; with no
+  font at all, or when one will not load, MIDI plays a synthesized fallback tone
+  rather than going silent. Audibility is proven headlessly; hearing it needs a
+  human once.
 - **Constant stubs.** `GETPICDIMENSIONS` returns `(0, 0)`, `PROPDIMENSIONS` and
   `PROPOFFSETS` push zeros, and `has_prop_by_name` returns false.
 - **No prop panel.** `set_props` is exposed and reachable, but nothing in the

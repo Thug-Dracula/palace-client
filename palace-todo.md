@@ -27,11 +27,11 @@ re-scoped, and nothing else is required for the release line:
   the row grouping from `palace://faces.json`; the renderer derives that payload
   from the constants it crops with, so the two cannot disagree.
 
-**Open, and small.** No component calls `set_props` yet, so "settable" is true of
-the command and not of the interface. A minimal props control — list the worn
-props, remove one — would use the `UserInfo.props` / `is_self` data the interface
-already has and needs no Rust. Whether it belongs in 1.0 or with the rest of the
-props work is a product call.
+**Decided.** No component calls `set_props` yet, so "settable" is true of the
+command and not of the interface. A minimal props control — list the worn props,
+remove one — would use the `UserInfo.props` / `is_self` data the interface
+already has and needs no Rust; it is deferred to Tier B rather than built for
+1.0.
 
 **Deliberately not in 1.0.** A prop bag browser (a tile grid over `PropBag.bundle`
 with saved outfits) is PalaceChat 5 work, as is the rest of that tier: Type 1
@@ -133,7 +133,7 @@ dialect. What remains:
 - [x] **`set_props` is reachable.** Exposed as a Tauri command
   (`src-tauri/src/commands.rs`), registered, wrapped in `api.ts` and surfaced as a
   store action, so the interface can change worn props without new Rust. Nothing
-  calls it yet — see §0 for the open question of whether a minimal control is 1.0.
+  calls it yet: the minimal props control is deferred to Tier B (§0).
 - [ ] **A prop bag browser is Tier B, not 1.0.** A tile grid over
   `PropBag.bundle` with saved outfits is PalaceChat 5 territory
   (`$CORPUS/TAURI-CLIENT-SCOPE.md`, Tier B). Classic-client prop wearing is

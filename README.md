@@ -154,5 +154,9 @@ abandoned software; licensing is not treated as a constraint. Sources are
 credited for their role in recovering an undocumented protocol. Distributed
 binaries, if any, are meant to be GPL-3.0.
 
+The one third-party asset shipped is the **GeneralUser GS** SoundFont
+(`src-tauri/resources/soundfonts/`), MIDI's default voice; its licence is
+included beside it.
+
 No credentials are used or stored: logon is guest-only and the username comes
 from `--user`.

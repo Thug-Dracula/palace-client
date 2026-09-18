@@ -10,12 +10,13 @@ pub mod settings;
 
 pub use settings::Settings;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use palace_audio::{AudioConfig, AudioEngine, AudioHandle};
 use palace_client::{ClientConfig, ClientEvent, ClientEventStream, ClientHandle, ClientRuntime};
+use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
 /// Shared app state: the running client and the settings it was built from.
@@ -23,6 +24,8 @@ pub struct AppState {
     pub client: Mutex<Option<ClientHandle>>,
     pub settings: Mutex<Settings>,
     pub audio: Mutex<AudioEngine>,
+    /// The vendored font `settings.soundfont` falls back to when it is `None`.
+    pub bundled_soundfont: Option<PathBuf>,
 }
 
 /// Split a search path using the platform's own separator.
@@ -75,14 +78,35 @@ pub fn config_for(settings: &Settings) -> ClientConfig {
     }
 }
 
+/// The SoundFont vendored into the bundle, relative to the resource directory.
+pub const BUNDLED_SOUNDFONT: &str = "resources/soundfonts/GeneralUser-GS.sf2";
+
+/// Locate the vendored SoundFont inside the installed bundle.
+///
+/// Returns `None` outside a bundled layout (a bare `cargo test`, or a dev run
+/// whose resources were not copied) and when the file is absent, which leaves
+/// the engine on its fallback tone exactly as before the font was vendored.
+#[must_use]
+pub fn bundled_soundfont(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path()
+        .resolve(BUNDLED_SOUNDFONT, BaseDirectory::Resource)
+        .ok()
+        .filter(|path| path.is_file())
+}
+
 /// The audio engine config the shell runs with.
 ///
 /// The shell, unlike a test harness, wants sound, so it selects
-/// [`AudioConfig::desktop`]; the library default stays silent.
+/// [`AudioConfig::desktop`]; the library default stays silent. When the
+/// settings name no font, `default_soundfont` — the vendored bundle — supplies
+/// one, so MIDI is audible out of the box while a saved choice still wins.
 #[must_use]
-pub fn audio_config_for(settings: &Settings) -> AudioConfig {
+pub fn audio_config_for(settings: &Settings, default_soundfont: Option<&Path>) -> AudioConfig {
     AudioConfig {
-        soundfont: settings.soundfont.clone(),
+        soundfont: settings
+            .soundfont
+            .clone()
+            .or_else(|| default_soundfont.map(Path::to_path_buf)),
         enabled: settings.audio_enabled,
         volume: settings.audio_volume,
         ..AudioConfig::desktop()
@@ -167,12 +191,14 @@ pub fn run() {
             let handle = app.handle().clone();
             let saved = settings::config_path(&handle).and_then(|path| settings::load(&path));
             let settings = Settings::resolve(defaults, saved, args.into_iter());
-            let audio = AudioEngine::spawn(audio_config_for(&settings));
+            let bundled = bundled_soundfont(&handle);
+            let audio = AudioEngine::spawn(audio_config_for(&settings, bundled.as_deref()));
             let audio_handle = audio.handle();
             app.manage(AppState {
                 client: Mutex::new(None),
                 settings: Mutex::new(settings.clone()),
                 audio: Mutex::new(audio),
+                bundled_soundfont: bundled,
             });
             match start_client(&handle, &settings, audio_handle) {
                 Ok(client) => {
@@ -225,7 +251,7 @@ mod tests {
             audio_volume: 0.25,
             ..sample()
         };
-        let audio = audio_config_for(&settings);
+        let audio = audio_config_for(&settings, None);
         assert_eq!(audio.soundfont, Some(PathBuf::from("/tmp/font.sf2")));
         assert!(!audio.enabled);
         assert_eq!(audio.volume, 0.25);
@@ -233,8 +259,27 @@ mod tests {
 
     #[test]
     fn the_desktop_shell_still_opens_a_device() {
-        let audio = audio_config_for(&sample());
+        let audio = audio_config_for(&sample(), None);
         assert_eq!(audio.device, palace_audio::DeviceMode::Open);
+    }
+
+    #[test]
+    fn the_bundled_font_is_the_default_but_a_saved_choice_wins() {
+        let bundled = PathBuf::from("/opt/palace/resources/soundfonts/GeneralUser-GS.sf2");
+        assert_eq!(
+            audio_config_for(&sample(), Some(&bundled)).soundfont,
+            Some(bundled.clone()),
+            "an unset soundfont falls back to the vendored font"
+        );
+        let chosen = Settings {
+            soundfont: Some(PathBuf::from("/tmp/mine.sf2")),
+            ..sample()
+        };
+        assert_eq!(
+            audio_config_for(&chosen, Some(&bundled)).soundfont,
+            Some(PathBuf::from("/tmp/mine.sf2")),
+            "a saved soundfont beats the vendored fallback"
+        );
     }
 
     #[test]
