@@ -33,7 +33,7 @@ pub fn quantize(channel: u8) -> u32 {
 pub fn encode_s20_payload(image: &PropImage) -> Result<Vec<u8>> {
     let width = image.width() as usize;
     let height = image.height() as usize;
-    if width == 0 || height == 0 || width % 2 != 0 {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) {
         return Err(PropError::UnencodableImage {
             width: image.width(),
             height: image.height(),

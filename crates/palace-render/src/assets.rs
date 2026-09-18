@@ -446,7 +446,7 @@ pub fn placeholder() -> PropImage {
     let mut bytes = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let on = ((x / CELL) + (y / CELL)) % 2 == 0;
+            let on = ((x / CELL) + (y / CELL)).is_multiple_of(2);
             bytes.extend_from_slice(if on {
                 &[255, 0, 255, 200]
             } else {
