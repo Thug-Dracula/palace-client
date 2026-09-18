@@ -13,15 +13,17 @@ use common::*;
 use iptscrae::value::Value;
 use iptscrae::{Chunk, Host, IptError};
 use palace_host::view::{HostView, SpotView};
-use palace_host::{AlarmKind, Effect, PendingAlarm, ScriptHost};
+use palace_host::{AlarmKind, Effect, PendingAlarm, ScriptHost, PALACECHAT_VERSION};
 
 // --------------------------------------------------------------- state getters
 
 #[test]
 fn identity_and_room_getters_answer_from_the_snapshot() {
-    for name in ["ME", "ID", "USERID", "WHOME"] {
+    for name in ["ID", "USERID", "WHOME"] {
         assert_eq!(pushed(name, &[]), ints(&[13]), "{name}");
     }
+    // `ME` is the hotspot the running script belongs to, not the user.
+    assert_eq!(pushed("ME", &[]), ints(&[0]));
     assert_eq!(pushed("USERNAME", &[]), vec![Value::str("RustProbe")]);
     assert_eq!(pushed("SERVERNAME", &[]), vec![Value::str("TestServer")]);
     assert_eq!(pushed("CLIENTTYPE", &[]), vec![Value::str("OPENPALACE")]);
@@ -40,8 +42,24 @@ fn identity_and_room_getters_answer_from_the_snapshot() {
     assert_eq!(pushed("HTTPRECEIVED", &[]), ints(&[0]));
     // Version banners the corpus scripts probe.
     assert_eq!(pushed("OPENPALACE", &[]), ints(&[1]));
-    assert_eq!(pushed("PALACECHAT", &[]), ints(&[1]));
+    assert_eq!(pushed("PALACECHAT", &[]), ints(&[PALACECHAT_VERSION]));
     assert_eq!(pushed("IPTVERSION", &[]), ints(&[2]));
+}
+
+#[test]
+fn me_is_the_scripts_hotspot_not_the_user() {
+    let mut host = populated_host();
+    host.current_spot = 5;
+    assert_eq!(
+        host.command("ME", &[]).unwrap(),
+        ints(&[5]),
+        "ME answers the hotspot the handler is scoped to"
+    );
+    assert_eq!(
+        host.command("USERID", &[]).unwrap(),
+        ints(&[13]),
+        "USERID still answers the user"
+    );
 }
 
 #[test]
@@ -1049,4 +1067,34 @@ fn bad_operands_are_refused_and_record_nothing() {
         host.unsupported
     );
     assert_eq!(host.pen, palace_host::PenState::default());
+}
+
+// ------------------------------------------------- PalaceChat extensions
+
+#[test]
+fn palacechat_reports_a_version_above_every_gate_in_the_corpus() {
+    for threshold in [40913, 41155, 41171, 41182, 42365] {
+        assert!(
+            PALACECHAT_VERSION > threshold,
+            "the corpus gates on {threshold}"
+        );
+    }
+}
+
+#[test]
+fn encodeurl_percent_encodes_like_the_reference() {
+    assert_eq!(
+        pushed("ENCODEURL", &[Value::str("a b/c?d=e&f")]),
+        vec![Value::str("a%20b%2Fc%3Fd%3De%26f")]
+    );
+    assert_eq!(
+        pushed("ENCODEURL", &[Value::str("Az0-_.!~*'()")]),
+        vec![Value::str("Az0-_.!~*'()")],
+        "encodeURIComponent leaves the unreserved set alone"
+    );
+    assert_eq!(
+        pushed("ENCODEURL", &[Value::str("é")]),
+        vec![Value::str("%C3%A9")],
+        "non-ASCII goes out as UTF-8 percent-encoding"
+    );
 }

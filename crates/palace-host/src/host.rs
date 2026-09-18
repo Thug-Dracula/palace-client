@@ -190,6 +190,44 @@ fn text_arg(args: &[Value], index: usize) -> Result<String> {
     }
 }
 
+/// The PalaceChat build number scripts gate features on.
+///
+/// Sparky's `PALACECHAT` pushes the constant 50_000, which clears every
+/// threshold the harvested corpus tests, so gated branches take the modern path.
+pub const PALACECHAT_VERSION: i32 = 50_000;
+
+/// Percent-encode a string the way the reference's `ENCODEURL` does.
+///
+/// Sparky's implementation is `encodeURIComponent`, so the unreserved set is
+/// `A-Za-z0-9-_.!~*'()` and every other byte becomes `%XX` over its UTF-8 bytes.
+#[must_use]
+pub fn encode_url(input: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(byte as char),
+            _ => {
+                out.push('%');
+                out.push(HEX[usize::from(byte >> 4)] as char);
+                out.push(HEX[usize::from(byte & 0x0F)] as char);
+            }
+        }
+    }
+    out
+}
+
 /// Read a `{ ... }` code-block operand.
 ///
 /// The block must carry its recorded inner source; a chunk built without one (a
@@ -334,9 +372,13 @@ impl Host for ScriptHost {
             "LOGMSG" => self.log_message(&text_arg(args, 0)?).map(|_| Vec::new()),
 
             // ------------------------------------------------------ identity
-            "ME" | "ID" | "USERID" | "WHOME" => {
-                Ok(vec![Value::Int(self.get_self_user_id() as i32)])
-            }
+            // `ME` is the hotspot the running script belongs to, not the user
+            // (`MECommand.as` pushes `PalaceIptExecutionContext.hotspotId`). The
+            // arena rooms navigate with `ME DEST GOTOROOM`, so collapsing it into
+            // `USERID` sent them to the destination of a spot id that does not
+            // exist, and left the user id on the stack.
+            "ME" => Ok(vec![Value::Int(self.current_spot)]),
+            "ID" | "USERID" | "WHOME" => Ok(vec![Value::Int(self.get_self_user_id() as i32)]),
             "USERNAME" => Ok(vec![Value::str(self.get_self_user_name())]),
             "SERVERNAME" => Ok(vec![Value::str(self.get_server_name())]),
             "ROOMID" => Ok(vec![Value::Int(self.get_room_id() as i32)]),
@@ -351,7 +393,7 @@ impl Host for ScriptHost {
             ]),
             "CLIENTTYPE" => Ok(vec![Value::str(self.client_type())]),
             "OPENPALACE" => Ok(vec![Value::Int(1)]),
-            "PALACECHAT" => Ok(vec![Value::Int(1)]),
+            "PALACECHAT" => Ok(vec![Value::Int(PALACECHAT_VERSION)]),
             "IPTVERSION" => Ok(vec![Value::Int(2)]),
             "ISGOD" => Ok(vec![Value::Int(i32::from(self.is_god()))]),
             "ISGUEST" => Ok(vec![Value::Int(i32::from(self.is_guest()))]),
@@ -851,6 +893,7 @@ impl Host for ScriptHost {
                 Some(Value::Str(s)) => s.to_string(),
                 _ => String::new(),
             })]),
+            "ENCODEURL" => Ok(vec![Value::str(encode_url(&text_arg(args, 0)?))]),
             "HIDESMILEYS" | "LOCKUSERPROPS" | "AUTOUSERLAYER" | "REMOVEPIC" | "DELPIC"
             | "ROOMZOOM" | "ROOMUNZOOM" | "CIRCLE" | "FILL" | "PAINT" | "TEXT" | "PING"
             | "CLRPROPS" | "SHOWALLPROPS" | "HIDEPROPS" | "SHOWPROPS" | "SETPROPSLOCAL"

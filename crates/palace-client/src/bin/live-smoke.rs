@@ -94,7 +94,8 @@ async fn pump_for(
                     }
                 }
                 if let ClientEvent::Screen { screen } = &event {
-                    if let (Some((rx, ry)), false) = (click_room, *clicked) {
+                    let in_target = target == 0 || screen.room_id == target;
+                    if let (Some((rx, ry)), false, true) = (click_room, *clicked, in_target) {
                         let g = &screen.geometry;
                         let vx = g.content_x + rx * g.scale;
                         let vy = g.content_y + ry * g.scale;

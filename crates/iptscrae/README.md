@@ -302,8 +302,8 @@ Current result (PalaceChat dialect, seed 0):
 | files | 2400 |
 | parsed | **2396 (99.8%)** |
 | handlers | 3805 |
-| ran clean | **3791 (99.6%)** |
-| files fully clean | 2382 (99.4%) |
+| ran clean | **3797 (99.8%)** |
+| files fully clean | 2388 (99.7%) |
 
 ### Failure distribution, by cause
 
@@ -314,8 +314,8 @@ plan — by `iptscrae_palace::classify`, which the report also prints:
 | Class | Parse | Run | Meaning |
 |---|---|---|---|
 | (a) tokenizer gap | 0 | 0 | a character the reference accepts and we reject — **should never be non-zero** |
-| (b) unimplemented command | 0 | 7 | the handler calls an extension this milestone does not ship |
-| (c) semantics / environment | 0 | 7 | the reference agrees with us; the script needed host state we did not provide |
+| (b) unimplemented command | 0 | 0 | the handler calls an extension this milestone does not ship |
+| (c) semantics / environment | 0 | 8 | the reference agrees with us; the script needed host state we did not provide |
 | (d) malformed source | 4 | 0 | the reference tokenizer rejects it too |
 
 **Parse failures (4) — all (d).** All four are genuinely malformed source, not
@@ -326,26 +326,24 @@ them. (a) is zero *by construction*: `reference_accepts` is asserted against the
 lexer's character set in `classify::tests` and is enforced at lex time, so a
   tokenizer gap would have to be a set-membership conflict.
 
-**Run failures (14) — 7 (b), 7 (c).**
+**Run failures (8) — all (c).**
 
-1. **(b) Six `ON ROOMREADY` handlers** (`7022_hs2`, `7028_hs0`, `7030_hs0`,
-   `7031_hs0`, `7034_hs0`, `7035_hs0`) call PalaceChat-5 extensions this crate
-   does not register (`CONFIRMBOX`, `PALACECHAT`, `aptSM`, `setobjsplash`). Each
-   unregistered name lexes as a variable — exactly as it would in OpenPalace,
-   which does not know them either — so the operands they should have consumed
-   shift the stack and the next `IF` sees a string. A later milestone adds them.
-2. **(b) `167_hs0`** names `ENCODEURL`, but the fault actually fires *before*
-   `ENCODEURL`: see the hand trace below.
-   This is the one case where the automatic class and the true cause differ, which
-   is why the report prints the unregistered names next to every failure.
-3. **(c) Five handlers read globals set by a different script** (`144_hs1`,
-   `144_hs2`, `9211_hs2`, `5308_hs4`, `889_hs0`): `hnd EXEC`, `prar EXEC` and
-   friends read a global that another hotspot (or the cyborg) set. The harness
-   isolates globals per file, so those reads see `0`, `EXEC 0` is the documented
-   silent no-op, and the next assignment underflows. Running with
-   `--shared-globals` rescues handlers and changes which ones fail: **3793 of
-   3805 handlers (99.7%) run clean**, and the (c) count falls from 7 to 5.
-4. **(c) The residue under `--shared-globals`** is mixed: some handlers still
+The (b) class is empty: it was the PalaceChat-5 extensions (`CONFIRMBOX`,
+`PALACECHAT`, `ENCODEURL`, `HIDESMILEYS`, `LOCKUSERPROPS`), which are now
+registered with their stack effects sourced from `sparky/index.js` (see the
+`iptscrae-palace` README). Each used to lex as a variable, so the operands it
+should have consumed shifted the stack and the next `IF` saw a string.
+
+1. **(c) The handlers read globals set by a different script** (`144_hs1`,
+   `144_hs2`, `14463_hs2`, `14463_hs3`, `5308_hs4`, `889_hs0`): `hnd EXEC`,
+   `prar EXEC` and friends read a global that another hotspot (or the cyborg) set.
+   The harness isolates globals per file, so those reads see `0`, `EXEC 0` is the
+   documented silent no-op, and the next assignment underflows — or a `&` meets
+   that `0` where the reference, whose `ConcatOperator` likewise refuses a number,
+   expects a string. Running with `--shared-globals` rescues handlers and changes
+   which ones fail: **3799 of 3805 handlers (99.8%) run clean**, and the (c) count
+   falls from 8 to 6.
+2. **(c) The residue under `--shared-globals`** is mixed: some handlers still
    underflow inside a `&` because the global they need is set by a script that is
    not in this corpus directory at all (the harvest is per-hotspot; the room-wide
    script is a separate payload), and others run a `WHILE` past the 7500-iteration

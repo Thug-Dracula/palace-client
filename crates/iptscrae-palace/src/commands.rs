@@ -226,6 +226,22 @@ pub const PALACE_COMMANDS: &[CommandSpec] = &[
     spec("BAN", 1, 0, NONE),
     // Send a kick request for a user; Sparky GS KICK:Uw pops one string.
     spec("KICK", 1, 0, NONE),
+    // ---- PalaceChat version gates -----------------------------------------
+    // The client build scripts gate features on. Sparky's PALACECHAT pushes the
+    // constant 50_000, which clears every threshold the harvested corpus tests
+    // (40913, 41155, 41171, 41182, 42365), so a gated branch takes the modern
+    // path instead of offering a download.
+    spec("PALACECHAT", 0, 1, INT),
+    // Percent-encode a string; Sparky's ENCODEURL wraps `encodeURIComponent`.
+    spec("ENCODEURL", 1, 1, STR),
+    // Ask the user to confirm; Sparky's CONFIRMBOX pops a string and pushes a
+    // 0/1 answer. The corpus calls it as `"message" CONFIRMBOX IF`.
+    spec("CONFIRMBOX", 1, 1, INT),
+    // Suppress smiley rendering. Called bare inside a block by the corpus, so it
+    // consumes nothing; Sparky has no entry for it.
+    spec("HIDESMILEYS", 0, 0, NONE),
+    // Stop other users changing our props. Bare, as above.
+    spec("LOCKUSERPROPS", 0, 0, NONE),
 ];
 
 /// Register every Palace command name as a host command.

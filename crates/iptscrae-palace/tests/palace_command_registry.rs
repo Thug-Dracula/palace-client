@@ -257,10 +257,10 @@ fn register_palace_commands_installs_every_name_and_is_idempotent() {
     assert!(!set.contains("SGLOBAL"), "SGLOBAL is a Palace addition");
 
     let added = register_palace_commands(&mut set);
-    assert_eq!(PALACE_COMMANDS.len(), 121 + 12, "12 sourced additions");
+    assert_eq!(PALACE_COMMANDS.len(), 121 + 17, "17 sourced additions");
     assert_eq!(
         added,
-        120 + 12,
+        120 + 17,
         "ALARMEXEC/IPTVERSION overlap core; SGLOBAL adds one"
     );
     assert_eq!(

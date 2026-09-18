@@ -65,18 +65,17 @@ items in §1–§7 below are wanted but do not gate 1.0.
   found, a script's spot move is local to this client only.
 - [ ] **`durl` (DISPLAYURL) — the one unresolved opcode.** The spec documents a
   body; no server constructs it.
-- [ ] **Register or remove the unregistered fallback names.** The host's fallback
-  arm lists 32 commands it recognises but does not implement; 28 of them are not
-  in `PALACE_COMMANDS`, so a script that calls one lexes the name as a variable
-  and misbehaves quietly. Registering them changes that silent misbehaviour into
-  an explicit report; implementing them is the larger task.
-  - **Blocked on operand counts.** Registering needs pops/pushes per name, and
-    guessing corrupts the stack (see the note at `commands.rs:62`). No reference
-    lists these 28: `reference/docs/iptscrae.txt` and both AS3 trees have none of
-    them, and `repos/sparky/index.js` holds only wire opcodes. The harvested
-    corpus `reference/captures/pat_now.pat` does use `HIDESMILEYS` and
-    `LOCKUSERPROPS`, but bare inside `{ ... }` version guards — evidence of a
-    0-operand call, not proof for the other 26.
+- [ ] **The unregistered fallback names.** The host's fallback arm lists 32
+  commands it recognises but does not implement; 26 of them are still not in
+  `PALACE_COMMANDS`, so a script that calls one lexes the name as a variable and
+  misbehaves quietly. Registering a name turns that into an explicit report.
+  - **Partly sourced.** `HIDESMILEYS` and `LOCKUSERPROPS` are now registered with
+    0 operands, because the harvested corpus calls them bare inside a `{ ... }`
+    version guard. The rest need pops/pushes from a reference: `sparky/index.js`
+    carries a full `GS` command table (it is where `PALACECHAT`, `ENCODEURL` and
+    `CONFIRMBOX` came from), but it has no entry for these 26, and neither does
+    `reference/docs/iptscrae.txt` nor either AS3 tree. Guessing would corrupt the
+    stack (`commands.rs:62`).
 - [ ] **Feedback and send-side opcodes**, in the order a user would notice:
 
   | Opcode | What it would fix |

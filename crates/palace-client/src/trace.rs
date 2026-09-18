@@ -60,6 +60,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use palace_host::{DispatchReport, Effect};
+use palace_room::RoomDesc;
 use palace_wire::byteorder::ByteOrder;
 use palace_wire::frame::Frame;
 use palace_wire::messages::{AssetSpec, Message};
@@ -69,6 +70,9 @@ use crate::runtime::ClientEvent;
 
 /// The environment variable that turns tracing on.
 pub const ENV_VAR: &str = "PALACE_TRACE";
+
+/// The environment variable that turns the hotspot-script dump on.
+pub const DUMP_SCRIPTS_ENV_VAR: &str = "PALACE_DUMP_SCRIPTS";
 
 /// Longest single line the tracer will write before truncating. A script can
 /// echo arbitrarily long chat, and a trace must not grow an unbounded line.
@@ -82,6 +86,8 @@ static SLOT: OnceLock<Mutex<Option<Arc<Tracer>>>> = OnceLock::new();
 static ENV_INIT: Once = Once::new();
 /// Guards the one-off stderr note about a failed tracer.
 static NOTE_ONCE: AtomicBool = AtomicBool::new(false);
+/// Caches the `PALACE_DUMP_SCRIPTS` decision so it is read at most once.
+static DUMP_SCRIPTS: OnceLock<bool> = OnceLock::new();
 
 /// One open trace target.
 ///
@@ -519,6 +525,55 @@ pub fn nav_request(room_id: i32) {
 pub fn worn_props(user_id: i32, props: &[AssetSpec]) {
     if let Some(tracer) = tracer() {
         tracer.worn_props(user_id, props);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PALACE_DUMP_SCRIPTS: the live hotspot-script dump
+// ---------------------------------------------------------------------------
+
+/// Whether the hotspot-script dump is on.
+///
+/// Read once and cached; with `PALACE_DUMP_SCRIPTS` unset every call after the
+/// first is a single atomic-free `OnceLock` load.
+fn dump_scripts_enabled() -> bool {
+    *DUMP_SCRIPTS.get_or_init(|| std::env::var_os(DUMP_SCRIPTS_ENV_VAR).is_some())
+}
+
+/// Print every hotspot's script source in `room` to stderr, verbatim.
+///
+/// Enabled by `PALACE_DUMP_SCRIPTS`; with it unset this returns without
+/// touching stderr, so a normal run stays byte-for-byte unchanged. Each hotspot
+/// gets a header line naming its index, id and name, then its raw source
+/// between `source-begin`/`source-end` markers, so the text can be read back
+/// exactly as the live server sent it.
+pub fn dump_scripts(room: &RoomDesc) {
+    if !dump_scripts_enabled() {
+        return;
+    }
+    let room_id = room.header.room_id;
+    for (index, hotspot) in room.hotspots.iter().enumerate() {
+        let name = hotspot.name.as_deref().unwrap_or("");
+        eprintln!(
+            "palace-dump-scripts: room={room_id} name={:?} hotspot index={index} id={} name={name:?}",
+            room.name, hotspot.id
+        );
+        eprintln!(
+            "palace-dump-scripts: source-begin room={room_id} hotspot={}",
+            hotspot.id
+        );
+        if let Some(source) = hotspot.script.as_deref() {
+            eprint!("{source}");
+            if !source.ends_with('\n') {
+                eprintln!();
+            }
+        } else {
+            eprintln!("palace-dump-scripts: (no script)");
+        }
+        eprintln!(
+            "palace-dump-scripts: source-end room={room_id} hotspot={}",
+            hotspot.id
+        );
     }
 }
 

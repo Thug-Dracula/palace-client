@@ -68,13 +68,16 @@ Event dispatch section in `STATUS.md`). The remaining work in *this* crate is th
 `PalaceCommands` adapter, which the live runtime does not use; `palace-host` wires
 the engine directly.
 
-Two deliberate omissions, both recorded in the `iptscrae` README:
+Two notes on registration, both recorded in the `iptscrae` README:
 
-* **Extended PalaceChat commands** (`WEBEMBED`, `DRAWTEXT`, `CONFIRMBOX`,
-  `PALACECHAT`, `ENCODEURL`, …) are *not* registered. This crate has no source
-  for their stack effects, and a guessed arity would corrupt the stack.
-  Unregistered, they lex as variables — which is what OpenPalace does, since it
-  does not know them either.
+* **The extended commands the corpus needs are registered**, with their stack
+  effects taken from `reference/repos/sparky/index.js`: `PALACECHAT` (the build
+  number scripts gate features on), `ENCODEURL` (its implementation is
+  `encodeURIComponent`), `CONFIRMBOX` (pops a string, pushes a 0/1 answer), and
+  the bare toggles `HIDESMILEYS` / `LOCKUSERPROPS`. Extensions that *no* reference
+  documents (`WEBEMBED`, `DRAWTEXT`, `ALERTBOX`, …) stay unregistered: a guessed
+  arity would corrupt the stack, and unregistered they lex as variables — which
+  is what OpenPalace does too, since it does not know them either.
 * **`SGLOBAL`** *is* registered, as an alias of the core `GLOBAL`. It is not in
   OpenPalace, but the corpus uses `sym SGLOBAL` exactly as `sym GLOBAL`, and `IF`
   only balances if `SGLOBAL` consumes one operand.
@@ -96,8 +99,8 @@ classification of every failure.
 
 `--shared-globals` runs the whole corpus through one global store instead of
 isolating each file, which is how a real session behaves. It rescues handlers and
-changes which ones fail: **3793 of 3805 handlers (99.7%) run clean** with sharing,
-against 3791 without, and the (c) failure count falls from 7 to 5. Both modes are
+changes which ones fail: **3799 of 3805 handlers (99.8%) run clean** with sharing,
+against 3797 without, and the (c) failure count falls from 8 to 6. Both modes are
 gated by `tests/corpus.rs` when `IPTSCRAE_CORPUS` is set.
 
 ## Command surface

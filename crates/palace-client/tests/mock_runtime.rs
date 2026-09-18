@@ -3907,6 +3907,10 @@ fn a_click_on_a_lockable_door_that_is_locked_is_still_refused() {
         "the click landed on the door: {:?}",
         notes(&events)
     );
+    assert!(
+        sent_room_goto(&server, order).is_none(),
+        "a refused locked-door click must not request a room change"
+    );
 
     handle.disconnect();
     drop(server);
@@ -4010,6 +4014,184 @@ fn a_click_on_a_door_sends_the_room_change_to_its_destination() {
             .iter()
             .any(|text| text.contains("locked door")),
         "a plain door is never refused: {:?}",
+        notes(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_click_on_a_door_with_no_handler_navigates_to_its_destination() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let door = room
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot.hotspot_type == 1
+                && hotspot.dest != 0
+                && !hotspot
+                    .script
+                    .as_deref()
+                    .is_some_and(|script| script.contains("ON SELECT"))
+        })
+        .expect("room 901 has a door no script claims");
+    assert_eq!(door.hotspot_type, 1, "HS_Door");
+    assert_eq!(door.dest, 1100, "the door's destination room");
+    assert!(
+        door.script
+            .as_deref()
+            .is_some_and(|script| script.contains("ON LEAVE")),
+        "the fixture door has only an ON LEAVE handler, so its click runs no select"
+    );
+
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, room_desc_payload(&fixture))
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("door-auto-nav-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901)
+        .expect("a frame was composed for room 901");
+    assert!(
+        sent_room_goto(&server, order).is_none(),
+        "the client asked to change rooms before the door was clicked"
+    );
+
+    let (x, y) = hotspot_click(door, screen);
+    handle.set_mouse(300, 200);
+    handle.click(x, y);
+
+    assert!(
+        wait_for(
+            || sent_room_goto(&server, order) == Some(door.dest as u16),
+            Duration::from_secs(10)
+        ),
+        "a door with no SELECT handler must send its destination: {:?}",
+        server.received_frames(order)
+    );
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "LEAVE" && run.fired >= 1)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        script_runs(&events)
+            .iter()
+            .any(|run| run.event == "LEAVE" && run.fired >= 1),
+        "navigating away ran the room's ON LEAVE handlers: {:?}",
+        script_runs(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_door_with_a_select_handler_does_not_auto_navigate() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("25567");
+    let room = palace_room::decode_payload(&payload, order).expect("room 25567 decodes");
+    let door = room
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot.hotspot_type == 1
+                && hotspot.dest != 0
+                && hotspot.script.as_deref().is_some_and(|script| {
+                    script.contains("ON SELECT") && !script.contains("GOTOROOM")
+                })
+        })
+        .expect("room 25567 has a door whose ON SELECT does not change rooms");
+    assert_eq!(door.hotspot_type, 1, "HS_Door");
+    assert_ne!(door.dest, 0, "the door has a destination to ignore");
+
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("door-select-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 25567)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 25567)
+        .expect("a frame was composed for room 25567");
+
+    let (x, y) = hotspot_click(door, screen);
+    handle.set_mouse(300, 200);
+    handle.click(x, y);
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "SELECT" && run.fired >= 1)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        script_runs(&events)
+            .iter()
+            .any(|run| run.event == "SELECT" && run.fired >= 1),
+        "the door's own ON SELECT ran: {:?}",
+        notes(&events)
+    );
+    assert!(
+        sent_room_goto(&server, order).is_none(),
+        "a handler ran for the click, so the client must not also navigate"
+    );
+    assert!(
+        !notes(&events)
+            .iter()
+            .any(|text| text.contains("is a door to room")),
+        "no auto-navigation was reported: {:?}",
         notes(&events)
     );
 

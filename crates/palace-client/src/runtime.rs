@@ -46,7 +46,7 @@ use crate::secret::Secret;
 use crate::session::{Connection, POLL_SLICE};
 use crate::state::{
     ChatKind, ChatLine, ConnectionStatus, RoomInfo, ScriptStimulus, ServerBanner, SessionState,
-    UserInfo, HS_LOCK,
+    UserInfo, HS_LOCK, HS_UNLOCK,
 };
 
 const MEDIA_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
@@ -61,6 +61,9 @@ const HS_DOOR: i16 = 1;
 /// `HS_LockableDoor` (3): "a door that can be locked" (:1667). The only door
 /// whose `state` may mean `HS_Lock`.
 const HS_LOCKABLE_DOOR: i16 = 3;
+/// `HS_ShutableDoor` (2): a door whose states are its opened/closed pictures.
+/// Only the unlocked state leads anywhere; the closed state refuses.
+const HS_SHUTABLE_DOOR: i16 = 2;
 
 /// How to reach a server and what to draw with.
 #[derive(Debug, Clone)]
@@ -773,12 +776,7 @@ fn run_session(
         let mut resync = false;
         while let Ok(command) = cmd_rx.try_recv() {
             match command {
-                ClientCommand::GotoRoom(id) => {
-                    if let Ok(mut guard) = shared.last_room.lock() {
-                        *guard = Some(id);
-                    }
-                    goto = Some(id);
-                }
+                ClientCommand::GotoRoom(id) => goto = Some(id),
                 ClientCommand::Say(text) => say = Some(text),
                 ClientCommand::Click { x, y } => click_pending = Some((x, y)),
                 ClientCommand::MouseMove { x, y } => mousemove_pending = Some((x, y)),
@@ -902,25 +900,15 @@ fn run_session(
         }
 
         if let Some(room_id) = goto {
-            if occupied_room {
-                crate::trace::room_leave(state.current_room.as_ref().map(|room| room.id));
-                for event in run_dispatch(
-                    &mut scripts,
-                    ScriptEvent::Leave,
-                    &mut state,
-                    shared,
-                    &mut conn,
-                    &mut dirty_render,
-                    None,
-                ) {
-                    shared.emit(event);
-                }
-                occupied_room = false;
-            }
-            state.begin_room_change();
-            crate::trace::nav_request(room_id);
-            conn.send(&state.navigate_frame(room_id))?;
-            dirty_render = true;
+            request_room(
+                room_id,
+                &mut scripts,
+                &mut state,
+                shared,
+                &mut conn,
+                &mut dirty_render,
+                &mut occupied_room,
+            )?;
         }
         if let Some(text) = say {
             let (events, rewritten) = run_chat_dispatch(
@@ -985,9 +973,11 @@ fn run_session(
                     // SELECT handlers, so the pointer must be at the click before
                     // the handler runs - Colosseum 7774 ejects when x is below 78.
                     shared.set_mouse(rx, ry);
-                    let view = host_view(&state, shared);
-                    match view.spot_at(rx, ry).map(|spot| spot.id) {
-                        Some(id) => {
+                    let hit = host_view(&state, shared)
+                        .spot_at(rx, ry)
+                        .map(|spot| (spot.id, spot.kind, spot.dest, spot.state));
+                    match hit {
+                        Some((id, kind, dest, spot_state)) => {
                             shared.note(format!(
                                 "script: click at room ({rx},{ry}) hit hotspot {id}"
                             ));
@@ -996,7 +986,7 @@ fn run_session(
                                     "script: hotspot {id} is a locked door, click refused"
                                 ));
                             } else {
-                                for event in run_dispatch(
+                                let (events, fired) = run_dispatch_report(
                                     &mut scripts,
                                     ScriptEvent::Select,
                                     &mut state,
@@ -1004,8 +994,25 @@ fn run_session(
                                     &mut conn,
                                     &mut dirty_render,
                                     Some(id),
-                                ) {
+                                );
+                                for event in events {
                                     shared.emit(event);
+                                }
+                                if !fired {
+                                    if let Some(room) = door_destination(kind, dest, spot_state) {
+                                        shared.note(format!(
+                                            "script: hotspot {id} is a door to room {room}"
+                                        ));
+                                        request_room(
+                                            room,
+                                            &mut scripts,
+                                            &mut state,
+                                            shared,
+                                            &mut conn,
+                                            &mut dirty_render,
+                                            &mut occupied_room,
+                                        )?;
+                                    }
                                 }
                             }
                         }
@@ -1145,6 +1152,7 @@ fn run_session(
                         crate::trace::room_arrived(room.id, &room.name);
                         if let Some(desc) = state.room_desc.clone() {
                             refresh_asset_facts(&state, &builder, &mut fact_cache, shared);
+                            crate::trace::dump_scripts(&desc);
                             scripts.load_room(&desc);
                             for problem in &scripts.problems {
                                 shared.note(format!(
@@ -1992,7 +2000,63 @@ fn run_dispatch(
     dirty_render: &mut bool,
     only: Option<i32>,
 ) -> Vec<ClientEvent> {
+    run_event(scripts, event, state, shared, conn, dirty_render, only, 0).0
+}
+
+/// Like [`run_dispatch`], but also says whether any script declared the event.
+///
+/// The click path needs this: the reference auto-navigates a door only when no
+/// handler ran for the click, so it must see [`DispatchReport::fired`], which
+/// the event list alone cannot express.
+fn run_dispatch_report(
+    scripts: &mut ScriptEngine,
+    event: ScriptEvent,
+    state: &mut SessionState,
+    shared: &Arc<Shared>,
+    conn: &mut Connection,
+    dirty_render: &mut bool,
+    only: Option<i32>,
+) -> (Vec<ClientEvent>, bool) {
     run_event(scripts, event, state, shared, conn, dirty_render, only, 0)
+}
+
+/// Send the room-change request for `room_id` and reset the room being left.
+///
+/// The `/goto` command and a click on an unclaimed door both run this, so the
+/// `ON LEAVE` handlers fire and the `navR` frame goes out once, the same
+/// lifecycle the reference's `PalaceClient.gotoRoom` runs.
+fn request_room(
+    room_id: i32,
+    scripts: &mut ScriptEngine,
+    state: &mut SessionState,
+    shared: &Arc<Shared>,
+    conn: &mut Connection,
+    dirty_render: &mut bool,
+    occupied_room: &mut bool,
+) -> Result<()> {
+    if let Ok(mut guard) = shared.last_room.lock() {
+        *guard = Some(room_id);
+    }
+    if *occupied_room {
+        crate::trace::room_leave(state.current_room.as_ref().map(|room| room.id));
+        for event in run_dispatch(
+            scripts,
+            ScriptEvent::Leave,
+            state,
+            shared,
+            conn,
+            dirty_render,
+            None,
+        ) {
+            shared.emit(event);
+        }
+        *occupied_room = false;
+    }
+    state.begin_room_change();
+    crate::trace::nav_request(room_id);
+    conn.send(&state.navigate_frame(room_id))?;
+    *dirty_render = true;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2005,13 +2069,14 @@ fn run_event(
     dirty_render: &mut bool,
     only: Option<i32>,
     depth: u32,
-) -> Vec<ClientEvent> {
+) -> (Vec<ClientEvent>, bool) {
     scripts.set_view(host_view(state, shared));
     let report = match only {
         Some(spot) => scripts.fire_spot(event, spot),
         None => scripts.fire(event),
     };
     crate::trace::dispatch(&report, only);
+    let fired = report.fired();
     let mut out = Vec::new();
     for run in &report.runs {
         if let Some(error) = &run.error {
@@ -2045,21 +2110,24 @@ fn run_event(
                 text: "script: nested dispatch capped".to_string(),
             });
         }
-        return out;
+        return (out, fired);
     }
     for (next, next_only) in follow {
-        out.extend(run_event(
-            scripts,
-            next,
-            state,
-            shared,
-            conn,
-            dirty_render,
-            next_only,
-            depth + 1,
-        ));
+        out.extend(
+            run_event(
+                scripts,
+                next,
+                state,
+                shared,
+                conn,
+                dirty_render,
+                next_only,
+                depth + 1,
+            )
+            .0,
+        );
     }
-    out
+    (out, fired)
 }
 
 /// Run an `ON INCHAT` / `ON OUTCHAT` handler and return what `CHATSTR` became.
@@ -3050,6 +3118,23 @@ fn is_locked_door(state: &mut SessionState, spot: i32) -> bool {
         .is_some_and(|hotspot| state_means_locked(hotspot.hotspot_type, hotspot.state))
 }
 
+/// The room a clicked door-type hotspot leads to when no handler claimed the
+/// click, or `None` when the click must stay put.
+///
+/// This is the reference's fallback (`HotSpotSprite.handleHotSpotMouseDown`):
+/// a `TYPE_PASSAGE` with a destination goes, and `TYPE_SHUTABLE_DOOR` /
+/// `TYPE_LOCKABLE_DOOR` go only while unlocked. An ordinary spot, a bolt and a
+/// nav area never navigate, whatever their `dest`.
+fn door_destination(kind: i32, dest: i32, state: i32) -> Option<i32> {
+    match kind {
+        k if k == i32::from(HS_DOOR) => (dest != 0).then_some(dest),
+        k if k == i32::from(HS_SHUTABLE_DOOR) || k == i32::from(HS_LOCKABLE_DOOR) => {
+            (state == i32::from(HS_UNLOCK) && dest != 0).then_some(dest)
+        }
+        _ => None,
+    }
+}
+
 /// `SETLOC` / `SETLOCLOCAL`: `x y` are the spot's new absolute position, so this
 /// replaces `loc`. `MSG_SPOTMOVE` carries a position rather than a delta, the
 /// reference server assigns it, and OpenPalace changed its own implementation
@@ -3443,6 +3528,59 @@ mod tests {
                 !state_means_locked(other, 1),
                 "type {other} state 1 is a picture selector, not a lock, so its click must not be refused"
             );
+        }
+    }
+
+    #[test]
+    fn a_plain_door_always_leads_to_a_nonzero_destination() {
+        assert_eq!(
+            door_destination(i32::from(HS_DOOR), 5009, 0),
+            Some(5009),
+            "a passage with a destination navigates however it is drawn"
+        );
+        assert_eq!(
+            door_destination(i32::from(HS_DOOR), 5009, 1),
+            Some(5009),
+            "a plain door's state is a picture selector, so state 1 still navigates"
+        );
+        assert_eq!(
+            door_destination(i32::from(HS_DOOR), 0, 0),
+            None,
+            "a door with dest 0 goes nowhere"
+        );
+    }
+
+    #[test]
+    fn an_unlocked_shutable_or_lockable_door_leads_to_its_destination() {
+        for kind in [HS_SHUTABLE_DOOR, HS_LOCKABLE_DOOR] {
+            assert_eq!(
+                door_destination(i32::from(kind), 5009, i32::from(HS_UNLOCK)),
+                Some(5009),
+                "unlocked type {kind} navigates"
+            );
+            assert_eq!(
+                door_destination(i32::from(kind), 5009, i32::from(HS_LOCK)),
+                None,
+                "a locked/closed type {kind} must not navigate"
+            );
+            assert_eq!(
+                door_destination(i32::from(kind), 0, i32::from(HS_UNLOCK)),
+                None,
+                "type {kind} with dest 0 goes nowhere"
+            );
+        }
+    }
+
+    #[test]
+    fn a_normal_bolt_or_navarea_spot_never_navigates_however_it_is_marked() {
+        for kind in [0, 4, 5] {
+            for state in [0, 1] {
+                assert_eq!(
+                    door_destination(kind, 5009, state),
+                    None,
+                    "type {kind} is not a door, so state {state} with a dest must not navigate"
+                );
+            }
         }
     }
 
