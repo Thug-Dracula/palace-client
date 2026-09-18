@@ -6,10 +6,14 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use iptscrae::{Host, Value};
-use palace_host::{Effect, HostView, LoosePropView, ScriptHost, SpotView, UserView};
+use palace_host::{
+    AssetFacts, Effect, HostView, LoosePropView, PropFacts, ScriptHost, SpotView, UserView,
+};
 use palace_room::{Hotspot, RoomDesc, RoomRec};
 use palace_wire::byteorder::ByteOrder;
 use palace_wire::{frame::Frame, opcode};
@@ -95,7 +99,7 @@ pub fn populated_view() -> HostView {
                 name: "Door".to_owned(),
                 state: 1,
                 nbr_states: 2,
-                state_pics: vec![(1, 2, 3)],
+                state_pics: vec![(1, 2, 3), (2, 4, 5)],
                 loc: (50, 60),
                 ..SpotView::default()
             },
@@ -128,6 +132,18 @@ pub fn populated_view() -> HostView {
                 y: 40,
             },
         ],
+        assets: Arc::new(AssetFacts {
+            pic_dims: BTreeMap::from([(1, (10, 20)), (2, (30, 40))]),
+            prop_facts: BTreeMap::from([(
+                7,
+                PropFacts {
+                    width: 100,
+                    height: 50,
+                    h_offset: 40,
+                    v_offset: 25,
+                },
+            )]),
+        }),
     }
 }
 

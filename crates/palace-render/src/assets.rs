@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use palace_prop::{decode, PropImage};
+use palace_prop::{decode, decode_header, PropHeader, PropImage, HEADER_LEN};
 
 use crate::error::{AssetNote, RenderError};
 
@@ -345,6 +345,33 @@ impl PropStore {
         }
     }
 
+    /// Read only the 12-byte header of `id`, without pulling its pixel payload.
+    ///
+    /// `None` when the id is absent, the stored blob is shorter than a header,
+    /// or the header does not parse.
+    #[must_use]
+    pub fn header(&self, id: u32) -> Option<PropHeader> {
+        let backend = self.blobs.get(&id)?;
+        let mut buf = [0u8; HEADER_LEN];
+        match backend {
+            PropBackend::File(path) => {
+                use std::io::Read;
+                let mut file = std::fs::File::open(path).ok()?;
+                file.read_exact(&mut buf).ok()?;
+            }
+            PropBackend::Roster { path, offset, .. } => {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut file = std::fs::File::open(path).ok()?;
+                file.seek(SeekFrom::Start(*offset)).ok()?;
+                file.read_exact(&mut buf).ok()?;
+            }
+            PropBackend::Memory(bytes) => {
+                buf.copy_from_slice(bytes.get(..HEADER_LEN)?);
+            }
+        }
+        decode_header(&buf).ok()
+    }
+
     /// Insert a prop blob handed over live, replacing any existing entry for `id`.
     ///
     /// Returns whether an entry already existed. Used by clients that receive
@@ -567,6 +594,28 @@ mod tests {
         assert_eq!(n, 1);
         assert!(store.contains(1234));
         assert_eq!(store.blob(1234).as_deref(), Some(prop.as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_prop_header_is_read_without_its_payload() {
+        let blob = [
+            4u8, 0, 1, 0, 7, 0, 5, 0, 0, 0, 0, 0, 0x04, 0x01, 0x01, 0x01, 0x01,
+        ];
+        let dir = tempdir("header");
+        std::fs::write(dir.join("4242_unnamed.bin"), blob).expect("write");
+        let mut store = PropStore::new();
+        store.add_directory(&dir);
+        let header = store.header(4242).expect("header parses");
+        assert_eq!((header.width, header.height), (4, 1));
+        assert_eq!((header.h_offset, header.v_offset), (7, 5));
+        assert!(store.header(1).is_none(), "an absent id has no header");
+
+        let mut memory = PropStore::new();
+        memory.insert_blob(7, blob.to_vec());
+        let header = memory.header(7).expect("memory header parses");
+        assert_eq!((header.width, header.height), (4, 1));
+        assert_eq!((header.h_offset, header.v_offset), (7, 5));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

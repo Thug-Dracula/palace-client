@@ -74,6 +74,13 @@ items in §1–§7 below are wanted but do not gate 1.0.
   in `PALACE_COMMANDS`, so a script that calls one lexes the name as a variable
   and misbehaves quietly. Registering them changes that silent misbehaviour into
   an explicit report; implementing them is the larger task.
+  - **Blocked on operand counts.** Registering needs pops/pushes per name, and
+    guessing corrupts the stack (see the note at `commands.rs:62`). No reference
+    lists these 28: `reference/docs/iptscrae.txt` and both AS3 trees have none of
+    them, and `repos/sparky/index.js` holds only wire opcodes. The harvested
+    corpus `reference/captures/pat_now.pat` does use `HIDESMILEYS` and
+    `LOCKUSERPROPS`, but bare inside `{ ... }` version guards — evidence of a
+    0-operand call, not proof for the other 26.
 - [ ] **Feedback and send-side opcodes**, in the order a user would notice:
 
   | Opcode | What it would fix |
@@ -91,6 +98,12 @@ items in §1–§7 below are wanted but do not gate 1.0.
 - [ ] **The remaining draw commands.** `CIRCLE`, `FILL`, `PAINT` and `TEXT` are
   not implemented, and `DRAW`'s text operands have a layout the references leave
   undetermined.
+  - **The four names are reference-absent.** The AS3 `command/` tree implements
+    only `LINE`/`LINETO`/`PEN*`/`PAINTCLEAR`/`PAINTUNDO`, and QPalace's IPT table
+    has none of the four, so their operand counts and effects cannot be
+    reference-derived (`commands.rs:62` forbids guessing; `TEXT` is not
+    `DRAWTEXT`). They stay unregistered. The recoverable part of this item is the
+    wire `DC_Text` operand layout.
 - [ ] **A data-driven face grid.** The grid (13 faces × 16 colours × 44 px) is
   hardcoded in the renderer, the protocol constant and the avatar picker;
   describing it in a data file and loading art from a folder like every other
@@ -121,8 +134,11 @@ dialect. What remains:
 
 - [ ] **No live run.** The script-level chain is proven; nobody has watched the
   arena accept a player. That needs a human at the app.
-- [ ] `ADDSPOT` reads its points through `props_arg`, which keeps integers only;
-  the reference also accepts quoted numeric strings.
+- [x] **Quoted numeric strings are accepted.** `ADDSPOT`'s polygon operand is read
+  by `point_list_arg`, which parses a `Value::Str` as a base-10 integer, so the
+  quoted forms the extended dialect accepts (`"10"`) work; a non-numeric string
+  is still dropped. `SETPROPS` keeps the strict reader, because the reference
+  resolves a string operand there as a prop *name*, not a number.
 - [ ] `SETSPOTSCRIPT` matches a literal uppercase `ON`, like the reference
   parser; a lowercase `on` in an existing source is not a handler to either.
 
@@ -142,16 +158,24 @@ dialect. What remains:
   read-only reference `pserver.prp`.
 - [ ] **`ASSET_REGI`.** Decide whether uploading a worn prop's art is required
   for the server to accept the prop, or whether `USER_PROP` alone suffices.
-- [ ] **The constant prop stubs.** `GETPICDIMENSIONS` returns `(0, 0)`;
-  `PROPDIMENSIONS`/`PROPOFFSETS` push zeros and `has_prop_by_name` returns
-  false. `GETPICDIMENSIONS` needs a source of picture dimensions (the PNG
-  `IHDR`, or the decode already done), a `pict_id → (w, h)` map in `HostView`,
-  and the runtime populating it before dispatch. `PROPDIMENSIONS`/`PROPOFFSETS`
-  need the equivalent for props.
-- [ ] **`LOADPROPS`** is effect-free by design (a prefetch with a 500-id limit).
-  The real gaps are the 500-limit error the reference throws (we accept anything
-  silently) and the prefetch itself, which needs a prop store the host cannot
-  reach yet — the same plumbing the dimension work needs.
+- [x] **The prop and picture geometry stubs are implemented.**
+  `GETPICDIMENSIONS` resolves a spot and state (a negative state means the spot's
+  current one) to its picture's size; `PROPDIMENSIONS` and `PROPOFFSETS` read a
+  prop header (`PROPOFFSETS` less the reference's 22). The data reaches the host
+  as an immutable `AssetFacts` snapshot carried in `HostView`, built by the
+  runtime from decoded media and prop headers and cached on `Shared` — the script
+  dispatch path only clones an `Arc`. Anything not yet loaded answers `(0, 0)`.
+  `has_prop_by_name` stays false on purpose; the reference's is too.
+  - **`GETPICLOC` aligned too.** It now resolves a negative state to the spot's
+    current state (shared with `GETPICDIMENSIONS`), where it previously clamped
+    to index 0.
+- [ ] **`LOADPROPS` records nothing, but now validates.** It stays effect-free by
+  design (a cache warm-up), and its operand is now checked as the reference
+  checks it: more than 500 ids is refused (*"You may only load up to 500 props at
+  a time."*), a non-integer element is refused (*"Only Prop IDs are allowed to be
+  specified for LOADPROPS."*), and a non-array operand is a type error. The
+  prefetch itself still needs a prop store the host cannot reach — the same
+  plumbing the dimension work needs.
 
 ---
 

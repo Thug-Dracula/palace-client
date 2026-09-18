@@ -178,6 +178,14 @@ pub trait PalaceHost: Host {
     fn get_pic_dimensions(&self, _spot: i64, _state: i64) -> (i64, i64) {
         (0, 0)
     }
+    /// A prop's size (`PROPDIMENSIONS`).
+    fn get_prop_dimensions(&self, _prop: i64) -> (i64, i64) {
+        (0, 0)
+    }
+    /// A prop's origin offsets, less the avatar half-size (`PROPOFFSETS`).
+    fn get_prop_offsets(&self, _prop: i64) -> (i64, i64) {
+        (0, 0)
+    }
     /// Set a spot's state for everyone (`SETSPOTSTATE`).
     fn set_spot_state(&mut self, _spot: i64, _state: i64) -> Result<()> {
         Err(unavailable("SETSPOTSTATE"))

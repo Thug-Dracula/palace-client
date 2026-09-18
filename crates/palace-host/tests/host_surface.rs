@@ -69,7 +69,13 @@ fn resolvers_no_command_reaches_still_answer() {
     assert!(!host.has_prop_by_name("hat"));
     assert!(host.has_prop_by_id(7));
     assert!(!host.has_prop_by_id(99));
-    assert_eq!(host.get_pic_dimensions(5, 0), (0, 0));
+    assert_eq!(host.get_pic_dimensions(5, 0), (10, 20));
+    assert_eq!(host.get_pic_dimensions(5, -1), (30, 40));
+    assert_eq!(host.get_pic_dimensions(99, 0), (0, 0));
+    assert_eq!(host.get_prop_dimensions(7), (100, 50));
+    assert_eq!(host.get_prop_offsets(7), (18, 3));
+    assert_eq!(host.get_prop_dimensions(12345), (0, 0));
+    assert_eq!(host.get_prop_offsets(12345), (0, 0));
     assert_eq!(host.get_num_spots(), 3);
 }
 

@@ -4,7 +4,32 @@
 //! state before each dispatch, so a script never borrows the network thread's
 //! structures and dispatch stays a pure function of `(view, scripts, event)`.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use palace_room::{Hotspot, RoomDesc};
+
+/// The dimensions and origin offsets a prop header carries.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PropFacts {
+    /// Prop width in pixels.
+    pub width: i32,
+    /// Prop height in pixels.
+    pub height: i32,
+    /// Horizontal origin offset.
+    pub h_offset: i32,
+    /// Vertical origin offset.
+    pub v_offset: i32,
+}
+
+/// Asset facts a script can answer geometry questions from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AssetFacts {
+    /// Image size per picture id.
+    pub pic_dims: BTreeMap<i32, (i32, i32)>,
+    /// Header facts per prop asset id.
+    pub prop_facts: BTreeMap<i64, PropFacts>,
+}
 
 /// A user currently in the room.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -167,6 +192,8 @@ pub struct HostView {
     pub spots: Vec<SpotView>,
     /// Loose props on the floor.
     pub loose_props: Vec<LoosePropView>,
+    /// Geometry facts resolved from media files and prop blobs.
+    pub assets: Arc<AssetFacts>,
 }
 
 impl HostView {
@@ -239,6 +266,50 @@ impl HostView {
     pub fn self_in_spot(&self, id: i32) -> bool {
         self.spot(id)
             .is_some_and(|s| s.contains(self.self_x, self.self_y))
+    }
+
+    /// The picture id and origin offset a spot/state pair selects.
+    ///
+    /// A negative state selects the spot's current state; a missing spot or an
+    /// out-of-range state selects nothing.
+    fn state_image(&self, spot: i32, state: i32) -> Option<(i32, i32, i32)> {
+        let spot = self.spot(spot)?;
+        let state = if state < 0 { spot.state } else { state };
+        let index = usize::try_from(state).ok()?;
+        spot.state_pics.get(index).copied()
+    }
+
+    /// The image size of a hotspot state (`GETPICDIMENSIONS`).
+    #[must_use]
+    pub fn pic_dimensions(&self, spot: i32, state: i32) -> (i32, i32) {
+        self.state_image(spot, state)
+            .and_then(|(pict_id, _, _)| self.assets.pic_dims.get(&pict_id).copied())
+            .unwrap_or((0, 0))
+    }
+
+    /// The image origin of a hotspot state (`GETPICLOC`).
+    #[must_use]
+    pub fn pic_offset(&self, spot: i32, state: i32) -> (i32, i32) {
+        self.state_image(spot, state)
+            .map_or((0, 0), |(_, dx, dy)| (dx, dy))
+    }
+
+    /// A prop's size (`PROPDIMENSIONS`).
+    #[must_use]
+    pub fn prop_dimensions(&self, prop: i64) -> (i32, i32) {
+        self.assets
+            .prop_facts
+            .get(&prop)
+            .map_or((0, 0), |facts| (facts.width, facts.height))
+    }
+
+    /// A prop's origin offsets, less the avatar half-size (`PROPOFFSETS`).
+    #[must_use]
+    pub fn prop_offsets(&self, prop: i64) -> (i32, i32) {
+        self.assets
+            .prop_facts
+            .get(&prop)
+            .map_or((0, 0), |facts| (facts.h_offset - 22, facts.v_offset - 22))
     }
 
     /// The id of the single door-like spot, if the room has exactly one.

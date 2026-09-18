@@ -274,8 +274,14 @@ local to this client only.
   font at all, or when one will not load, MIDI plays a synthesized fallback tone
   rather than going silent. Audibility is proven headlessly; hearing it needs a
   human once.
-- **Constant stubs.** `GETPICDIMENSIONS` returns `(0, 0)`, `PROPDIMENSIONS` and
-  `PROPOFFSETS` push zeros, and `has_prop_by_name` returns false.
+- **Prop and picture geometry.** `GETPICDIMENSIONS`, `PROPDIMENSIONS` and
+  `PROPOFFSETS` answer from a per-room `AssetFacts` snapshot the runtime builds
+  from decoded media and prop headers — pictures keyed by picture id, props by
+  asset id — and `PROPOFFSETS` subtracts 22 as the reference does. Asking about a
+  picture, state or prop the client has not loaded still answers `(0, 0)`.
+  `has_prop_by_name` returning false is *not* a gap: the reference's own
+  `hasPropByName` is a hard-coded `false` (`PalaceController.as:484`), and no
+  prop-name source exists to answer better.
 - **No prop panel.** `set_props` is exposed and reachable, but nothing in the
   interface calls it, so worn props are still changed only from the console or a
   script.

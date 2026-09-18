@@ -98,9 +98,10 @@ fn lookups_clamp_bad_indices_instead_of_panicking() {
     assert_eq!(pushed("GETSPOTSTATE", &ints(&[99])), ints(&[0]));
     assert_eq!(pushed("SPOTDEST", &ints(&[5])), ints(&[817]));
     assert_eq!(pushed("GETPICLOC", &ints(&[5, 0])), ints(&[2, 3]));
+    assert_eq!(pushed("GETPICLOC", &ints(&[5, -1])), ints(&[4, 5]));
     assert_eq!(pushed("GETPICLOC", &ints(&[5, 9])), ints(&[0, 0]));
     assert_eq!(pushed("GETPICLOC", &ints(&[99, 0])), ints(&[0, 0]));
-    assert_eq!(pushed("GETPICDIMENSIONS", &ints(&[5, 0])), ints(&[0, 0]));
+    assert_eq!(pushed("GETPICDIMENSIONS", &ints(&[5, 0])), ints(&[10, 20]));
     // Props.
     assert_eq!(pushed("USERPROP", &ints(&[0])), ints(&[7]));
     assert_eq!(pushed("USERPROP", &ints(&[1])), ints(&[9]));
@@ -165,9 +166,24 @@ fn islocked_needs_a_lockable_kind_and_the_locked_state() {
 }
 
 #[test]
-fn prop_dimensions_and_offsets_are_stubbed_with_two_numbers() {
-    assert_eq!(pushed("PROPDIMENSIONS", &ints(&[7])), ints(&[0, 0]));
-    assert_eq!(pushed("PROPOFFSETS", &ints(&[7])), ints(&[0, 0]));
+fn getpicdimensions_resolves_a_state_to_its_picture_size() {
+    assert_eq!(pushed("GETPICDIMENSIONS", &ints(&[5, 0])), ints(&[10, 20]));
+    assert_eq!(pushed("GETPICDIMENSIONS", &ints(&[5, 1])), ints(&[30, 40]));
+    assert_eq!(
+        pushed("GETPICDIMENSIONS", &ints(&[5, -1])),
+        ints(&[30, 40]),
+        "-1 selects the spot's current state, which is 1"
+    );
+    assert_eq!(pushed("GETPICDIMENSIONS", &ints(&[99, 0])), ints(&[0, 0]));
+    assert_eq!(pushed("GETPICDIMENSIONS", &ints(&[5, 9])), ints(&[0, 0]));
+}
+
+#[test]
+fn prop_dimensions_and_offsets_come_from_asset_facts() {
+    assert_eq!(pushed("PROPDIMENSIONS", &ints(&[7])), ints(&[100, 50]));
+    assert_eq!(pushed("PROPOFFSETS", &ints(&[7])), ints(&[18, 3]));
+    assert_eq!(pushed("PROPDIMENSIONS", &ints(&[12345])), ints(&[0, 0]));
+    assert_eq!(pushed("PROPOFFSETS", &ints(&[12345])), ints(&[0, 0]));
 }
 
 #[test]
@@ -381,6 +397,48 @@ fn addspot_drops_a_dangling_odd_coordinate_instead_of_panicking() {
 }
 
 #[test]
+fn addspot_accepts_quoted_numeric_strings_in_the_point_array() {
+    let mut host = populated_host();
+    let points = Value::array(vec![
+        Value::str("0"),
+        Value::str("0"),
+        Value::str("10"),
+        Value::Int(0),
+        Value::str(" 10 "),
+        Value::str("10"),
+    ]);
+    host.command("ADDSPOT", &[points, Value::Int(1), Value::Int(2)])
+        .expect("command succeeds");
+    let effects = host.take_effects();
+    match effects.as_slice() {
+        [Effect::AddSpot { points, .. }] => {
+            assert_eq!(points, &vec![(0, 0), (10, 0), (10, 10)]);
+        }
+        other => panic!("expected one AddSpot, got {other:?}"),
+    }
+}
+
+#[test]
+fn addspot_drops_a_non_numeric_string_element() {
+    let mut host = populated_host();
+    let points = Value::array(vec![
+        Value::Int(1),
+        Value::Int(2),
+        Value::str("oops"),
+        Value::Int(3),
+        Value::Int(4),
+        Value::Int(5),
+    ]);
+    host.command("ADDSPOT", &[points, Value::Int(1), Value::Int(2)])
+        .expect("command succeeds");
+    let effects = host.take_effects();
+    match effects.as_slice() {
+        [Effect::AddSpot { points, .. }] => assert_eq!(points, &vec![(1, 2), (3, 4)]),
+        other => panic!("expected one AddSpot, got {other:?}"),
+    }
+}
+
+#[test]
 fn addpic_records_the_filename_and_target_spot() {
     assert_eq!(
         effect_of("ADDPIC", &[Value::str("stage.png"), Value::Int(2)]),
@@ -525,11 +583,42 @@ fn prop_commands_record_their_effects() {
     assert_eq!(effect_of("CLEARPROPS", &[]), Effect::Naked);
     // LOADPROPS is a cache warm-up: it records nothing.
     let mut host = populated_host();
+    let warm_up = Value::array(vec![Value::Int(7), Value::Int(9)]);
     assert_eq!(
-        host.command("LOADPROPS", &ints(&[7, 9])).unwrap(),
+        host.command("LOADPROPS", std::slice::from_ref(&warm_up))
+            .unwrap(),
         Vec::new()
     );
     assert!(host.effects.is_empty());
+}
+
+#[test]
+fn loadprops_validates_its_array() {
+    let mut host = populated_host();
+
+    let too_many = Value::array((0..501i32).map(Value::Int).collect());
+    let error = host
+        .command("LOADPROPS", std::slice::from_ref(&too_many))
+        .expect_err("501 ids exceed the cap");
+    assert!(error.to_string().contains("500"), "{error}");
+
+    let with_name = Value::array(vec![Value::Int(1), Value::str("hat")]);
+    let error = host
+        .command("LOADPROPS", std::slice::from_ref(&with_name))
+        .expect_err("a name is not a prop id");
+    assert!(error.to_string().contains("Prop IDs"), "{error}");
+
+    let error = host
+        .command("LOADPROPS", &ints(&[7]))
+        .expect_err("an array is required");
+    assert!(error.to_string().contains("array"), "{error}");
+
+    let ok = Value::array(vec![Value::Int(1), Value::Int(2)]);
+    assert_eq!(
+        host.command("LOADPROPS", std::slice::from_ref(&ok))
+            .unwrap(),
+        Vec::new()
+    );
 }
 
 #[test]

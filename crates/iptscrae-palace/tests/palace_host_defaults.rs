@@ -105,6 +105,8 @@ fn prop_getters_default_to_zero_false_and_empty() {
     assert_eq!(host.get_user_prop(0), 0, "USERPROP");
     assert_eq!(host.get_num_user_props(), 0, "NBRUSERPROPS");
     assert_eq!(host.get_prop_id_by_name("hat"), 0, "DONPROP by name");
+    assert_eq!(host.get_prop_dimensions(3), (0, 0), "PROPDIMENSIONS");
+    assert_eq!(host.get_prop_offsets(3), (0, 0), "PROPOFFSETS");
     assert!(!host.has_prop_by_id(3), "HASPROP");
     assert!(!host.has_prop_by_name("hat"), "HASPROP");
 }

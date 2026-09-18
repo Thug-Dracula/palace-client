@@ -218,19 +218,33 @@ fn loose_int(args: &[Value], index: usize) -> Result<i64> {
 }
 
 fn props_arg(args: &[Value], index: usize) -> Vec<i64> {
+    int_list(args, index, false)
+}
+
+/// The `ADDSPOT` polygon operand: like [`props_arg`], but a quoted numeric
+/// string counts as its number, which the extended dialect relies on.
+fn point_list_arg(args: &[Value], index: usize) -> Vec<i64> {
+    int_list(args, index, true)
+}
+
+fn int_list(args: &[Value], index: usize, quoted_numbers: bool) -> Vec<i64> {
     match args.get(index) {
         Some(Value::Array(items)) => match items.try_borrow() {
-            Ok(items) => items.iter().filter_map(as_int).collect(),
+            Ok(items) => items
+                .iter()
+                .filter_map(|value| as_int(value, quoted_numbers))
+                .collect(),
             Err(_) => Vec::new(),
         },
-        Some(other) => as_int(other).into_iter().collect(),
+        Some(other) => as_int(other, quoted_numbers).into_iter().collect(),
         None => Vec::new(),
     }
 }
 
-fn as_int(value: &Value) -> Option<i64> {
+fn as_int(value: &Value, quoted_numbers: bool) -> Option<i64> {
     match value {
         Value::Int(n) => Some(i64::from(*n)),
+        Value::Str(s) if quoted_numbers => s.trim().parse::<i64>().ok(),
         _ => None,
     }
 }
@@ -414,7 +428,14 @@ impl Host for ScriptHost {
             "NBRLOOSEPROPS" => Ok(vec![Value::Int(self.get_num_loose_props() as i32)]),
             "MOUSEX" => Ok(vec![Value::Int(self.get_mouse_x() as i32)]),
             "MOUSEY" => Ok(vec![Value::Int(self.get_mouse_y() as i32)]),
-            "PROPDIMENSIONS" | "PROPOFFSETS" => Ok(stub_values(pushes.max(2), Push::Int)),
+            "PROPDIMENSIONS" => {
+                let (w, h) = self.get_prop_dimensions(int_arg(args, 0)?);
+                Ok(vec![Value::Int(w as i32), Value::Int(h as i32)])
+            }
+            "PROPOFFSETS" => {
+                let (x, y) = self.get_prop_offsets(int_arg(args, 0)?);
+                Ok(vec![Value::Int(x as i32), Value::Int(y as i32)])
+            }
             "HTTPRECEIVED" => Ok(vec![Value::Int(0)]),
             "DOORIDX" => Ok(vec![Value::Int(
                 self.get_door_id_by_index(int_arg(args, 0)?) as i32,
@@ -496,7 +517,7 @@ impl Host for ScriptHost {
                 self.unimplemented(name, pushes, push)
             }
             "ADDSPOT" => {
-                let flat = props_arg(args, 0);
+                let flat = point_list_arg(args, 0);
                 let x = int_arg(args, 1)?;
                 let y = int_arg(args, 2)?;
                 let points: Vec<(i32, i32)> = flat
@@ -620,7 +641,28 @@ impl Host for ScriptHost {
                 });
                 Ok(Vec::new())
             }
-            "LOADPROPS" => Ok(Vec::new()),
+            "LOADPROPS" => {
+                let Some(Value::Array(items)) = args.first() else {
+                    return Err(IptError::TypeMismatch {
+                        expected: "an array of prop IDs",
+                        found: args.first().map_or("nothing", Value::type_name),
+                    });
+                };
+                let Ok(items) = items.try_borrow() else {
+                    return Ok(Vec::new());
+                };
+                if items.len() > 500 {
+                    return Err(IptError::BadArgument(
+                        "You may only load up to 500 props at a time.",
+                    ));
+                }
+                if items.iter().any(|item| !matches!(item, Value::Int(_))) {
+                    return Err(IptError::BadArgument(
+                        "Only Prop IDs are allowed to be specified for LOADPROPS.",
+                    ));
+                }
+                Ok(Vec::new())
+            }
 
             // ------------------------------------------------------ movement
             "SETPOS" => {
@@ -998,14 +1040,23 @@ impl PalaceHost for ScriptHost {
     }
 
     fn get_pic_offset(&self, spot: i64, state: i64) -> (i64, i64) {
-        self.view
-            .spot(spot as i32)
-            .and_then(|s| s.state_pics.get(state.max(0) as usize))
-            .map_or((0, 0), |(_, dx, dy)| (i64::from(*dx), i64::from(*dy)))
+        let (x, y) = self.view.pic_offset(spot as i32, state as i32);
+        (i64::from(x), i64::from(y))
     }
 
-    fn get_pic_dimensions(&self, _spot: i64, _state: i64) -> (i64, i64) {
-        (0, 0)
+    fn get_pic_dimensions(&self, spot: i64, state: i64) -> (i64, i64) {
+        let (w, h) = self.view.pic_dimensions(spot as i32, state as i32);
+        (i64::from(w), i64::from(h))
+    }
+
+    fn get_prop_dimensions(&self, prop: i64) -> (i64, i64) {
+        let (w, h) = self.view.prop_dimensions(prop);
+        (i64::from(w), i64::from(h))
+    }
+
+    fn get_prop_offsets(&self, prop: i64) -> (i64, i64) {
+        let (x, y) = self.view.prop_offsets(prop);
+        (i64::from(x), i64::from(y))
     }
 
     fn set_spot_state(&mut self, spot: i64, state: i64) -> Result<()> {

@@ -5,6 +5,7 @@
 //! arrive over a channel, results leave as [`ClientEvent`]s, and the current
 //! frame lands in a shared [`FrameStore`] that the presentation layer reads.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -17,8 +18,8 @@ use palace_asset::{
     ScriptOutcome, UreqTransport,
 };
 use palace_host::{
-    effect_frame, move_target, Effect, HostView, PenState, ScriptEngine, ScriptEvent, UserView,
-    WireContext,
+    effect_frame, move_target, AssetFacts, Effect, HostView, PenState, PropFacts, ScriptEngine,
+    ScriptEvent, UserView, WireContext,
 };
 use palace_render::{
     clamp_avatar_position, clamp_dpr, render, AnimationClock, AvatarSpec, ChatStyle, ChatText,
@@ -264,6 +265,7 @@ struct Shared {
     debug_frames: bool,
     last_room: Mutex<Option<i32>>,
     transform: Mutex<Option<ViewTransform>>,
+    assets: Mutex<Arc<AssetFacts>>,
     mouse: Mutex<(i32, i32)>,
     room_size: Mutex<(f64, f64)>,
 }
@@ -309,6 +311,20 @@ impl Shared {
         match self.transform.lock() {
             Ok(guard) => *guard,
             Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn set_assets(&self, assets: Arc<AssetFacts>) {
+        match self.assets.lock() {
+            Ok(mut guard) => *guard = assets,
+            Err(poisoned) => *poisoned.into_inner() = assets,
+        }
+    }
+
+    fn assets(&self) -> Arc<AssetFacts> {
+        match self.assets.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -496,6 +512,7 @@ impl ClientRuntime {
             debug_frames: std::env::var_os("PALACE_DEBUG_FRAMES").is_some(),
             last_room: Mutex::new(None),
             transform: Mutex::new(None),
+            assets: Mutex::new(Arc::new(AssetFacts::default())),
             mouse: Mutex::new((0, 0)),
             room_size: Mutex::new((512.0, 384.0)),
         });
@@ -725,6 +742,8 @@ fn run_session(
     let mut last_asset_request = Instant::now() - MEDIA_REQUEST_INTERVAL;
     let mut props_received = 0usize;
     let mut restored_room = false;
+    let mut fact_cache = FactCache::default();
+    let mut facts_dirty = true;
 
     loop {
         let mut goto: Option<i32> = None;
@@ -1053,16 +1072,25 @@ fn run_session(
                 for outbound in &applied.outbound {
                     let _ = conn.send(outbound);
                 }
+                let mut drain = DrainCtx {
+                    props_received: &mut props_received,
+                    dirty_render: &mut dirty_render,
+                    cache: &mut fact_cache,
+                    facts_dirty: &mut facts_dirty,
+                };
                 for event in drain_pipeline(
                     &mut pipeline,
                     &mut builder,
                     &mut conn,
                     &mut workspace,
-                    &mut props_received,
-                    &mut dirty_render,
+                    &mut drain,
                     pipeline_events.drain(..),
                 ) {
                     shared.emit(event);
+                }
+                if facts_dirty {
+                    facts_dirty = false;
+                    refresh_asset_facts(&state, &builder, &mut fact_cache, shared);
                 }
                 if applied.banner {
                     shared.emit(ClientEvent::Banner {
@@ -1095,6 +1123,7 @@ fn run_session(
                         shared.emit(ClientEvent::RoomEntered { room: room.clone() });
                         crate::trace::room_arrived(room.id, &room.name);
                         if let Some(desc) = state.room_desc.clone() {
+                            refresh_asset_facts(&state, &builder, &mut fact_cache, shared);
                             scripts.load_room(&desc);
                             for problem in &scripts.problems {
                                 shared.note(format!(
@@ -1218,13 +1247,18 @@ fn run_session(
         }
 
         pipeline_events.extend(pipeline.poll(now));
+        let mut drain = DrainCtx {
+            props_received: &mut props_received,
+            dirty_render: &mut dirty_render,
+            cache: &mut fact_cache,
+            facts_dirty: &mut facts_dirty,
+        };
         for event in drain_pipeline(
             &mut pipeline,
             &mut builder,
             &mut conn,
             &mut workspace,
-            &mut props_received,
-            &mut dirty_render,
+            &mut drain,
             pipeline_events.into_iter(),
         ) {
             shared.emit(event);
@@ -1236,11 +1270,16 @@ fn run_session(
                     builder.media_mut().insert_path(&name, path);
                     shared.note(format!("fetched media {name}"));
                     dirty_render = true;
+                    facts_dirty = true;
                 }
                 MediaResult::Failed { name, error } => {
                     shared.note(format!("media {name} failed: {error}"));
                 }
             }
+        }
+        if facts_dirty {
+            facts_dirty = false;
+            refresh_asset_facts(&state, &builder, &mut fact_cache, shared);
         }
 
         let ticks = (now * 60 / 1000) as i64;
@@ -1373,13 +1412,80 @@ fn build_scene_builder(workspace: &AssetWorkspace, cfg: &ClientConfig) -> SceneB
     SceneBuilder::new(media, props)
 }
 
+/// Facts resolved so far, so an unchanged image or prop is never re-read.
+#[derive(Default)]
+struct FactCache {
+    pic_dims: HashMap<String, (i32, i32)>,
+    prop_facts: BTreeMap<i64, PropFacts>,
+}
+
+/// The mutable side effects a pipeline drain produces.
+struct DrainCtx<'a> {
+    props_received: &'a mut usize,
+    dirty_render: &'a mut bool,
+    cache: &'a mut FactCache,
+    facts_dirty: &'a mut bool,
+}
+
+/// Resolve the room's images and the room-relevant props into [`AssetFacts`].
+///
+/// Only names not already decoded and ids not already read are touched: this is
+/// the sole place geometry is decoded, never the script dispatch path.
+fn refresh_asset_facts(
+    state: &SessionState,
+    builder: &SceneBuilder,
+    cache: &mut FactCache,
+    shared: &Arc<Shared>,
+) {
+    let mut facts = AssetFacts::default();
+
+    if let Some(room) = &state.room_desc {
+        for picture in &room.pictures {
+            let Some(name) = &picture.name else {
+                continue;
+            };
+            let key = name.to_ascii_lowercase();
+            if !cache.pic_dims.contains_key(&key) {
+                if let Ok(image) = builder.media().load(name) {
+                    cache
+                        .pic_dims
+                        .insert(key.clone(), (image.width() as i32, image.height() as i32));
+                }
+            }
+            if let Some(dims) = cache.pic_dims.get(&key) {
+                facts.pic_dims.insert(i32::from(picture.pic_id), *dims);
+            }
+        }
+
+        let mut ids: Vec<u32> = room.loose_props.iter().map(|p| p.spec.id).collect();
+        for user in state.users_in_room() {
+            ids.extend(user.props.iter().copied());
+        }
+        for id in ids {
+            let key = i64::from(id);
+            if let std::collections::btree_map::Entry::Vacant(entry) = cache.prop_facts.entry(key) {
+                if let Some(header) = builder.props().header(id) {
+                    entry.insert(PropFacts {
+                        width: i32::from(header.width),
+                        height: i32::from(header.height),
+                        h_offset: i32::from(header.h_offset),
+                        v_offset: i32::from(header.v_offset),
+                    });
+                }
+            }
+        }
+    }
+
+    facts.prop_facts = cache.prop_facts.clone();
+    shared.set_assets(Arc::new(facts));
+}
+
 fn drain_pipeline(
     pipeline: &mut AssetPipeline,
     builder: &mut SceneBuilder,
     conn: &mut Connection,
     workspace: &mut AssetWorkspace,
-    props_received: &mut usize,
-    dirty_render: &mut bool,
+    ctx: &mut DrainCtx,
     events: impl Iterator<Item = PipelineEvent>,
 ) -> Vec<ClientEvent> {
     let mut out = Vec::new();
@@ -1396,10 +1502,22 @@ fn drain_pipeline(
                     let dest = workspace.props_dir().join(format!("{}.bin", key.id));
                     let _ = std::fs::write(&dest, &blob);
                     builder.props_mut().insert_blob(key.id as u32, blob);
-                    *props_received += 1;
-                    *dirty_render = true;
+                    if let Some(header) = builder.props().header(key.id as u32) {
+                        ctx.cache.prop_facts.insert(
+                            i64::from(key.id),
+                            PropFacts {
+                                width: i32::from(header.width),
+                                height: i32::from(header.height),
+                                h_offset: i32::from(header.h_offset),
+                                v_offset: i32::from(header.v_offset),
+                            },
+                        );
+                        *ctx.facts_dirty = true;
+                    }
+                    *ctx.props_received += 1;
+                    *ctx.dirty_render = true;
                     out.push(ClientEvent::Note {
-                        text: format!("received prop #{} ({} total)", key.id, *props_received),
+                        text: format!("received prop #{} ({} total)", key.id, *ctx.props_received),
                     });
                 }
             }
@@ -1659,6 +1777,7 @@ fn host_view(state: &SessionState, shared: &Arc<Shared>) -> HostView {
         room_height: room_h,
         server_name: state.banner.name.clone().unwrap_or_default(),
         mouse: (mouse_x, mouse_y),
+        assets: shared.assets(),
         ..HostView::default()
     };
     if let Some(room) = &state.room_desc {
@@ -3401,6 +3520,40 @@ mod tests {
         state
     }
 
+    #[test]
+    fn refresh_asset_facts_records_a_received_prop_header() {
+        let mut state = session_in_room();
+        let prop_id = 987_654u32;
+        state.users.get_mut(&SELF_ID).expect("self").props = vec![prop_id];
+
+        let mut builder = SceneBuilder::new(MediaStore::default(), PropStore::new());
+        let mut blob = vec![0u8; 12];
+        blob[0] = 44;
+        blob[2] = 44;
+        blob[4] = 7;
+        blob[6] = 5;
+        builder.props_mut().insert_blob(prop_id, blob);
+
+        let shared = test_shared();
+        let mut cache = FactCache::default();
+        refresh_asset_facts(&state, &builder, &mut cache, &shared);
+
+        let facts = shared.assets();
+        let header = facts
+            .prop_facts
+            .get(&i64::from(prop_id))
+            .expect("prop facts");
+        assert_eq!(
+            (
+                header.width,
+                header.height,
+                header.h_offset,
+                header.v_offset
+            ),
+            (44, 44, 7, 5)
+        );
+    }
+
     fn loose_ids(state: &SessionState) -> Vec<u32> {
         state
             .room_desc
@@ -4047,6 +4200,7 @@ mod tests {
             debug_frames: false,
             last_room: Mutex::new(None),
             transform: Mutex::new(None),
+            assets: Mutex::new(Arc::new(AssetFacts::default())),
             mouse: Mutex::new((0, 0)),
             room_size: Mutex::new((512.0, 384.0)),
         })
