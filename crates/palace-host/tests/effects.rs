@@ -225,6 +225,37 @@ fn every_effect() -> Vec<(Effect, &'static str, bool, &'static str)> {
             false,
             "SETPICOPACITY spot=2 state=1 0.50",
         ),
+        (
+            Effect::AddSpot {
+                id: 6,
+                points: vec![(0, 0), (10, 0), (10, 10)],
+                x: 20,
+                y: 30,
+            },
+            "ADDSPOT",
+            false,
+            "ADDSPOT id=6 at (20,30) [3 points]",
+        ),
+        (
+            Effect::AddPic {
+                spot: 2,
+                name: "stage.png".to_owned(),
+            },
+            "ADDPIC",
+            false,
+            "ADDPIC spot=2 \"stage.png\"",
+        ),
+        (
+            Effect::SetSpotOptions {
+                spot: 5,
+                hotspot_type: 3,
+                flags: 0x40,
+                top_layer: true,
+            },
+            "SETSPOTOPTIONS",
+            false,
+            "SETSPOTOPTIONS spot=5 type=3 flags=64 top_layer=true",
+        ),
         (Effect::Lock { spot: 4 }, "LOCK", true, "LOCK 4"),
         (Effect::Unlock { spot: 4 }, "UNLOCK", true, "UNLOCK 4"),
         (Effect::SelectSpot { spot: 5 }, "SELECT", false, "SELECT 5"),

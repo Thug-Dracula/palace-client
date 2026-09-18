@@ -6,8 +6,14 @@
 //!
 //! ## The rules, as implemented
 //!
-//! * Whitespace is space, tab, CR and LF. A NUL byte ends the script (the
-//!   reference client stops at `charCodeAt(0) == 0`).
+//! * Whitespace is space, tab, CR and LF. **As the `comma_separator` corpus
+//!   extension, a `,` also separates tokens exactly like a space**: the
+//!   reference `IptParser.as` has no comma branch and would throw "Unexpected
+//!   character", but the live server serves bodies that separate values with
+//!   commas — `media_custo2.txt`'s arena line is
+//!   `[1000,0 537,0 ...] 0,0 ADDSPOT` — and those scripts MUST lex. A comma is
+//!   never an operator and never a value, only a separator. A NUL byte ends the
+//!   script (the reference client stops at `charCodeAt(0) == 0`).
 //! * `#` and `;` begin a comment that runs to end of line, inside or outside an
 //!   atomlist. A `}` inside a comment does not close an atomlist.
 //! * `{ ... }` is an atomlist and nests. No whitespace is required around the
@@ -58,7 +64,7 @@ pub fn parse_script(source: &str, commands: &CommandSet, limits: &Limits) -> Res
     loop {
         match lexer.peek() {
             None => break,
-            Some(c) if Lexer::is_whitespace(c) => {
+            Some(c) if Lexer::separates_tokens(c) => {
                 lexer.bump();
             }
             Some('#') | Some(';') => lexer.skip_line_comment(),
@@ -129,8 +135,23 @@ impl<'a> Lexer<'a> {
         Some(c)
     }
 
+    /// Real whitespace, as the reference tokenizer defines it.
     fn is_whitespace(c: char) -> bool {
         matches!(c, ' ' | '\t' | '\r' | '\n')
+    }
+
+    /// Whether `c` separates tokens.
+    ///
+    /// This is whitespace **plus the `comma_separator` corpus extension**.
+    /// The reference `IptParser.as` has no comma branch, so a comma would be an
+    /// "Unexpected character" there; but the live Colosseum server serves
+    /// scripts whose bodies use `x,y` separators (`media_custo2.txt`'s arena
+    /// line), and the production tokenizer is forced to handle them explicitly.
+    /// A comma separates exactly like a space — it is never an operator and
+    /// never a value. Only token *separation* uses this predicate; string
+    /// literals and comments still consume commas verbatim.
+    fn separates_tokens(c: char) -> bool {
+        Self::is_whitespace(c) || c == ','
     }
 
     fn skip_line_comment(&mut self) {
@@ -145,7 +166,7 @@ impl<'a> Lexer<'a> {
     fn skip_trivia(&mut self) {
         loop {
             match self.peek() {
-                Some(c) if Self::is_whitespace(c) => {
+                Some(c) if Self::separates_tokens(c) => {
                     self.bump();
                 }
                 Some('#') | Some(';') => self.skip_line_comment(),
@@ -161,7 +182,7 @@ impl<'a> Lexer<'a> {
         loop {
             match self.peek() {
                 None => return String::new(),
-                Some(c) if Self::is_whitespace(c) => {
+                Some(c) if Self::separates_tokens(c) => {
                     self.bump();
                 }
                 Some('#') | Some(';') => self.skip_line_comment(),
@@ -238,7 +259,8 @@ impl<'a> Lexer<'a> {
             return Err(IptError::HandlerBodyMissing { offset });
         }
         self.bump();
-        self.lex_until(Some('}'), depth, offset)
+        let inner_start = self.pos;
+        self.lex_until(Some('}'), depth, offset, Some(inner_start))
     }
 
     /// Parse a bare body: instructions to end of input.
@@ -249,10 +271,16 @@ impl<'a> Lexer<'a> {
             });
         }
         let offset = self.pos;
-        self.lex_until(None, depth, offset)
+        self.lex_until(None, depth, offset, None)
     }
 
-    fn lex_until(&mut self, terminator: Option<char>, depth: usize, start: usize) -> Result<Chunk> {
+    fn lex_until(
+        &mut self,
+        terminator: Option<char>,
+        depth: usize,
+        start: usize,
+        inner_start: Option<usize>,
+    ) -> Result<Chunk> {
         let mut ops = Vec::new();
         let mut array_depth: i32 = 0;
         loop {
@@ -267,8 +295,16 @@ impl<'a> Lexer<'a> {
                 Some(c) => c,
             };
             if Some(c) == terminator {
+                let close = self.pos;
                 self.bump();
-                return Ok(Chunk::new(ops, start as u32));
+                return match inner_start {
+                    Some(inner_start) => Ok(Chunk::with_source(
+                        ops,
+                        start as u32,
+                        &self.src[inner_start..close],
+                    )),
+                    None => Ok(Chunk::new(ops, start as u32)),
+                };
             }
             match c {
                 '{' => {
@@ -583,10 +619,137 @@ mod tests {
     }
 
     #[test]
+    fn blocks_record_the_text_between_their_braces() {
+        let ops = body("{ 1 2 + }");
+        let Op::Chunk(c) = &ops[0] else {
+            panic!("expected a chunk")
+        };
+        assert_eq!(c.source(), Some(" 1 2 + "));
+        assert_eq!(
+            c.offset(),
+            0,
+            "the offset still points at the opening brace"
+        );
+
+        let ops = body("{glued}");
+        let Op::Chunk(c) = &ops[0] else {
+            panic!("expected a chunk")
+        };
+        assert_eq!(c.source(), Some("glued"));
+    }
+
+    #[test]
+    fn nested_blocks_record_their_own_inner_source() {
+        let ops = body("{ outer { inner } tail }");
+        let Op::Chunk(outer) = &ops[0] else {
+            panic!("expected an outer chunk")
+        };
+        assert_eq!(outer.source(), Some(" outer { inner } tail "));
+        let Op::Chunk(inner) = &outer.ops()[1] else {
+            panic!("expected an inner chunk")
+        };
+        assert_eq!(inner.source(), Some(" inner "));
+    }
+
+    #[test]
+    fn block_source_keeps_strings_and_comments_verbatim() {
+        let ops = body("{ \"a } b\" # not a close\n 1 }");
+        let Op::Chunk(c) = &ops[0] else {
+            panic!("expected a chunk")
+        };
+        assert_eq!(c.source(), Some(" \"a } b\" # not a close\n 1 "));
+    }
+
+    #[test]
+    fn a_bare_body_has_no_source_text() {
+        let chunk = parse_body("1 2 +", &set(), &Limits::default()).expect("parses");
+        assert_eq!(chunk.source(), None);
+    }
+
+    #[test]
     fn arrays_emit_marks() {
         let ops = body("[ 1 2 ]");
         assert!(matches!(ops[0], Op::Mark));
         assert!(matches!(ops[3], Op::ArrayClose));
+    }
+
+    /// `comma_separator` corpus extension: a comma separates tokens like a
+    /// space. Reference `IptParser.as` has no comma branch.
+    #[test]
+    fn comma_separator_splits_integers() {
+        let ops = body("1,2");
+        assert_eq!(ops.len(), 2, "a comma is not an operator and not a value");
+        assert!(matches!(ops[0], Op::Int(1)));
+        assert!(matches!(ops[1], Op::Int(2)));
+    }
+
+    #[test]
+    fn comma_separator_inside_an_array() {
+        let ops = body("[1000,0 537,0]");
+        let ints: Vec<i32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Int(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ints, vec![1000, 0, 537, 0], "x,y pairs stay in order");
+        assert!(matches!(ops[0], Op::Mark));
+        assert!(matches!(ops.last(), Some(Op::ArrayClose)));
+    }
+
+    #[test]
+    fn comma_separator_lexes_the_real_arena_prefix() {
+        let mut s = set();
+        s.register_host("ADDSPOT");
+        let ops = parse_body(
+            "[1000,0 537,0 537,363 933,363 933,396 1000,396] 0,0 ADDSPOT",
+            &s,
+            &Limits::default(),
+        )
+        .expect("the media_custo2 arena line lexes")
+        .ops()
+        .to_vec();
+
+        let ints: Vec<i32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Int(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ints,
+            vec![1000, 0, 537, 0, 537, 363, 933, 363, 933, 396, 1000, 396, 0, 0],
+            "six polygon x,y pairs, then the spot's x,y"
+        );
+        assert!(
+            matches!(ops.last(), Some(Op::Host(n)) if &**n == "ADDSPOT"),
+            "the trailing command is a single host op, not a comma artifact"
+        );
+        assert_eq!(
+            ops.iter().filter(|op| matches!(op, Op::Host(_))).count(),
+            1,
+            "a comma never produces a command"
+        );
+    }
+
+    #[test]
+    fn comma_inside_a_string_is_a_literal() {
+        let ops = body("\"@934,442 hi\"");
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0], Op::Str(s) if &**s == "@934,442 hi"));
+    }
+
+    #[test]
+    fn comma_inside_a_comment_is_ignored() {
+        let ops = body("1 ; 2,3 not tokens\n4");
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], Op::Int(1)));
+        assert!(matches!(ops[1], Op::Int(4)));
+
+        let ops = body("1 # 2,3 not tokens\n4");
+        assert_eq!(ops.len(), 2);
     }
 
     #[test]

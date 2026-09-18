@@ -320,6 +320,194 @@ fn spot_mutation_commands_record_their_effects() {
     );
 }
 
+#[test]
+fn addspot_allocates_distinct_ids_and_records_the_polygon() {
+    let mut host = populated_host();
+    let polygon = || {
+        Value::array(vec![
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(10),
+            Value::Int(0),
+            Value::Int(10),
+            Value::Int(10),
+        ])
+    };
+    let first = host
+        .command("ADDSPOT", &[polygon(), Value::Int(20), Value::Int(30)])
+        .expect("command succeeds");
+    let second = host
+        .command("ADDSPOT", &[polygon(), Value::Int(40), Value::Int(50)])
+        .expect("command succeeds");
+    assert_eq!(
+        first,
+        ints(&[6]),
+        "seeded from the fixture's highest id (5)"
+    );
+    assert_eq!(second, ints(&[7]));
+    assert_ne!(first, second, "two ADDSPOTs in one handler differ");
+    assert_eq!(
+        host.take_effects(),
+        vec![
+            Effect::AddSpot {
+                id: 6,
+                points: vec![(0, 0), (10, 0), (10, 10)],
+                x: 20,
+                y: 30,
+            },
+            Effect::AddSpot {
+                id: 7,
+                points: vec![(0, 0), (10, 0), (10, 10)],
+                x: 40,
+                y: 50,
+            },
+        ]
+    );
+}
+
+#[test]
+fn addspot_drops_a_dangling_odd_coordinate_instead_of_panicking() {
+    let mut host = populated_host();
+    let points = Value::array(vec![Value::Int(3), Value::Int(4), Value::Int(5)]);
+    let pushed = host
+        .command("ADDSPOT", &[points, Value::Int(1), Value::Int(2)])
+        .expect("command succeeds");
+    assert_eq!(pushed, ints(&[6]));
+    let effects = host.take_effects();
+    match effects.as_slice() {
+        [Effect::AddSpot { points, .. }] => assert_eq!(points, &vec![(3, 4)]),
+        other => panic!("expected one AddSpot, got {other:?}"),
+    }
+}
+
+#[test]
+fn addpic_records_the_filename_and_target_spot() {
+    assert_eq!(
+        effect_of("ADDPIC", &[Value::str("stage.png"), Value::Int(2)]),
+        Effect::AddPic {
+            spot: 2,
+            name: "stage.png".to_owned()
+        }
+    );
+}
+
+#[test]
+fn setspotoptions_maps_its_four_operands() {
+    assert_eq!(
+        effect_of("SETSPOTOPTIONS", &ints(&[0x40, 1, 3, 5])),
+        Effect::SetSpotOptions {
+            spot: 5,
+            hotspot_type: 3,
+            flags: 0x40,
+            top_layer: true,
+        }
+    );
+    assert_eq!(
+        effect_of("SETSPOTOPTIONS", &ints(&[0x40, 0, 0, 2])),
+        Effect::SetSpotOptions {
+            spot: 2,
+            hotspot_type: 0,
+            flags: 0x40,
+            top_layer: false,
+        }
+    );
+}
+
+/// Lex `{ <source> }` and return the block value, source text included.
+fn lexed_block(source: &str) -> Value {
+    let body = iptscrae::parse_body(
+        &format!("{{{source}}}"),
+        &palace_commands(),
+        &iptscrae::Limits::default(),
+    )
+    .expect("a block lexes");
+    match body.ops() {
+        [iptscrae::Op::Chunk(chunk)] => Value::Chunk(chunk.clone()),
+        other => panic!("expected exactly one block, got {other:?}"),
+    }
+}
+
+#[test]
+fn setspotscript_maps_the_block_event_and_spot() {
+    assert_eq!(
+        effect_of(
+            "SETSPOTSCRIPT",
+            &[
+                lexed_block(" 0 NUMSPOTS "),
+                Value::str("select"),
+                Value::Int(5),
+            ],
+        ),
+        Effect::SetSpotScript {
+            spot: 5,
+            event: "SELECT".to_owned(),
+            script: " 0 NUMSPOTS ".to_owned(),
+        },
+        "args are the block, the event name, then the spot"
+    );
+}
+
+#[test]
+fn setspotscript_requires_a_block_with_recorded_source() {
+    let mut host = populated_host();
+    let error = host
+        .command(
+            "SETSPOTSCRIPT",
+            &[Value::Int(1), Value::str("SELECT"), Value::Int(1)],
+        )
+        .expect_err("a number is not a code block");
+    assert!(matches!(error, IptError::TypeMismatch { .. }));
+
+    let mut host = populated_host();
+    let error = host
+        .command(
+            "SETSPOTSCRIPT",
+            &[
+                Value::Chunk(Chunk::new(Vec::new(), 0)),
+                Value::str("SELECT"),
+                Value::Int(1),
+            ],
+        )
+        .expect_err("a chunk with no recorded source cannot name a handler");
+    assert!(matches!(error, IptError::TypeMismatch { .. }));
+}
+
+#[test]
+fn setspotscript_validates_the_event_name_in_bytes() {
+    let block = lexed_block(" 1 ");
+    let too_long = "x".repeat(31);
+    let mut host = populated_host();
+    for bad in ["", "A", too_long.as_str()] {
+        let error = host
+            .command(
+                "SETSPOTSCRIPT",
+                &[block.clone(), Value::str(bad), Value::Int(1)],
+            )
+            .expect_err("an event name outside 2..=30 bytes is an error");
+        assert!(
+            matches!(error, IptError::BadArgument(_)),
+            "{bad:?} must be rejected, got {error:?}"
+        );
+    }
+    assert!(
+        host.effects.is_empty(),
+        "a rejected command records nothing"
+    );
+
+    let max = "x".repeat(30);
+    for good in ["ON", max.as_str()] {
+        let mut host = populated_host();
+        let pushed = host
+            .command(
+                "SETSPOTSCRIPT",
+                &[block.clone(), Value::str(good), Value::Int(1)],
+            )
+            .expect("an event name of 2..=30 bytes is accepted");
+        assert!(pushed.is_empty());
+        assert_eq!(host.take_effects().len(), 1);
+    }
+}
+
 // --------------------------------------------------------------------- props
 
 #[test]

@@ -8,7 +8,7 @@
 use iptscrae::budget::{Limits, StackDialect};
 use iptscrae::registry::CommandSet;
 use iptscrae::value::Chunk;
-use iptscrae::{Engine, Value};
+use iptscrae::{parse_script, Engine, Value};
 use iptscrae_palace::commands::register_palace_commands;
 use iptscrae_palace::ScriptEvent;
 use palace_room::RoomDesc;
@@ -165,6 +165,43 @@ impl ScriptEngine {
         self.scripts.clear();
         self.alarms.clear();
         self.engine.host.alarms.clear();
+    }
+
+    /// Replace one hotspot's script from its current source text.
+    ///
+    /// `SETSPOTSCRIPT` merges a new handler into a hotspot's source at runtime,
+    /// so the engine has to re-parse that one spot or the handler never fires.
+    /// A source with no handlers (or a syntax error) leaves the spot's previous
+    /// script in place and returns the [`LoadProblem`].
+    pub fn set_spot_script(&mut self, spot: i32, source: &str) -> Option<LoadProblem> {
+        let limits = self.engine.limits;
+        let commands = self.engine.commands.clone();
+        match parse_script(source, &commands, &limits) {
+            Ok(script) if script.is_empty() => Some(LoadProblem {
+                spot,
+                error: "no ON handlers in script text".to_owned(),
+            }),
+            Ok(script) => {
+                let loaded = LoadedScript {
+                    spot,
+                    script,
+                    source: source.to_owned(),
+                };
+                match self
+                    .scripts
+                    .iter_mut()
+                    .find(|existing| existing.spot == spot)
+                {
+                    Some(existing) => *existing = loaded,
+                    None => self.scripts.push(loaded),
+                }
+                None
+            }
+            Err(error) => Some(LoadProblem {
+                spot,
+                error: error.to_string(),
+            }),
+        }
     }
 
     /// Whether any loaded script declares the handler for `event`.

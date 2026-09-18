@@ -65,6 +65,67 @@ fn load_cyborg_adds_a_spotless_script_or_a_problem() {
 }
 
 #[test]
+fn set_spot_script_reparses_one_hotspot_and_its_handler_fires() {
+    let mut engine = ScriptEngine::with_palace_limits();
+    engine.load_room(&room_with_scripts(&[(1, Some("ON ENTER { \"old\" SAY }"))]));
+    assert!(!engine.has_handler(ScriptEvent::Select));
+
+    let problem = engine.set_spot_script(1, "ON SELECT { \"hi\" SAY }");
+    assert!(problem.is_none(), "the merged source parses");
+    assert!(engine.has_handler(ScriptEvent::Select));
+
+    let report = engine.fire_spot(ScriptEvent::Select, 1);
+    assert_eq!(report.runs.len(), 1, "the merged handler ran");
+    assert_eq!(
+        report.effects,
+        vec![Effect::Say {
+            text: "hi".to_owned()
+        }]
+    );
+}
+
+#[test]
+fn set_spot_script_replaces_the_existing_script_for_the_same_spot() {
+    let mut engine = ScriptEngine::with_palace_limits();
+    engine.load_room(&room_with_scripts(&[(
+        1,
+        Some("ON SELECT { \"old\" SAY }"),
+    )]));
+
+    let problem = engine.set_spot_script(1, "ON SELECT { \"new\" SAY }");
+    assert!(problem.is_none());
+    assert_eq!(
+        engine.scripts().len(),
+        1,
+        "the spot's script is replaced, not appended"
+    );
+    let report = engine.fire_spot(ScriptEvent::Select, 1);
+    assert_eq!(
+        report.effects,
+        vec![Effect::Say {
+            text: "new".to_owned()
+        }]
+    );
+}
+
+#[test]
+fn set_spot_script_reports_a_source_with_no_handlers() {
+    let mut engine = ScriptEngine::with_palace_limits();
+    engine.load_room(&room_with_scripts(&[(1, Some("ON ENTER { 1 NOPE }"))]));
+
+    let problem = engine.set_spot_script(1, "1 2 +");
+    assert_eq!(
+        problem.map(|problem| problem.spot),
+        Some(1),
+        "a bare body is reported against the spot and leaves its script alone"
+    );
+    assert!(
+        engine.has_handler(ScriptEvent::Enter),
+        "the previous script for the spot is kept"
+    );
+}
+
+#[test]
 fn the_alarm_queue_is_capped_and_counts_what_it_drops() {
     let mut engine = ScriptEngine::with_palace_limits();
     engine.load_room(&room_with_scripts(&[(

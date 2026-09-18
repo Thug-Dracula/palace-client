@@ -153,6 +153,11 @@ pub struct SessionState {
     /// change so a left room's late effects cannot fetch into the new room.
     pub pending_fetches: Vec<ScriptFetch>,
     pending_fetch_room: Option<i32>,
+    /// Hotspots whose script text a `SETSPOTSCRIPT` changed and whose handler set
+    /// must be re-parsed. The runtime owns the engine, so the apply path queues
+    /// the spot and the main loop drains it. Cleared on room change, like
+    /// `pending_fetches`, so a left room's spot cannot name the new room's.
+    pub pending_spot_scripts: Vec<i32>,
     pub chat: Vec<ChatLine>,
     chat_seq: u64,
     last_error: Option<String>,
@@ -180,6 +185,7 @@ impl SessionState {
             draw: DrawList::new(),
             pending_fetches: Vec::new(),
             pending_fetch_room: None,
+            pending_spot_scripts: Vec::new(),
             chat: Vec::new(),
             chat_seq: 0,
             last_error: None,
@@ -249,6 +255,7 @@ impl SessionState {
         self.draw = DrawList::new();
         self.pending_fetches.clear();
         self.pending_fetch_room = None;
+        self.pending_spot_scripts.clear();
     }
 
     /// Start the draw list from a room's own stored commands.

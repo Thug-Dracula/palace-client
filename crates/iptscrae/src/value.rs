@@ -40,12 +40,30 @@ pub struct Chunk(Rc<ChunkData>);
 struct ChunkData {
     ops: Vec<Op>,
     offset: u32,
+    /// The verbatim source text between a block's braces, when the chunk came
+    /// from a `{ ... }` literal. `SETSPOTSCRIPT` needs it to re-emit a handler;
+    /// a chunk built programmatically (or a bare body) has none.
+    source: Option<Rc<str>>,
 }
 
 impl Chunk {
-    /// Build a chunk from already-parsed operations.
+    /// Build a chunk from already-parsed operations, with no recorded source.
     pub fn new(ops: Vec<Op>, offset: u32) -> Self {
-        Self(Rc::new(ChunkData { ops, offset }))
+        Self(Rc::new(ChunkData {
+            ops,
+            offset,
+            source: None,
+        }))
+    }
+
+    /// Build a chunk from already-parsed operations and the source text that
+    /// sits between its `{` and `}`.
+    pub fn with_source(ops: Vec<Op>, offset: u32, source: impl Into<Rc<str>>) -> Self {
+        Self(Rc::new(ChunkData {
+            ops,
+            offset,
+            source: Some(source.into()),
+        }))
     }
 
     /// The empty atomlist, `{}`.
@@ -61,6 +79,15 @@ impl Chunk {
     /// Byte offset of the opening `{` (or of the script for a bare body).
     pub fn offset(&self) -> u32 {
         self.0.offset
+    }
+
+    /// The source text between the braces of the block this was parsed from.
+    ///
+    /// `None` for a bare body or a programmatically built chunk. This is the
+    /// *inner* text: the braces themselves are not included, and nested blocks
+    /// each carry their own inner source.
+    pub fn source(&self) -> Option<&str> {
+        self.0.source.as_deref()
     }
 
     /// Whether this chunk has no operations.
@@ -280,6 +307,14 @@ mod tests {
         assert!(Value::Chunk(Chunk::empty()).is_truthy());
         assert!(Value::array(vec![]).is_truthy());
         assert!(Value::Mark.is_truthy());
+    }
+
+    #[test]
+    fn only_a_block_carries_source_text() {
+        assert_eq!(Chunk::new(Vec::new(), 0).source(), None);
+        assert_eq!(Chunk::empty().source(), None);
+        let chunk = Chunk::with_source(Vec::new(), 0, " 1 2 + ");
+        assert_eq!(chunk.source(), Some(" 1 2 + "));
     }
 
     #[test]

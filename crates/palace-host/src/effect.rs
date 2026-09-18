@@ -79,6 +79,59 @@ pub enum Effect {
     },
     /// `SETPICOPACITY` — fade a spot's picture.
     SetPicOpacity { spot: i32, state: i32, opacity: f64 },
+    /// `ADDSPOT` — append a polygon hotspot to the room and answer its new id.
+    ///
+    /// Local-only: the reference mutates its own hotspot store in place and
+    /// there is no documented client→server body, so [`Effect::is_wire_effect`]
+    /// omits it. The runtime appends it, so a later hit-test can select it.
+    AddSpot {
+        /// The id the host allocated for it and returned to the script.
+        id: i32,
+        /// Polygon outline as `(x, y)` room coordinates, in wire order.
+        points: Vec<(i32, i32)>,
+        /// The hotspot's nominal location `(x, y)`.
+        x: i32,
+        y: i32,
+    },
+    /// `ADDPIC` — attach a picture file to a hotspot as one more state.
+    ///
+    /// Local-only, like [`Effect::AddSpot`]: the reference mutates its own
+    /// picture and state lists and no wire body exists for it.
+    AddPic {
+        /// Target hotspot id.
+        spot: i32,
+        /// Picture file name.
+        name: String,
+    },
+    /// `SETSPOTOPTIONS` — patch a hotspot's type and flags.
+    ///
+    /// Local-only, like [`Effect::AddSpot`]. `flags` is the raw flag word the
+    /// script passed and `top_layer` is the separate `topLayer` operand; the
+    /// runtime merges the latter into the pictures-above-all bit, because the
+    /// wire model has only `flags` where the reference keeps both fields.
+    SetSpotOptions {
+        /// Target hotspot id.
+        spot: i32,
+        /// New `HS_*` type.
+        hotspot_type: i32,
+        /// Raw `HS_*` flag word before the top-layer bit is merged.
+        flags: i32,
+        /// Whether `topLayer` was positive.
+        top_layer: bool,
+    },
+    /// `SETSPOTSCRIPT` — attach an `ON <EVENT> { ... }` handler to a hotspot.
+    ///
+    /// Local-only, like [`Effect::AddSpot`]: the reference merges the block into
+    /// its own hotspot script and there is no documented client→server body, so
+    /// [`Effect::is_wire_effect`] omits it.
+    SetSpotScript {
+        /// Target hotspot id.
+        spot: i32,
+        /// The event name, upper-cased as the reference merges it.
+        event: String,
+        /// The block's inner source text, without the braces.
+        script: String,
+    },
     /// `LOCK` — lock a door.
     Lock { spot: i32 },
     /// `UNLOCK` — unlock a door.
@@ -185,6 +238,10 @@ impl Effect {
             Effect::SetPicOffset { .. } => "SETPICLOC",
             Effect::SetPicOffsetLocal { .. } => "SETPICLOCLOCAL",
             Effect::SetPicOpacity { .. } => "SETPICOPACITY",
+            Effect::AddSpot { .. } => "ADDSPOT",
+            Effect::AddPic { .. } => "ADDPIC",
+            Effect::SetSpotOptions { .. } => "SETSPOTOPTIONS",
+            Effect::SetSpotScript { .. } => "SETSPOTSCRIPT",
             Effect::Lock { .. } => "LOCK",
             Effect::Unlock { .. } => "UNLOCK",
             Effect::SelectSpot { .. } => "SELECT",
@@ -301,6 +358,27 @@ impl fmt::Display for Effect {
                 state,
                 opacity,
             } => write!(f, "SETPICOPACITY spot={spot} state={state} {opacity:.2}"),
+            Effect::AddSpot { id, points, x, y } => {
+                write!(f, "ADDSPOT id={id} at ({x},{y}) [{} points]", points.len())
+            }
+            Effect::AddPic { spot, name } => write!(f, "ADDPIC spot={spot} {name:?}"),
+            Effect::SetSpotOptions {
+                spot,
+                hotspot_type,
+                flags,
+                top_layer,
+            } => write!(
+                f,
+                "SETSPOTOPTIONS spot={spot} type={hotspot_type} flags={flags} top_layer={top_layer}"
+            ),
+            Effect::SetSpotScript {
+                spot,
+                event,
+                script,
+            } => write!(
+                f,
+                "SETSPOTSCRIPT spot={spot} event={event} script={script:?}"
+            ),
             Effect::Lock { spot } => write!(f, "LOCK {spot}"),
             Effect::Unlock { spot } => write!(f, "UNLOCK {spot}"),
             Effect::SelectSpot { spot } => write!(f, "SELECT {spot}"),

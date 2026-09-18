@@ -23,6 +23,7 @@ use palace_host::{
 use palace_render::{
     clamp_avatar_position, clamp_dpr, render, AnimationClock, AvatarSpec, MediaStore, PointF,
     PropStore, RenderOptions, SceneBuilder, SizeF, ViewTransform, COLOR_VARIANTS, FACE_VARIANTS,
+    FLAG_PICTURES_ABOVE_ALL,
 };
 use palace_wire::byteorder::Writer;
 use palace_wire::frame::{user_color_frame, user_face_frame, user_move_frame, Frame};
@@ -1150,6 +1151,32 @@ fn run_session(
             }
         }
 
+        // A `SETSPOTSCRIPT` changed a hotspot's source; the engine owns the
+        // parsed handlers, so re-parse the changed spots now that every effect
+        // path above has had a chance to queue them.
+        if !state.pending_spot_scripts.is_empty() {
+            for spot in std::mem::take(&mut state.pending_spot_scripts) {
+                let Some(source) = state
+                    .room_desc
+                    .as_ref()
+                    .and_then(|room| {
+                        room.hotspots
+                            .iter()
+                            .find(|spot_view| i32::from(spot_view.id) == spot)
+                    })
+                    .and_then(|hotspot| hotspot.script.clone())
+                else {
+                    continue;
+                };
+                if let Some(problem) = scripts.set_spot_script(spot, &source) {
+                    shared.note(format!(
+                        "script: hotspot {} script did not parse: {}",
+                        problem.spot, problem.error
+                    ));
+                }
+            }
+        }
+
         if last_asset_request.elapsed() >= MEDIA_REQUEST_INTERVAL {
             last_asset_request = Instant::now();
             request_assets(
@@ -1930,6 +1957,55 @@ fn apply_effect(
                 ),
             }]
         }
+        Effect::AddSpot { id, points, x, y } => {
+            let changed = add_spot(state, *id, points, *x, *y);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: ADDSPOT id={id} at ({x},{y}) [{} points]{}",
+                    points.len(),
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
+        Effect::AddPic { spot, name } => {
+            let changed = add_pic(state, *spot, name);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: ADDPIC spot={spot} {name:?}{}",
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
+        Effect::SetSpotOptions {
+            spot,
+            hotspot_type,
+            flags,
+            top_layer,
+        } => {
+            let changed = set_spot_options(state, *spot, *hotspot_type, *flags, *top_layer);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: SETSPOTOPTIONS spot={spot} type={hotspot_type} flags={flags} top_layer={top_layer}{}",
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
+        Effect::SetSpotScript {
+            spot,
+            event,
+            script,
+        } => {
+            let changed = set_spot_script(state, *spot, event, script);
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: SETSPOTSCRIPT spot={spot} event={event}{}",
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
         // The frame was already sent above by `effect_frame`, which computes the
         // target with the same `move_target` used here, so the position applied
         // locally is the position on the wire. The server relays our own `uLoc`
@@ -2640,6 +2716,293 @@ pub(crate) fn set_pic_offset_in_room(
     };
     target.pic_loc = point(x, y);
     true
+}
+
+fn add_spot(state: &mut SessionState, id: i32, points: &[(i32, i32)], x: i32, y: i32) -> bool {
+    let Some(room_id) = current_room_id(state) else {
+        return false;
+    };
+    add_spot_in_room(state, room_id, id, points, x, y)
+}
+
+/// `ADDSPOT` for a room named by the wire. The hotspot is appended so the
+/// compositor paints it over its elders and [`HostView::spot_at`]'s reverse
+/// scan selects it first.
+pub(crate) fn add_spot_in_room(
+    state: &mut SessionState,
+    room_id: i16,
+    id: i32,
+    points: &[(i32, i32)],
+    x: i32,
+    y: i32,
+) -> bool {
+    let Some(room) = state.room_desc.as_mut() else {
+        return false;
+    };
+    if room.header.room_id != room_id {
+        return false;
+    }
+    let Ok(id) = i16::try_from(id) else {
+        return false;
+    };
+    let polygon: Vec<Point> = points.iter().map(|(px, py)| point(*px, *py)).collect();
+    room.hotspots.push(palace_room::Hotspot {
+        id,
+        loc: point(x, y),
+        points: polygon,
+        name: Some(String::new()),
+        ..Default::default()
+    });
+    true
+}
+
+fn add_pic(state: &mut SessionState, spot: i32, name: &str) -> bool {
+    let Some(room_id) = current_room_id(state) else {
+        return false;
+    };
+    add_pic_in_room(state, room_id, spot, name)
+}
+
+/// `ADDPIC` for a room named by the wire: one new picture record and one new
+/// state on the target hotspot, whose id is one past the room's highest.
+pub(crate) fn add_pic_in_room(
+    state: &mut SessionState,
+    room_id: i16,
+    spot: i32,
+    name: &str,
+) -> bool {
+    let Some(room) = state.room_desc.as_mut() else {
+        return false;
+    };
+    if room.header.room_id != room_id {
+        return false;
+    }
+    let Ok(spot) = i16::try_from(spot) else {
+        return false;
+    };
+    let Some(index) = room.hotspots.iter().position(|hotspot| hotspot.id == spot) else {
+        return false;
+    };
+    let pic_id = room
+        .pictures
+        .iter()
+        .map(|picture| i32::from(picture.pic_id))
+        .max()
+        .unwrap_or(0)
+        .max(0)
+        .saturating_add(1) as i16;
+    room.pictures.push(palace_room::PictureOverlay {
+        pic_id,
+        name: Some(name.to_owned()),
+        trans_color: 0,
+        ..Default::default()
+    });
+    let hotspot = &mut room.hotspots[index];
+    hotspot.states.push(palace_room::HotspotState {
+        pict_id: pic_id,
+        pic_loc: point(0, 0),
+        ..Default::default()
+    });
+    hotspot.nbr_states = hotspot.states.len() as i16;
+    true
+}
+
+fn set_spot_options(
+    state: &mut SessionState,
+    spot: i32,
+    hotspot_type: i32,
+    flags: i32,
+    top_layer: bool,
+) -> bool {
+    let Some(room_id) = current_room_id(state) else {
+        return false;
+    };
+    set_spot_options_in_room(state, room_id, spot, hotspot_type, flags, top_layer)
+}
+
+/// `SETSPOTOPTIONS` for a room named by the wire. The reference keeps
+/// `topLayer` apart from `flags`; the wire model has only the latter, so the
+/// pictures-above-all bit is merged in here.
+pub(crate) fn set_spot_options_in_room(
+    state: &mut SessionState,
+    room_id: i16,
+    spot: i32,
+    hotspot_type: i32,
+    flags: i32,
+    top_layer: bool,
+) -> bool {
+    let Some(hotspot) = hotspot_mut(state, room_id, spot) else {
+        return false;
+    };
+    hotspot.hotspot_type = hotspot_type as i16;
+    hotspot.flags = if top_layer {
+        flags | FLAG_PICTURES_ABOVE_ALL
+    } else {
+        flags & !FLAG_PICTURES_ABOVE_ALL
+    };
+    true
+}
+
+/// `SETSPOTSCRIPT`: merge an `ON <EVENT> { ... }` handler into a hotspot's
+/// script text and mark the spot for re-parsing by the engine.
+pub(crate) fn set_spot_script(
+    state: &mut SessionState,
+    spot: i32,
+    event: &str,
+    script: &str,
+) -> bool {
+    let Some(room_id) = current_room_id(state) else {
+        return false;
+    };
+    let Some(hotspot) = hotspot_mut(state, room_id, spot) else {
+        return false;
+    };
+    let merged = merge_spot_script(hotspot.script.as_deref().unwrap_or(""), event, script);
+    hotspot.script = Some(merged);
+    if !state.pending_spot_scripts.contains(&spot) {
+        state.pending_spot_scripts.push(spot);
+    }
+    true
+}
+
+/// Merge `ON <EVENT> { <script> }` into `existing`.
+///
+/// An existing handler for the same event is replaced in place — the whole
+/// `ON ... { ... }` span including nested braces — so a second call for one
+/// event replaces rather than duplicates. With no such handler the block is
+/// appended, separated by a newline. Event matching is ASCII-case-insensitive.
+pub(crate) fn merge_spot_script(existing: &str, event: &str, script: &str) -> String {
+    let event = event.to_ascii_uppercase();
+    let block = format!("ON {event} {{{script}}}");
+    match find_event_block(existing, &event) {
+        Some((start, end)) => {
+            let mut merged = String::with_capacity(existing.len() + block.len());
+            merged.push_str(&existing[..start]);
+            merged.push_str(&block);
+            merged.push_str(&existing[end..]);
+            merged
+        }
+        None => {
+            let trimmed = existing.trim_end();
+            if trimmed.is_empty() {
+                block
+            } else {
+                let mut merged = String::with_capacity(trimmed.len() + block.len() + 1);
+                merged.push_str(trimmed);
+                merged.push('\n');
+                merged.push_str(&block);
+                merged
+            }
+        }
+    }
+}
+
+/// The byte span of the `ON <EVENT> { ... }` block in `source`, if any.
+///
+/// Only a top-level `ON` counts, and braces inside strings and comments are
+/// ignored, so the returned span is exactly one handler block.
+fn find_event_block(source: &str, event_upper: &str) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = skip_quoted(bytes, i),
+            b'#' | b';' => i = skip_to_eol(bytes, i),
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth = (depth - 1).max(0);
+                i += 1;
+            }
+            b'O' if depth == 0
+                && bytes.get(i + 1) == Some(&b'N')
+                && bytes.get(i + 2).is_some_and(u8::is_ascii_whitespace)
+                && (i == 0 || !is_identifier_byte(bytes[i - 1])) =>
+            {
+                let name_start = skip_whitespace(bytes, i + 2);
+                if let Some(name_end) = identifier_end(bytes, name_start) {
+                    if source[name_start..name_end].eq_ignore_ascii_case(event_upper) {
+                        let brace = skip_whitespace(bytes, name_end);
+                        if bytes.get(brace) == Some(&b'{') {
+                            if let Some(close) = matching_brace(bytes, brace) {
+                                return Some((i, close + 1));
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn identifier_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut end = start;
+    while end < bytes.len() && is_identifier_byte(bytes[end]) {
+        end += 1;
+    }
+    (end > start).then_some(end)
+}
+
+fn skip_whitespace(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn skip_quoted(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn skip_to_eol(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+        i += 1;
+    }
+    i
+}
+
+fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = skip_quoted(bytes, i),
+            b'#' | b';' => i = skip_to_eol(bytes, i),
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// `MSG_SPOTDEL` removes a hotspot "from the current room" (:1900) and carries
@@ -3612,6 +3975,294 @@ mod tests {
     }
 
     const RED: [u8; 4] = [255, 0, 0, 255];
+
+    fn room_with_two_states(id: i16) -> RoomDesc {
+        let mut room = scripted_room(&[]);
+        room.hotspots.push(Hotspot {
+            id,
+            states: vec![
+                palace_room::HotspotState::default(),
+                palace_room::HotspotState::default(),
+            ],
+            ..Default::default()
+        });
+        room.header.nbr_hotspots = room.hotspots.len() as i16;
+        room
+    }
+
+    #[test]
+    fn addspot_through_the_apply_arm_appends_a_hittable_spot() {
+        let mut state = state_in(&scripted_room(&[(3, "")]));
+        let mut harness = harness();
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        let events = apply_effect(
+            &Effect::AddSpot {
+                id: 9,
+                points: vec![(100, 100), (140, 100), (140, 140), (100, 140)],
+                x: 120,
+                y: 120,
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert!(dirty, "a new spot dirties the frame");
+        assert_eq!(events.len(), 1, "ADDSPOT reports one note");
+        let room = state.room_desc.as_ref().expect("a room");
+        assert_eq!(room.hotspots.last().map(|spot| spot.id), Some(9));
+
+        let mut view = HostView::default();
+        view.apply_room(room);
+        assert_eq!(
+            view.spot_at(120, 120).map(|spot| spot.id),
+            Some(9),
+            "a point inside the polygon resolves to the new spot"
+        );
+    }
+
+    #[test]
+    fn addpic_through_the_apply_arm_adds_one_picture_and_one_state() {
+        let mut state = state_in(&scripted_room(&[(7, "")]));
+        state
+            .room_desc
+            .as_mut()
+            .expect("a room")
+            .pictures
+            .push(palace_room::PictureOverlay {
+                pic_id: 4,
+                ..Default::default()
+            });
+        let mut harness = harness();
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        let events = apply_effect(
+            &Effect::AddPic {
+                spot: 7,
+                name: "stage.png".to_owned(),
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert!(dirty, "a new picture dirties the frame");
+        assert_eq!(events.len(), 1, "ADDPIC reports one note");
+        let room = state.room_desc.as_ref().expect("a room");
+        assert_eq!(room.pictures.len(), 2, "exactly one picture appended");
+        let added = &room.pictures[1];
+        assert_eq!(added.pic_id, 5, "one past the highest existing id");
+        assert_eq!(added.name.as_deref(), Some("stage.png"));
+        assert_eq!(added.trans_color, 0);
+        let hotspot = room.hotspots.iter().find(|h| h.id == 7).expect("spot 7");
+        assert_eq!(hotspot.states.len(), 1, "exactly one state appended");
+        assert_eq!(hotspot.states[0].pict_id, 5);
+        assert_eq!(
+            (hotspot.states[0].pic_loc.h, hotspot.states[0].pic_loc.v),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn setspotoptions_through_the_apply_arm_merges_the_top_layer_bit() {
+        let mut state = state_in(&scripted_room(&[(7, "")]));
+        let mut harness = harness();
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+
+        apply_effect(
+            &Effect::SetSpotOptions {
+                spot: 7,
+                hotspot_type: 3,
+                flags: 0x40,
+                top_layer: true,
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert!(dirty);
+        let hotspot = state
+            .room_desc
+            .as_ref()
+            .expect("a room")
+            .hotspots
+            .iter()
+            .find(|h| h.id == 7)
+            .expect("spot 7");
+        assert_eq!(hotspot.hotspot_type, 3);
+        assert_eq!(
+            hotspot.flags,
+            0x40 | FLAG_PICTURES_ABOVE_ALL,
+            "topLayer > 0 sets the above-all bit"
+        );
+
+        dirty = false;
+        apply_effect(
+            &Effect::SetSpotOptions {
+                spot: 7,
+                hotspot_type: 0,
+                flags: 0x40,
+                top_layer: false,
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert!(dirty);
+        let hotspot = state
+            .room_desc
+            .as_ref()
+            .expect("a room")
+            .hotspots
+            .iter()
+            .find(|h| h.id == 7)
+            .expect("spot 7");
+        assert_eq!(hotspot.hotspot_type, 0);
+        assert_eq!(
+            hotspot.flags, 0x40,
+            "topLayer == 0 clears the above-all bit and keeps the rest"
+        );
+    }
+
+    #[test]
+    fn setspotscript_merge_appends_replaces_and_does_not_duplicate() {
+        assert_eq!(merge_spot_script("", "SELECT", " 1 "), "ON SELECT { 1 }");
+        assert_eq!(
+            merge_spot_script("ON ENTER { 2 }", "SELECT", "1"),
+            "ON ENTER { 2 }\nON SELECT {1}"
+        );
+
+        let existing = "ON ENTER { 1 }\nON SELECT { 2 }\nON LEAVE { 3 }";
+        assert_eq!(
+            merge_spot_script(existing, "SELECT", " 9 "),
+            "ON ENTER { 1 }\nON SELECT { 9 }\nON LEAVE { 3 }",
+            "only the SELECT handler is replaced"
+        );
+
+        let once = merge_spot_script("", "SELECT", "1");
+        let twice = merge_spot_script(&once, "SELECT", "2");
+        assert_eq!(twice, "ON SELECT {2}");
+        assert_eq!(
+            twice.matches("ON SELECT").count(),
+            1,
+            "a second call replaces rather than duplicates"
+        );
+    }
+
+    #[test]
+    fn setspotscript_merge_matches_the_event_case_insensitively_and_nests_braces() {
+        assert_eq!(
+            merge_spot_script("ON select { 2 }", "SELECT", "3"),
+            "ON SELECT {3}"
+        );
+        assert_eq!(
+            merge_spot_script("ON SELECT { { 1 } 2 }", "SELECT", "9"),
+            "ON SELECT {9}",
+            "the replaced span covers a nested atomlist"
+        );
+        assert_eq!(
+            merge_spot_script("ON SELECT { \"}\" 2 }", "SELECT", "9"),
+            "ON SELECT {9}",
+            "a brace inside a string does not end the span early"
+        );
+    }
+
+    #[test]
+    fn setspotscript_through_the_apply_arm_merges_and_queues_the_spot() {
+        let mut state = state_in(&scripted_room(&[(7, "ON ENTER { 1 }")]));
+        let mut harness = harness();
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        let events = apply_effect(
+            &Effect::SetSpotScript {
+                spot: 7,
+                event: "SELECT".to_owned(),
+                script: " 9 ".to_owned(),
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert_eq!(events.len(), 1, "SETSPOTSCRIPT reports one note");
+        let hotspot = state
+            .room_desc
+            .as_ref()
+            .expect("a room")
+            .hotspots
+            .iter()
+            .find(|h| h.id == 7)
+            .expect("spot 7");
+        assert_eq!(
+            hotspot.script.as_deref(),
+            Some("ON ENTER { 1 }\nON SELECT { 9 }")
+        );
+        assert_eq!(
+            state.pending_spot_scripts,
+            vec![7],
+            "the spot is queued for re-parsing"
+        );
+        assert!(!dirty, "changing a script is not a render change");
+    }
+
+    #[test]
+    fn setpicloclocal_through_the_apply_arm_moves_the_named_state() {
+        let mut state = state_in(&room_with_two_states(7));
+        let mut harness = harness();
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        apply_effect(
+            &Effect::SetPicOffsetLocal {
+                spot: 7,
+                state: 1,
+                dx: -5,
+                dy: 9,
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert!(dirty, "a moved picture offset dirties the frame");
+        let hotspot = state
+            .room_desc
+            .as_ref()
+            .expect("a room")
+            .hotspots
+            .iter()
+            .find(|h| h.id == 7)
+            .expect("spot 7");
+        assert_eq!(
+            (hotspot.states[1].pic_loc.h, hotspot.states[1].pic_loc.v),
+            (-5, 9)
+        );
+        assert_eq!(
+            (hotspot.states[0].pic_loc.h, hotspot.states[0].pic_loc.v),
+            (0, 0),
+            "the other state is untouched"
+        );
+    }
 
     #[test]
     fn a_received_draw_message_paints_the_stroke_into_the_composed_frame() {

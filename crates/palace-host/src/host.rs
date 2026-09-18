@@ -74,6 +74,9 @@ pub struct ScriptHost {
     pub current_spot: i32,
     /// The limiter, kept so a host can report what bound a runaway script.
     pub limits: Limits,
+    /// Next id [`Effect::AddSpot`] will hand out; `None` until the first
+    /// `ADDSPOT`, when it is seeded from the view's highest spot id.
+    next_spot_id: Option<i32>,
     rng: u64,
 }
 
@@ -97,6 +100,7 @@ impl ScriptHost {
             pen: PenState::default(),
             current_spot: 0,
             limits: Limits::default(),
+            next_spot_id: None,
             rng: 0x2545_F491_4F6C_DD1D,
         }
     }
@@ -128,6 +132,25 @@ impl ScriptHost {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
+
+    /// Allocate the next `ADDSPOT` id. The first call seeds from the highest
+    /// id the snapshot holds (1 when there are none); each call then consumes
+    /// the counter, so two `ADDSPOT`s in one handler get distinct ids even
+    /// though the snapshot does not change under them.
+    fn alloc_spot_id(&mut self) -> i32 {
+        let seed = self
+            .view
+            .spots
+            .iter()
+            .map(|spot| spot.id)
+            .max()
+            .unwrap_or(0)
+            .max(0)
+            .saturating_add(1);
+        let id = self.next_spot_id.map_or(seed, |next| next.max(seed));
+        self.next_spot_id = Some(id.saturating_add(1));
+        id
+    }
 }
 
 fn stub_values(pushes: usize, push: Push) -> Vec<Value> {
@@ -158,6 +181,24 @@ fn text_arg(args: &[Value], index: usize) -> Result<String> {
         Some(Value::Str(s)) => Ok(s.to_string()),
         Some(other) => Err(IptError::TypeMismatch {
             expected: "string operand",
+            found: other.type_name(),
+        }),
+        None => Err(IptError::StackUnderflow {
+            needed: index + 1,
+            available: args.len(),
+        }),
+    }
+}
+
+/// Read a `{ ... }` code-block operand.
+///
+/// The block must carry its recorded inner source; a chunk built without one (a
+/// bare body, or one made programmatically) cannot name a handler to attach.
+fn chunk_arg(args: &[Value], index: usize) -> Result<&Chunk> {
+    match args.get(index) {
+        Some(Value::Chunk(chunk)) => Ok(chunk),
+        Some(other) => Err(IptError::TypeMismatch {
+            expected: "code block operand",
             found: other.type_name(),
         }),
         None => Err(IptError::StackUnderflow {
@@ -450,6 +491,65 @@ impl Host for ScriptHost {
             "SETPICBRIGHTNESS" | "SETPICSATURATION" | "SETPICDIM" => {
                 self.unimplemented(name, pushes, push)
             }
+            "ADDSPOT" => {
+                let flat = props_arg(args, 0);
+                let x = int_arg(args, 1)?;
+                let y = int_arg(args, 2)?;
+                let points: Vec<(i32, i32)> = flat
+                    .chunks_exact(2)
+                    .map(|pair| (pair[0] as i32, pair[1] as i32))
+                    .collect();
+                let id = self.alloc_spot_id();
+                self.effects.push(Effect::AddSpot {
+                    id,
+                    points,
+                    x: x as i32,
+                    y: y as i32,
+                });
+                Ok(vec![Value::Int(id)])
+            }
+            "ADDPIC" => {
+                let name = text_arg(args, 0)?;
+                let spot = int_arg(args, 1)?;
+                self.effects.push(Effect::AddPic {
+                    spot: spot as i32,
+                    name,
+                });
+                Ok(Vec::new())
+            }
+            "SETSPOTOPTIONS" => {
+                let flags = int_arg(args, 0)?;
+                let top_layer = int_arg(args, 1)? > 0;
+                let hotspot_type = int_arg(args, 2)?;
+                let spot = int_arg(args, 3)?;
+                self.effects.push(Effect::SetSpotOptions {
+                    spot: spot as i32,
+                    hotspot_type: hotspot_type as i32,
+                    flags: flags as i32,
+                    top_layer,
+                });
+                Ok(Vec::new())
+            }
+            "SETSPOTSCRIPT" => {
+                let block = chunk_arg(args, 0)?;
+                let source = block.source().ok_or(IptError::TypeMismatch {
+                    expected: "code block with source text",
+                    found: "atomlist",
+                })?;
+                let event = text_arg(args, 1)?;
+                let bytes = event.len();
+                if !(2..=30).contains(&bytes) {
+                    return Err(IptError::BadArgument(
+                        "SETSPOTSCRIPT event name must be 2..=30 bytes",
+                    ));
+                }
+                self.effects.push(Effect::SetSpotScript {
+                    spot: int_arg(args, 2)? as i32,
+                    event: event.to_ascii_uppercase(),
+                    script: source.to_owned(),
+                });
+                Ok(Vec::new())
+            }
             "LOCK" => {
                 self.effects.push(Effect::Lock {
                     spot: int_arg(args, 0)? as i32,
@@ -701,8 +801,7 @@ impl Host for ScriptHost {
                 _ => String::new(),
             })]),
             "HIDESMILEYS" | "LOCKUSERPROPS" | "AUTOUSERLAYER" | "SETTOOLTIP" | "CLEARTOOLTIP"
-            | "SETSPOTOPTIONS" | "ADDPIC" | "REMOVEPIC" | "DELPIC" | "ADDSPOT"
-            | "SETSPOTSCRIPT" | "ROOMZOOM" | "ROOMUNZOOM" | "CIRCLE" | "FILL" | "PAINT"
+            | "REMOVEPIC" | "DELPIC" | "ROOMZOOM" | "ROOMUNZOOM" | "CIRCLE" | "FILL" | "PAINT"
             | "TEXT" | "PING" | "CLRPROPS" | "SHOWALLPROPS" | "HIDEPROPS" | "SHOWPROPS"
             | "SETPROPSLOCAL" | "ADDPROP" | "PURGE" | "ROOMDESC" | "OFFLINE" | "ONLINE"
             | "NBRUSERS" | "GETWHOTALKING" | "MSGTO" | "FLUSH" | "SETSPOTSTATEALL" | "AWAY"
