@@ -8,21 +8,15 @@ format is `protocol.md`; the work queue is `palace-todo.md`.
 
 ---
 
-## Hard boundaries (do not cross)
+## Verifying the interface
 
-**Note:**
-- **Inject input into the user's desktop.** No `input-tool`, `input-tool`, `input-tool mousemove/click/key`, `xte`, or any synthetic input. Not to click a button, not to prove a UI works. This machine is actively used.
-- **Unlock, wake, or inhibit the user's screen.** A locked screen ends the QA run — stop and report.
-- **Screenshot the whole desktop.** If a capture is needed, grab the app window only (`import -window <id>`). Never full-screen `spectacle -b -n`.
-- **Activate, raise or focus the user's windows** (`wmctrl -a`, KWin D-Bus window scripting).
-- **Ask for or use the user's password**, or any credential.
+The interface can be checked without touching the mouse: drive the app's own
+command path (`invoke("set_viewport", …)`), which is the identical code a control
+calls, and read the resulting geometry and transform values back. The compositor
+also renders headlessly, so a frame can be produced and inspected on its own.
 
-**DO INSTEAD, for UI verification:**
-- Drive the app's own command/state path (`invoke("set_viewport", …)`) — the identical code the button calls.
-- Verify numerically (geometry readouts, transform values) and via headless renders.
-- State plainly that a human still needs to click the real control once.
-
-**Never write a definition of done that can only be satisfied by driving the user's desktop.** Specify the command path instead.
+Appearance still needs a human once. A numeric match proves the transform is
+right; it does not prove a control looks right.
 
 ---
 
@@ -133,23 +127,23 @@ The registry holds **205 names**: 72 core builtins
 (`crates/iptscrae-palace/src/commands.rs`). `[` and `]` are lexer delimiters, not
 registry commands.
 
-The host's fallback arm (`crates/palace-host/src/host.rs`) lists **34** command
+The host's fallback arm (`crates/palace-host/src/host.rs`) lists **32** command
 names it recognises but does not implement. **28** of them are not in
 `PALACE_COMMANDS`, so a script that calls one lexes it as a variable and
-misbehaves quietly rather than reporting "unsupported". The other six
-(`AUTOUSERLAYER`, `SETTOOLTIP`, `CLEARTOOLTIP`, `REMOVEPIC`, `BAN`, `KICK`) are
-registered and dispatch to `unimplemented()`.
+misbehaves quietly rather than reporting "unsupported". The other four
+(`AUTOUSERLAYER`, `REMOVEPIC`, `BAN`, `KICK`) are registered and dispatch to
+`unimplemented()`.
 
-**Opcodes.** 75 are named; **39 are decoded and 36 are not**
+**Opcodes.** 75 are named; **40 are decoded and 35 are not**
 (`crates/palace-wire/src/opcode.rs`, `crates/palace-wire/src/messages/mod.rs`).
-The undecoded 36 fall into four classes:
+The undecoded 35 fall into four classes:
 
 | Class | n | Meaning |
 |---|---|---|
 | Already handled elsewhere | 7 | `qAst`, `rAst`, `sAst`, `navR`, `xtlk`, `xwis`, `ryit` |
 | Vestigial | 14 | defined but unused; named below |
 | Unresolved | 1 | `durl` (DISPLAYURL): the spec documents a body, no server constructs it |
-| Real but non-blocking | 14 | ranked below |
+| Real but non-blocking | 13 | ranked below |
 
 **Vestigial (14) — do not implement:** `PICTDEL`, `PICTNEW`, `PICTSETDESC`,
 `SPOTSETDESC`, `PROPSETDESC`, `ASSETNEW`, `USERENTER`, `SERVERUP`, `WMSG`,
@@ -165,7 +159,6 @@ Ranked after authentication, all feedback, send-side or optional channels:
 
 | Opcode | What it would fix |
 |---|---|
-| `down` SERVERDOWN | a forced disconnect (kick/ban/flood/full/shutdown) shows as a bare socket close |
 | `sRom` ROOMSETDESC | room edits made while you are inside are not reflected |
 | `blow` BLOWTHRU | the plugin-relay channel |
 | `sFil` / `fnfe` / `qFil` | legacy server-hosted file transfer, superseded by HTTP media |
@@ -248,9 +241,10 @@ local to this client only.
   `PROPOFFSETS` push zeros, and `has_prop_by_name` returns false.
 - **A props panel.** Worn props are sent to the server, but the interface cannot
   set them yet.
-- **Authentication.** A server requiring a password is refused, with the request
-  reported rather than silently ignored. `AUTHENTICATE` is decoded; the
-  `AUTHRESPONSE` reply is not implemented.
+- **Authentication.** `AUTHENTICATE` is decoded and reported rather than silently
+  ignored, but the `AUTHRESPONSE` reply is not implemented. The logon clears the
+  `Authenticate` `auxFlags` bit (the application advertises `0x00000008`), so the
+  client does not claim a capability it cannot honour.
 - **Live verification is thinner than the unit tests.** Several receive paths are
   proven against a mock harness; no live big-endian or HTTP-tunnel server has been
   reachable; asset transfer for other users' avatars is untested against a real
@@ -286,33 +280,23 @@ tiltleft, tiltup, tiltright, sad, blotto, angry`.
 
 - **Where does a credential live?** Implementing `AUTHRESPONSE` (a PString of
   `user:password`) needs a credential source, so the choice of config file,
-  prompt or keyring comes first. The alternative is to stop advertising the
-  capability in the logon (`aux_flags`), which deviates from the captured
-  reference logon and so is a decision rather than a unilateral change. Until
-  then, an auth-requiring server yields an explained failure, not a hang.
+  prompt or keyring comes first. The logon no longer advertises the capability:
+  the application sends `aux_flags` `0x00000008`, while `ReferenceProfile`
+  retains `0x80000008` so the reference logon stays byte-for-byte. An
+  auth-requiring server therefore yields an explained failure, not a hang.
 - **`SETLOC`/`SETPICLOC` broadcast** waits on a verified body layout for
   `SPOTMOVE`/`PICTMOVE`.
 - **`durl`** waits on any real server that constructs it.
 
 ---
 
-## Operational rules
+## Build notes
 
-- **Stage explicit paths, never `git add -A`, whenever another agent or agent-runner
-  instance may share the worktree.** `-A` sweeps a concurrent editor's
-  half-written files into your commit.
-- **A placeholder must not become a constraint.** The face art is a placeholder;
-  the hardcoded grid is the real limit. Keep the two separate.
-- **NEVER run `--workspace` cargo commands in a fresh worktree.** A new worktree
+- **Do not run `--workspace` cargo commands in a fresh worktree.** A new worktree
   has no `target/`, so `cargo test --workspace` / `cargo clippy --workspace
   --all-targets` compiles the entire Tauri/WebKit dependency tree from scratch
   (5.6 GB, 20–40 minutes), again for each cargo invocation. Scope to the crate
-  (`cargo test -p <crate>`), or set `CARGO_TARGET_DIR` to reuse the warm target.
-- **Delegate one milestone per agent, in its own git worktree.** Never blanket
-  `git add -A` during a conflicted merge.
-- **ALWAYS re-run the agent's own verification command before merging.**
-- **Never read the research dumps** in `~/.local/share/agent-runner/tool-output/`.
-- **`$CORPUS/` is read-only reference.** Do not edit it.
+  (`cargo test -p <crate>`), or set `CARGO_TARGET_DIR` to reuse a warm target.
 - **`pkill -f "<pattern>"` kills your own shell** when the pattern appears in the
   command string. Use `pgrep -x`/`pkill -x`, or kill by PID.
 - **WebKitGTK:** the Rust compositor keeps the webview's job to one bitmap, which

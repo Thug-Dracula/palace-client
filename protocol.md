@@ -83,7 +83,7 @@ honest ones:
 | field | value | note |
 |---|---|---|
 | `crc` / `counter` | `0x32fb23e9` / `0xaa18198f` | guest registration |
-| `auxFlags` | `0x80000008` | `Authenticate` + OS tag 8 |
+| `auxFlags` | `0x80000008` reference / `0x00000008` application | `Authenticate` + OS tag 8; see note below |
 | `puidCtr` / `puidCRC` | `0xe0546e4f` / `0x92c96d66` | |
 | `demo*` | 72000 | historical, unused |
 | `reserved` | `SCOUT1` | see note below |
@@ -98,6 +98,12 @@ honest ones:
 > `palace_walker.py`, which overwrites the field with `"SCOUT1"` — verified
 > working against the live server. The field is logged by the server and not
 > validated; `ReferenceProfile` exposes it if a different tag is wanted.
+
+> **Note on `auxFlags`.** `0x80000008` is the reference client's value, and both
+> the probe and `ReferenceProfile` keep it so a capture compares byte for byte
+> with `palace_walker.py`. The application advertises `0x00000008`: it clears
+> `Authenticate` (bit `0x80000000`) because `AUTHRESPONSE` is unimplemented, so a
+> server is not told the client can finish an authentication exchange it cannot.
 
 ### Logon burst, keepalive, exit
 
@@ -449,7 +455,7 @@ clamp them rather than index a sheet with whatever arrived.
 
 75 opcodes are named, taken from the 1999 protocol reference, Taj's
 `MessageTypes.cs` and QPalace's `message.hpp`. The `observed live` column marks
-the ones this server actually sent during a probe session (12). Of the 75, 39 are
+the ones this server actually sent during a probe session (12). Of the 75, 40 are
 decoded by `palace-wire`; the rest fall to `Message::Unknown`.
 
 | mnemonic | name | value | observed live |
@@ -531,6 +537,39 @@ decoded by `palace-wire`; the rest fall to `Message::Unknown`.
 | `xwis` | XWHISPER | `0x78776973` |  |
 
 Run `cargo run -p palace-probe -- --list-opcodes` for the same table.
+
+### `down` / SERVERDOWN: why the server dropped us
+
+`down` (`0x646f776e`) is decoded. Its reason is not a body field: the frame
+`refNum` carries the code (protocol reference :1800-1828). The body is empty
+unless the code is `K_Verbose` (16), when it is a `CString` with the server's
+own message.
+
+| code | name | client-visible meaning |
+|---|---|---|
+| 0 | K_Unknown | the server ended the session |
+| 1 | K_LoggedOff | you were logged off |
+| 2 | K_CommError | a communications error ended the session |
+| 3 | K_Flood | disconnected for flooding |
+| 4 | K_KilledByPlayer | another user disconnected you |
+| 5 | K_ServerDown | the server is shutting down |
+| 6 | K_Unresponsive | disconnected for not responding |
+| 7 | K_KilledBySysop | a sysop disconnected you |
+| 8 | K_ServerFull | the server is full |
+| 9 | K_InvalidSerialNumber | the server rejected your serial number |
+| 10 | K_DuplicateUser | another user is already using this account |
+| 11 | K_DeathPenaltyActive | your death penalty is still active |
+| 12 | K_Banished | you were banished from this server |
+| 13 | K_BanishKill | you were banished and disconnected from this server |
+| 14 | K_NoGuests | guests are not allowed on this server |
+| 15 | K_DemoExpired | your free demo has expired |
+| 16 | K_Verbose | the server's own `whyMessage` |
+
+Any other code is reported with its numeric value rather than guessed at. When
+the reason arrives mid-session the client shows it and stops; it does not
+reconnect, because the server has already ended the session. A `down` as the
+very first packet (server full, or a kick at logon) is surfaced the same way
+instead of being rejected as an unknown banner.
 
 ---
 

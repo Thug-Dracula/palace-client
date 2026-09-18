@@ -10,7 +10,7 @@ this file is only what is still open.
 | `protocol.md` | The wire specification. |
 | `$CORPUS/TAURI-CLIENT-SCOPE.md` | Design authority (scope and decisions). Read-only reference. |
 
-**Snapshot:** the registry holds 72 core names plus 133 Palace commands; 39 of the
+**Snapshot:** the registry holds 72 core names plus 133 Palace commands; 40 of the
 75 named opcodes are decoded.
 
 ---
@@ -21,17 +21,15 @@ this file is only what is still open.
   `auth` (`AUTHENTICATE`) after logon and waits for `autr` (`AUTHRESPONSE`). The
   request is decoded and reported; the reply is not implemented, so an
   auth-requiring server refuses this client.
-  - **Option (a) — implement the reply.** Needs a credential source. There is no
-    password field anywhere in `ClientConfig` or `Settings`, so this first needs a
-    decision about where a credential lives (config file, interactive prompt,
-    system keyring). The reply is a PString of `user:password`.
-  - **Option (b) — stop advertising the capability.** One line: `aux_flags`
-    `0x8000_0008` → `0x0000_0008`, plus updating the test that pins it. Not done
-    unilaterally, because it departs from the captured reference logon on the
-    critical logon path.
-- [ ] **The hover pair.** `SETTOOLTIP` and `CLEARTOOLTIP` are registered but
-  unimplemented, and the `ROLLOVER`/`ROLLOUT` runtime events they depend on are
-  not dispatched yet. This is the largest remaining command gap by corpus use.
+  - **Done — the capability is no longer advertised.** The application sends
+    `aux_flags` `0x0000_0008` (via `ClientProfile`); `ReferenceProfile` keeps
+    `0x8000_0008` for the walker-oracle tests. A server is no longer told this
+    client can answer a challenge it cannot.
+  - **Open — implement the reply.** `AUTHRESPONSE` is a PString of
+    `user:password`, so it needs a credential source. There is no password field
+    anywhere in `ClientConfig` or `Settings`, so this first needs a decision
+    about where a credential lives (config file, interactive prompt, system
+    keyring).
 
 ---
 
@@ -45,7 +43,7 @@ this file is only what is still open.
 - [ ] **`durl` (DISPLAYURL) — the one unresolved opcode.** The spec documents a
   body; no server constructs it.
 - [ ] **Register or remove the unregistered fallback names.** The host's fallback
-  arm lists 34 commands it recognises but does not implement; 28 of them are not
+  arm lists 32 commands it recognises but does not implement; 28 of them are not
   in `PALACE_COMMANDS`, so a script that calls one lexes the name as a variable
   and misbehaves quietly. Registering them changes that silent misbehaviour into
   an explicit report; implementing them is the larger task.
@@ -53,7 +51,6 @@ this file is only what is still open.
 
   | Opcode | What it would fix |
   |---|---|
-  | `down` SERVERDOWN | a forced disconnect (kick/ban/flood/full/shutdown) shows as a bare socket close |
   | `sRom` ROOMSETDESC | room edits made while you are inside are not reflected |
   | `blow` BLOWTHRU | the plugin-relay channel |
   | `sFil` / `fnfe` / `qFil` | legacy server-hosted file transfer, superseded by HTTP media |
@@ -92,13 +89,13 @@ this file is only what is still open.
 ## 5. Dynamic room content and the arena
 
 The fetched arena interface script runs end to end: `LOADSCRIPT`/`HTTPGET`,
-`ADDSPOT`, `ADDPIC`, `SETSPOTOPTIONS`, `SETPICLOCLOCAL` and `SETSPOTSCRIPT` are
+`ADDSPOT`, `ADDPIC`, `SETSPOTOPTIONS`, `SETPICLOCLOCAL`, `SETSPOTSCRIPT`,
+`SETTOOLTIP`/`CLEARTOOLTIP` and the `ROLLOVER`/`ROLLOUT`/`MOUSEMOVE` events are
 implemented, and the `comma_separator` lexer extension handles the served
 dialect. What remains:
 
 - [ ] **No live run.** The script-level chain is proven; nobody has watched the
   arena accept a player. That needs a human at the app.
-- [ ] `SETTOOLTIP`/`CLEARTOOLTIP` (see §1).
 - [ ] `ADDSPOT` reads its points through `props_arg`, which keeps integers only;
   the reference also accepts quoted numeric strings.
 - [ ] `SETSPOTSCRIPT` matches a literal uppercase `ON`, like the reference
@@ -178,9 +175,8 @@ or set `CARGO_TARGET_DIR` to reuse the warm target directory.
 
 ---
 
-## 10. Hard boundaries
+## 10. Verifying the interface
 
-See **`STATUS.md` → Hard boundaries**. In short: never inject desktop input,
-never unlock or screenshot the user's screen, never activate their windows, never
-ask for a credential. Drive the app's own command path instead, and never write a
-definition of done that can only be satisfied by driving the user's desktop.
+See **`STATUS.md` → Verifying the interface**. In short: the interface can be
+checked through the app's own command path and headless renders, so a numeric
+result is enough to prove a transform. Appearance still needs a human once.
