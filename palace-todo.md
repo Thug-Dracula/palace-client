@@ -1,1012 +1,186 @@
-# palace-todo.md — what is done, and what is left
+# palace-todo.md — live backlog
 
-A working checklist for the Palace client. Companion files:
+A working checklist for the Palace client. Completed work is not recorded here;
+this file is only what is still open.
 
 | File | Role |
 |---|---|
 | `README.md` | What The Palace is, and what this project is. |
-| `STATUS.md` | The detailed handoff record — evidence, root causes, measurement methods. **This file is the summary; STATUS.md is the authority.** |
+| `STATUS.md` | Current state, evidence and hard boundaries. **The authority for what is true.** |
+| `protocol.md` | The wire specification. |
 | `$CORPUS/TAURI-CLIENT-SCOPE.md` | Design authority (scope and decisions). Read-only reference. |
-| `protocol.md` | The protocol notes we keep ourselves. |
 
-**Snapshot:** 133 commits on `master` · no git remote (publication is a scrubbed copy, see below).
-**Uncommitted in the tree:** the arena work — `ADDSPOT`/`ADDPIC`/`SETSPOTOPTIONS`, the
-`comma_separator` lexer extension, and `SETSPOTSCRIPT` with `Chunk::source` (§2.24, and the latest
-update in `STATUS.md`). Gates green: `fmt` clean, clippy clean, **785 tests**, corpus unchanged at
-2396/2400 with zero tokenizer gaps. The §1.9 items (name tags, click-to-walk, visibility toggles, the
-avatar picker) have since been committed.
+**Snapshot:** the registry holds 72 core names plus 133 Palace commands; 39 of the
+75 named opcodes are decoded.
 
 ---
 
-## Part 1 — Work completed
+## 1. Top of queue
 
-### 1.1 The foundation: eight crates, contracts unchanged
-
-| Crate | State | Evidence |
-|---|---|---|
-| `palace-wire` | done | framing, `ByteOrder`, 75-opcode table, codecs |
-| `palace-probe` | done | live logon: 81 rooms / 2 users |
-| `palace-room` | done | 804/804 corpus records parse |
-| `palace-prop` | done | 5 decoders + S20 encoder; 227,874-prop differential = 0 disagreements |
-| `palace-asset` | done | `qAst`/`sAst`/`rAst`, paced scheduler, media HTTP |
-| `palace-render` | done | composites rooms → PNG; coordinate round-trip tested |
-| `iptscrae` | done | lexer, parser, VM, budgets, capability trait, regex; zero dependencies |
-| `iptscrae-palace` | done | 497-line host trait, 371 lines of Palace commands; corpus 2396/2400 parse, 3791/3805 handlers clean |
-
-### 1.2 The interactive client milestone
-
-- `crates/palace-client/` — headless runtime: connection supervisor, media worker thread, session
-  state machine, frame store. Emits `ClientEvent`s, no Tauri types.
-- `src-tauri/` (`palace-app`) — Tauri v2 shell; `palace://` URI scheme serves the frame as PNG.
-- `src/` — SvelteKit 5 frontend: room viewport, room/user lists, chat, status bar, connect form.
-- `crates/palace-client/src/bin/live-smoke.rs` — headless live harness.
-- No `Vec<u8>` crosses a Tauri command; the webview receives one bitmap.
-
-### 1.3 Bugs found and fixed
-
-- **`navr_frame` built a malformed body** — the length constant was inside the payload, so the server
-  read destination room 2 and navigation silently did nothing. Fixed; wire bytes pinned by test.
-  Room switching now works live.
-- **`xtlk`/`xwis` had no cipher** — encrypted chat degraded to `Message::Unknown`. Park–Miller
-  Lehmer keystream implemented in `crates/palace-client/src/xtlk.rs`, LUT asserted against
-  independently computed values.
-- **The effect-application gap** — `apply_effect()` ended in a catch-all that logged effects and
-  changed nothing. All 16 missing arms written, catch-all removed, match now exhaustive (deleting an
-  arm fails the build with `E0004`).
-- **Seven arms that applied nothing** — set `*dirty_render = true`, emitted a note, and mutated no
-  state, so they forced a byte-identical re-render. An inert arm is indistinguishable from a working
-  one inside a `match`, which is how it stayed hidden. All seven now mutate what the renderer reads.
-- **`DIMROOM` never reached the room** — `palace-render` had `dim_level` and `apply_dim` all along;
-  the builder hardcoded `1.0` and the runtime arm only logged. Three links added.
-- **The receive path was mostly deaf** — 7 messages now decode and apply (`USERFACE`, `USERCOLOR`,
-  `USERPROP`, `USERDESC`, `PROPNEW`, `PROPMOVE`, `PROPDEL`), so other users' faces, colours and worn
-  props change, and loose props appear, move and vanish.
-- **Name tags rendered nothing, because no name was ever supplied** — `palace-render` gained a complete,
-  tested name-tag rasterizer, but `avatar_specs()` in `runtime.rs` built every `AvatarSpec` without
-  `name`, so every tag was `None` and the renderer correctly drew nothing. The renderer was right and
-  the wiring was absent — a whole feature silently inert with every test green. Now wired, and locked
-  by a test that fails if the assignment is removed. Same class as the "seven arms that applied
-  nothing" above: a component can be complete, correct, tested, and still not connected.
-
-### 1.4 Windows portability — the build had never been *run*
-
-The `v0.1.0` portable zip failed immediately with `os error 123`, because the session cache directory
-was named `localhost:9998` and a colon is illegal in a Windows filename. Fixed and tested:
-
-- `host:port` escaped to `localhost%3A9998` via a shared `escape_name_component` (also covers IPv6).
-- `session_cache_dir()` extracted so the *wiring* is testable, not just the helper.
-- Cache root prefers `XDG_CACHE_HOME` → `LOCALAPPDATA` → `HOME/.cache` → `temp_dir()`.
-- `split_paths` replaced `split(':')`, which was mangling `C:\props`; `HOME` falls back to `USERPROFILE`.
-- `write_media` refuses names Windows cannot hold (reserved device names, control chars, `:`).
-
-**Lesson:** a cross-compile check cannot catch this class. `cargo check --target x86_64-pc-windows-gnu`
-passed cleanly throughout — the problem is path *semantics at runtime*. Windows dev loop instructions:
-`$MEDIA/palace-client-windows-dev-setup.md`.
-
-### 1.5 Door locks
-
-Locked doors were walkable, because the lock state was never heard. `DOORLOCK`/`DOORUNLOCK` (`lock`/`unlo`)
-and `SPOTSTATE` (`sSta`) now decode. Key fact: a door's locked state *is* the hotspot `state` field
-(`HS_Unlock = 0`, `HS_Lock = 1`), so no new model field was needed. A click on a locked door is
-refused with a transcript note instead of dispatching `SELECT`.
-
-**CORRECTED (this session): the refusal used to cover `HS_Door` (1) too, and that was a bug — it broke
-every ordinary door.** The spec (`PalaceProtocolRef.txt`, hotspot record) says `state` "selects which of
-the pictures associated with the hotspot should be displayed. *Among other things*, it encodes whether a
-door is locked or unlocked." So `state` is **primarily a picture index**; a plain `HS_Door` (1) cannot be
-locked at all, and its `state == 1` is just the second frame of a two-picture door. Refusing it meant the
-click never dispatched, so the door's script (`ME DEST GOTOROOM` on Colosseum) never ran: *"no doors seem
-to work."* The rule now applies to `HS_LockableDoor` (3) only. The asymmetry argument below is what should
-have caught this — the code erred on the wrong side of it.
-
-### 1.6 Opcodes: what is vestigial, settled permanently
-
-Four room-mutation opcodes (`SPOTSETDESC`, `PICTNEW`, `PICTDEL`, `PICTSETDESC`) have **no documented
-body anywhere**. Proof: grepping the spec for `struct ClientMsg_(pict|spot)` returns exactly five
-definitions; the protocol's own legend includes a glyph for *"defined but unused"* and says such
-messages *"will not appear in the individual message descriptions."* Corroborated across nine
-authorities on disk. **Do not implement these** — the width and field order are unknowable, and a
-wrong decoder is worse than an honest "ignored opcode" line.
-
-A further 14 opcodes are vestigial (`PROPSETDESC`, `ASSETNEW`, `USERENTER`, `SERVERUP`, `WMSG`, `NOOP`,
-`TIMYID`, `RESPORT`, `TROPSER`, `INITCONNECTION`, and the four above).
-
-### 1.7 The opcode-coverage audit
-
-All 40 undecoded opcodes classified: 7 already handled elsewhere, 14 vestigial, 1 unresolved, 18 real
-but non-blocking. **Nothing still missing breaks using the client on a public server**, with one
-exception.
-
-### 1.8 This session's most recent stretch
-
-| Commit | What |
-|---|---|
-| `ec21f1e` | `AUTHENTICATE` decoded and reported honestly rather than silently stalling |
-| `97fe6b9` | the opcode-coverage audit recorded so it is not repeated |
-| `890b325` | two unanswered hotspot-click questions recorded |
-| `d4b053d` | only a door that can be locked refuses a click (narrowing correction) |
-| `ceaa998` | refuse a media name a Windows filesystem cannot hold |
-| `12ec28c` | four room-mutation opcodes recorded as vestigial, not missing |
-| `6d24495` | hotspots appearing/moving/vanishing (`SPOTNEW`/`SPOTDEL`/`SPOTMOVE`/`PICTMOVE`) |
-| `9306590` | door locks, and refusing to walk through a locked door |
-| `23acbd3` | run on Windows, not just compile there |
-
-Verified green: `fmt` clean, `clippy -D warnings` clean across all six protocol/render/client crates,
-all suites passing. Each new test was proven real by cutting its application arm and confirming the
-failure, then restoring.
-
-### 1.9 Current uncommitted work — name tags, walking, visibility, avatar picker
-
-Four features, all landed in the working tree and gated green (`cargo fmt` clean,
-`clippy -D warnings` clean for the touched crates, `palace-client`/`palace-render`/`palace-wire` suites
-passing, `bun run check` 0 errors 0 warnings, `bun run build` succeeds). **Not committed.**
-
-| Area | What landed |
-|---|---|
-| `palace-wire/src/frame.rs` | `user_move_frame`, `user_face_frame`, `user_color_frame` — each byte-pinned in **both** endians against the spec |
-| `palace-render/src/nametag.rs` | name-tag raster (438 lines) + embedded OFL font + licence; 8 unit tests |
-| `palace-render` | `name_tags_visible` on the scene/builder, drawn at layer 9 (above avatars, below the above-name-tags band) |
-| `palace-client` | floor click → `USERMOVE` (clamped like the renderer, applied locally) + `spec.name` wired; `set_visibility`; `set_avatar` |
-| `src-tauri` | `set_visibility(names, avatars)`, `set_avatar(face, color)`, and `palace://localhost/faces` serving the sheet |
-| `src/` | right-click room menu (Show names / Show avatars / Choose an Avatar…), `AvatarDialog` (13×16 picker), `api.ts` + store wiring |
-
-Two traps worth remembering:
-
-- **`Point::new(v, h)` is `(y, x)`** — `v` (vertical) comes first on the wire, the opposite of what
-  `Point::new(x, y)` suggests. Every encoder here depends on getting that right.
-- **The name-tag glow is a dilation approximation** of Flash's Gaussian `GlowFilter`, not a
-  reproduction. Documented as such in `nametag.rs`; do not "fix" it toward pixel-parity without a
-  reference capture.
-
-### 1.10 Found by live testing on Colosseum — four more bugs, all with a common shape
-
-Live testing against Colosseum (room ids into the 73xxx range, scripts far more demanding than the
-corpus) exposed four defects. The pattern is worth naming: **every one was a component that was
-individually correct, tested, and disconnected** — the same shape as the name-tag bug in §1.3.
-
-| Bug | What it looked like to the user | Root cause |
-|---|---|---|
-| Room ids >65535 **clamped** instead of truncated | Clicking a team/door hotspot did nothing, silently | `typedef sint16 RoomID`, so `73251` must narrow to `7715`; `clamp(0, 65535)` sent a nonexistent room. Two sites: `palace-host/src/wire.rs`, `palace-client/src/state.rs` |
-| `MSG_NAVERROR` (`sErr`) not decoded | A refused room change was **completely silent** | refNum carries the code (`SE_RoomUnknown 1`, `SE_RoomFull 2`, …); now decoded and surfaced as a chat error with a name |
-| Script moves (`SETPOS`/`MOVE`) mutated nothing | Doors/teleports did nothing; the note claimed success | `Effect::MoveUserAbs`/`MoveUserRel` set `dirty_render` and logged, but the frame was sent *and* the local avatar was never updated — and the server does not echo your own `uLoc`. Now both use one shared `move_target()` so the sent and applied positions cannot diverge |
-| Plain doors refused as "locked" | "No doors seem to work" | `state` is primarily a *picture selector*; treating `state == 1` as locked on `HS_Door` (1) blocked dispatch. Narrowed to `HS_LockableDoor` (3) — see §1.5 |
-
-Two traps worth keeping:
-
-- **A silent failure is worse than a loud one.** The room-id bug was invisible for exactly as long as
-  `NAVERROR` was undecoded. Where a server can refuse us, decode the refusal.
-- **`state` is overloaded.** Doors use one field for both "which picture" and "locked"; the spec's
-  "among other things" is doing a lot of work. Read hotspot fields per type, never globally.
-
-**The room-id conclusion is verified, not assumed** (it was the one load-bearing guess here):
-`typedef sint16 RoomID` in the spec (:222), `UserListRec.room_id: i16` (spec §3.18), our own
-`RoomListRec` comment ("a 32-bit *field* even though room ids are 16-bit"), and — decisively —
-**pserver's own `typedef std::pair<int16_t, Room*> RoomID`** (`include/server.hpp:170`). The id space
-is 16-bit in the server, so no room can be `73251`; truncating to `7715` is what addresses the room the
-script means. The body is 2 bytes, which small-id navigation working live already proves. pserver's
-repo here is a stub (the opcode is defined, no handler), so this rests on the type plus the working
-behaviour, not on reading its parser.
-
-Also found (being fixed as this was written): **`SETUSERNAME` was local-only** — the rename never
-reached the server, so other players never saw a character change. `usrN` is bidirectional with a
-revert-on-failure path, and now has an encoder and decoder.
+- [ ] **Authentication — blocked on a decision.** A server that requires it sends
+  `auth` (`AUTHENTICATE`) after logon and waits for `autr` (`AUTHRESPONSE`). The
+  request is decoded and reported; the reply is not implemented, so an
+  auth-requiring server refuses this client.
+  - **Option (a) — implement the reply.** Needs a credential source. There is no
+    password field anywhere in `ClientConfig` or `Settings`, so this first needs a
+    decision about where a credential lives (config file, interactive prompt,
+    system keyring). The reply is a PString of `user:password`.
+  - **Option (b) — stop advertising the capability.** One line: `aux_flags`
+    `0x8000_0008` → `0x0000_0008`, plus updating the test that pins it. Not done
+    unilaterally, because it departs from the captured reference logon on the
+    critical logon path.
+- [ ] **The hover pair.** `SETTOOLTIP` and `CLEARTOOLTIP` are registered but
+  unimplemented, and the `ROLLOVER`/`ROLLOUT` runtime events they depend on are
+  not dispatched yet. This is the largest remaining command gap by corpus use.
 
 ---
 
-## Part 2 — Work still to do
+## 2. Protocol
 
-### 2.1 BLOCKED ON A DECISION — authentication (the only hard blocker)
-
-**Where:** `crates/palace-wire/src/messages/logon.rs`, plus a new `AUTHRESPONSE` encoder and a
-credential source.
-
-On a server that requires authentication, the server sends `auth` (`AUTHENTICATE`) after logon and
-waits for `autr` (`AUTHRESPONSE`). The request is now **decoded and reported** in the transcript, so
-the failure is explained instead of silent — but **the exchange is still unimplemented, so an
-auth-requiring server will still refuse this client.**
-
-Two routes, both needing a decision:
-
-- [ ] **(a) Implement the reply.** Needs a credential source. There is **no password anywhere** in
-  `ClientConfig` or `Settings` today, so this first requires deciding *where a credential lives*
-  (config file? interactive prompt? system keyring?). The reply is a PString of `user:password`
-  (`PalaceProtocolRef.txt` :750-754). *Recommended* — every real client advertises this capability
-  precisely because it can authenticate.
-- [ ] **(b) Stop advertising the capability.** One line: `aux_flags = 0x8000_0008` → `0x0000_0008`,
-  plus updating the test that pins it. **Not done unilaterally** because it departs from the captured
-  reference logon and could change behaviour on the critical logon path; the research that would have
-  settled whether it is safe did not complete.
-
-**Why this bites at all:** our own logon *asks* for the challenge we cannot answer.
-
-**Current state is safe:** an auth-requiring server yields an explained failure, not a hang.
-
-### 2.2 Publish the current work
-
-- [x] Re-run the scrub-and-push to bring the public copy up to date.
-
-```bash
-tools/publish-public.sh git@github.com:example-user/palace-client.git
-```
-
-There is **no git remote** on this repo — publication is a scrubbed clone pushed to the public repo,
-so this command is the only way to publish. `tools/public-scrub.map` is gitignored and local-only.
-
-Republished 2026-09-17 at 122 commits; public `main` is now `72610c35`. The script verifies the tree
-and every commit's blobs — binaries included — for the leak patterns *before* it pushes, and it pushes
-without `--force`, so a rejected push fails safely instead of rewriting the public history. The
-non-forced push fast-forwarded, which is the intended property: rewriting the same source with the
-same map reproduces the earlier rewritten commits byte-for-byte, so each publication *extends* the
-last rather than forking from it. If the map is ever edited, every rewritten hash changes and the push
-will be rejected — read that rejection as a signal to reconcile deliberately, never as a reason to
-force. (`command -v git-filter-repo` reports it missing, yet `git filter-repo` runs: it is found
-through git's exec-path, not `PATH`. The prerequisite check is unreliable; the script is not.)
-
-**Local clippy is weaker than CI, and this bit us.** CI installs `dtolnay/rust-toolchain@stable`,
-which is *rolling*, while this machine was on `rustc 1.95.0` and CI was on `1.98.0`. Clippy 1.98 added
-`unneeded_wildcard_pattern`, so `Effect::FetchScript { url: _, .. }` passed every local gate and failed
-CI — which failed the first `v0.2.0-alpha` release attempt. **A local clippy pass is not sufficient
-verification here; CI is the authority, and a green local run means only that this toolchain has
-nothing to say.** **Resolved 2026-09-17: the local toolchain was updated to `rustc 1.98.1` / `clippy 0.1.98`,
-matching CI, and clippy is clean across every crate except the Tauri app (`palace-app`, which
-needs the 20-40 minute build). Local gates are trustworthy again. The lesson stands though: CI
-runs rolling stable, so this drifts back with time and the update is worth repeating periodically -
-and a green local run still only means *this* toolchain has nothing to say. Nothing else in the tree carries that particular pattern.
-
-**Cutting a release, in order**, because the order is load-bearing:
-1. Bump `version` in `src-tauri/tauri.conf.json` **and** `Cargo.toml`'s `[workspace.package]` (and
-   `package.json` for tidiness); refresh `Cargo.lock` with `cargo metadata`. The workflow compares the
-   tag's numeric part against `tauri.conf.json` and fails the run if they differ.
-2. Publish the source so the public tree carries the bump.
-3. Create the tag **on the published commit**, not a local one — our commits and the public ones have
-   different hashes, so a local tag cannot be pushed. Moving an existing tag means forcing the ref
-   (`gh api -X PATCH .../git/refs/tags/<tag> -F force=true`), which is safe only while no release has
-   succeeded from it.
-4. The tag's suffix is free-form and is stripped before the version comparison, because Windows
-   installers reject a pre-release suffix in an app version: `v0.2.0-alpha` declares `0.2.0`.
-   The release is created **without `--prerelease`**, so it becomes GitHub's "Latest" and the stale
-   `v0.1.0` stops being advertised.
-
-### 2.3 Protocol features that are decoded-but-local or missing
-
-- [ ] **`SETLOC`/`SETPICLOC` never reach the server.** The non-local variants should broadcast so the
-  whole room sees a move, but `SPOTMOVE` (`coLs`) and `PICTMOVE` (`pLoc`) have **no verified body
-  layout** to port. Every other encoder in `wire.rs` is pinned byte-for-byte against a working
-  reference sender; OpenPalace's own `moveSpot`/`setPicOffset` are no-op stubs. Until a reference is
+- [ ] **`SETLOC`/`SETPICLOC` never reach the server.** The non-local variants
+  should broadcast so the whole room sees a move, but `SPOTMOVE` (`coLs`) and
+  `PICTMOVE` (`pLoc`) have no verified body layout to port, and the reference
+  clients' own `moveSpot`/`setPicOffset` are no-op stubs. Until a reference is
   found, a script's spot move is local to this client only.
-- [ ] **`durl` (DISPLAYURL) — the one unresolved opcode.** The spec documents a body; no server
-  anywhere constructs it.
-- [x] **`protocol.md` loose-prop traversal — already correct.** The section now reads "steps *backwards
-  through the buffer*. That is a fact about the byte offsets, **not** about the logical order", which is
-  exactly the correction this item asked for. Stale entry.
-- [x] **`STATUS.md` decoded count — fixed.** It said "40 undecoded opcodes (75 in the table, 35 decoded)"
-  while the same section said `AUTHENTICATE` is now decoded. Now states which snapshot the 40 refers to
-  and gives the current split (36 decoded / 39 undecoded).
+- [ ] **`durl` (DISPLAYURL) — the one unresolved opcode.** The spec documents a
+  body; no server constructs it.
+- [ ] **Register or remove the unregistered fallback names.** The host's fallback
+  arm lists 34 commands it recognises but does not implement; 28 of them are not
+  in `PALACE_COMMANDS`, so a script that calls one lexes the name as a variable
+  and misbehaves quietly. Registering them changes that silent misbehaviour into
+  an explicit report; implementing them is the larger task.
+- [ ] **Feedback and send-side opcodes**, in the order a user would notice:
 
-### 2.4 Open questions from the door work (unchecked, not known-broken)
+  | Opcode | What it would fix |
+  |---|---|
+  | `down` SERVERDOWN | a forced disconnect (kick/ban/flood/full/shutdown) shows as a bare socket close |
+  | `sRom` ROOMSETDESC | room edits made while you are inside are not reflected |
+  | `blow` BLOWTHRU | the plugin-relay channel |
+  | `sFil` / `fnfe` / `qFil` | legacy server-hosted file transfer, superseded by HTTP media |
+  | `autr` AUTHRESPONSE | the reply an auth-requiring server waits for (§1) |
+  | `susr`, `kill`, `gmsg`, `smsg`, `rmsg`, `nRom`, `sInf` | send-side: become wizard, kick, global shout/page, create room, server info |
 
-We currently only run a hotspot's `ON SELECT` script on a click, and send nothing ourselves. That may
-be sufficient if the room's script does the work:
+---
 
-- [ ] **`HS_Bolt` (4)** — "bolt that locks or unlocks door pointed to by `dest`" (:1668). If the client
-  is meant to send `DOORLOCK`/`DOORUNLOCK` for the door at `dest`, we do not, and clicking a bolt does
-  nothing unless the room's script covers it.
-- [ ] **`HS_ShutableDoor` (2)** — "a door that can be opened/closed (by clicking)" (:1666). Closing
-  implies something advances the state. If the client is meant to send `SPOTSTATE`, we do not.
+## 3. Rendering and presentation
 
-Both settle cheaply by reading how a reference client handles a click on those types.
-
-### 2.5 Feedback channels worth decoding (ranked; none is blocking)
-
-| | Opcode | What it would fix |
-|---|---|---|
-| 2 | `down` SERVERDOWN | a forced disconnect (kick/ban/flood/full/shutdown) shows as a bare socket close with no reason |
-| 3 | `sErr` NAVERROR | a failed room change (full/closed/pinned/password/kicked) is silently ignored |
-| 4 | `usrN` USERNAME | ~~live renames are invisible; no way to rename yourself~~ **being fixed** — `usrN` now has an encoder and decoder, so `SETUSERNAME` reaches the server (and the spec's revert-on-failure path applies). See §1.10 |
-| 5 | `draw` DRAW (receive) | other people's paint is dropped at decode |
-| 6 | `sRom` ROOMSETDESC | room edits made while you are inside are not reflected — pserver does send this |
-| 7 | `blow` BLOWTHRU | the plugin-relay channel |
-| 8 | `sFil` / `fnfe` / `qFil` | legacy server-hosted file transfer, superseded by HTTP media |
-| 9 | `susr`, `kill`, `gmsg`, `smsg`, `rmsg`, `nRom`, `sInf` | send-side: become wizard, kick, global shout/page, create room, server info |
-
-- [ ] Pick these off in order as they annoy you; #2 and #3 are the ones a user would actually notice.
-
-### 2.6 Rendering and presentation gaps
-
-- [x] **Name tags — done** (§1.9): rasterized with an embedded font, positioned at the reference
-  formula, drawn above avatars, toggleable. The glow is a documented approximation, not Flex's
-  `GlowFilter`.
-- [ ] **Everything else in rasterization** — `LINE`/`LINETO` are dispatched and dropped; chat text and
-  draw strokes are not rasterized into the frame. Presentation-layer font/line work.
-- [ ] **Sound and MIDI playback** — `SOUND`, `MIDIPLAY`, `MIDILOOP`, `MIDISTOP`, `BEEP` are
-  dispatched and reported, but nothing plays.
+- [ ] **Chat text rasterization.** Draw commands and name tags are rasterized;
+  chat text is the one layer that is not.
+- [ ] **The remaining draw commands.** `CIRCLE`, `FILL`, `PAINT` and `TEXT` are
+  not implemented, and `DRAW`'s text operands have a layout the references leave
+  undetermined.
+- [ ] **A data-driven face grid.** The grid (13 faces × 16 colours × 44 px) is
+  hardcoded in the renderer, the protocol constant and the avatar picker;
+  describing it in a data file and loading art from a folder like every other
+  asset would make the placeholder genuinely replaceable.
 - [ ] **`WEBEMBED`** is not registered; `GOTOURL` is reported rather than opened.
-- [ ] **Deco, prop editor UI, theming** — out of scope so far, untouched.
+- [ ] **Deco, prop editor UI, theming** — out of scope so far.
 
-### 2.7 The placeholder-art constraint
+---
 
-- [ ] **Make the face grid data-driven.** The real limitation is *not* art quality: the grid
-  (13 faces × 16 colours × 44 px) is hardcoded in the binary, so different art or a different face
-  count is a code change. Describing the grid in a small data file and loading art from a folder like
-  every other Palace asset is what would make the placeholder genuinely replaceable. Polish, not a
-  blocker. **Now worse:** the new avatar picker (§1.9) hardcodes `13`/`16`/`44` a second time in
-  `AvatarDialog.svelte`, so a face-count change means editing the renderer, the protocol constant and
-  the dialog. Any data-driven fix must cover all three.
-- A pixel-perfect re-extract (208 clean 44×44 cells) is parked at
-  `$HOME/ProgramFiles/palace-faces-placeholder/` — a zero-code-change drop-in. Current sheet is a
-  *resampled* copy: 1,467 colours per cell against the source's 200 (interpolation), 807 KB against
-  182 KB, for a worse result.
+## 4. Audio
 
-### 2.8 Known pre-existing gaps (carried over)
+- [ ] **`SOUND`** is surfaced but never reaches an audio device. The reference
+  plays a bundled name from a built-in map, and otherwise fetches
+  `mediaServer + name + ".mp3"`; the media pipeline already fetches and caches
+  arbitrary media by name, so the fetch-by-name path is the one that matters.
+- [ ] **`MIDIPLAY`/`MIDILOOP`/`MIDISTOP`** need a synthesizer, not just a decoder,
+  and are a follow-up to `SOUND`.
 
-- [ ] Multi-block asset transfer — reference-derived only, no real capture exists.
+---
+
+## 5. Dynamic room content and the arena
+
+The fetched arena interface script runs end to end: `LOADSCRIPT`/`HTTPGET`,
+`ADDSPOT`, `ADDPIC`, `SETSPOTOPTIONS`, `SETPICLOCLOCAL` and `SETSPOTSCRIPT` are
+implemented, and the `comma_separator` lexer extension handles the served
+dialect. What remains:
+
+- [ ] **No live run.** The script-level chain is proven; nobody has watched the
+  arena accept a player. That needs a human at the app.
+- [ ] `SETTOOLTIP`/`CLEARTOOLTIP` (see §1).
+- [ ] `ADDSPOT` reads its points through `props_arg`, which keeps integers only;
+  the reference also accepts quoted numeric strings.
+- [ ] `SETSPOTSCRIPT` matches a literal uppercase `ON`, like the reference
+  parser; a lowercase `on` in an existing source is not a handler to either.
+
+---
+
+## 6. Props
+
+- [ ] **A props panel.** Worn props are sent to the server, but nothing in the
+  interface can set them, so the feature is only half reachable. The bag reader
+  in `palace-prop` parses `PropBag.bundle` already; the panel needs a tile grid,
+  toggle-wear, delete and saved outfits.
+- [ ] **`ASSET_REGI`.** Decide whether uploading a worn prop's art is required
+  for the server to accept the prop, or whether `USER_PROP` alone suffices.
+- [ ] **The constant prop stubs.** `GETPICDIMENSIONS` returns `(0, 0)`;
+  `PROPDIMENSIONS`/`PROPOFFSETS` push zeros and `has_prop_by_name` returns
+  false. `GETPICDIMENSIONS` needs a source of picture dimensions (the PNG
+  `IHDR`, or the decode already done), a `pict_id → (w, h)` map in `HostView`,
+  and the runtime populating it before dispatch. `PROPDIMENSIONS`/`PROPOFFSETS`
+  need the equivalent for props.
+- [ ] **`LOADPROPS`** is effect-free by design (a prefetch with a 500-id limit).
+  The real gaps are the 500-limit error the reference throws (we accept anything
+  silently) and the prefetch itself, which needs a prop store the host cannot
+  reach yet — the same plumbing the dimension work needs.
+
+---
+
+## 7. Known pre-existing gaps
+
+- [ ] Multi-block asset transfer — reference-derived only, no real capture.
 - [ ] 16-bit props — zero real samples.
 - [ ] All 155 loose-prop IDs in the local corpus are missing from local stores.
 - [ ] `pserver_full.prp` is systematically corrupt.
 - [ ] Avatar anchor offset `x−22, y−22`; one reference uses −21 (1 px ambiguity).
 
-### 2.9 Needs a human, not a script
-
-- [ ] **Click the real zoom slider once.** The last visual pass went through the runtime command path,
-  not a mouse drag, because the screen locked mid-QA. Everything is wired to the same `set_viewport`
-  command and the numeric sweep matches the tested transform — but a human should click it.
-- [ ] **Open the new right-click menu and the avatar picker once.** Both are new UI (§1.9). The
-  *numeric* core is now verified objectively: the sheet is exactly `572×704 = 13×44 × 16×44` with no
-  padding, and the picker's `-(face*44)px -(color*44)px` addresses the same cell the renderer's
-  `smiley_cell` reads (`face → x/column`, `color → y/row`, `face.rs:63-64`), so a pick cannot land on
-  the wrong cell. What remains unverified is only *appearance* — that the menu and dialog look right,
-  sit inside the viewport, and read well. `svelte-check` cannot tell you that, and neither can I
-  without driving your desktop, which this project forbids.
-- [ ] **Walk somewhere on a live server.** Click-to-walk is tested against the mock harness only; the
-  claim that the server does not echo your own `uLoc` back (so the client must apply it locally) is
-  from the protocol reference, not from a real observation.
-- [ ] **Watch a real second user's face change arrive** from Balamb Garden. The whole receive path is
-  verified against the mock harness only; nobody has seen it live. On Balamb Garden the logged-on user
-  arrives with `props=0`, so avatar *art transfer* for other users is also still unproven.
-- [x] **Re-run `bun install && bun run check`** — done this session: `svelte-check found 0 errors and
-  0 warnings`, and `bun run build` succeeds.
-
-### 2.10 Housekeeping
-
-- [ ] Commit `6d24495`'s message contains a `MSG(8->)` typo, left unamended rather than rewriting
-  history unasked. Fix only if the history is being rewritten anyway.
-- [ ] `feat/palace-ui`, `feat/events`, `feat/iptscrae` branches are kept as a safety net (all
-  contained in `master`). Delete once publication makes them redundant.
-
-### 2.11 Colosseum rooms load their logic from server-hosted scripts (`LOADSCRIPT`) — DONE
-
-**Superseded — see §2.24.** `LOADSCRIPT` is implemented as an HTTP fetch-and-execute (`b62de07`), not
-through the legacy file-transfer path this section assumes: the response *is* the script (§2.14).
-
-Colosseum rooms call `"big-script.txt" LOADSCRIPT` on entry and define their important functions in
-that file, not in the room payload. Verified against room 31000 ("The Colosseum (5v5)"): the room
-payload defines `cdead`, but **`bouncedef`, `deader` and `pinchat` have zero definitions in it** — they
-come from `big-script.txt`. The same command appears in `Colosseum_Lobby`, `Battle_Prep_bp`,
-`Entrance_xlobby`, `Battle_Arena_blackroom` and room 31743.
-
-`LOADSCRIPT` is **not a command in any reference client** (OpenPalace/QPalace/Taj only have an unrelated
-internal `loadScripts()` method), so it is a pserver extension. Fetching the file requires the legacy
-server-hosted file transfer (`sFil` / `qFil` / `fnfe`), which §2.5 ranks as superseded by HTTP media and
-does not implement.
-
-**Consequence:** any room whose behaviour depends on an externally-loaded script will misbehave in ways
-that look like script bugs but are missing definitions. Before diagnosing a Colosseum room as broken,
-check whether the function it calls is defined in the room payload at all:
-
-```bash
-grep -c "bouncedef DEF" $CORPUS/animanic_walk/room_31000.txt   # 0 = it lives in big-script.txt
-```
-
-- [x] Implemented as fetch-and-execute on the HTTP path (`b62de07`), not the legacy file-transfer path
-  this section predicted. §2.24 records what the arena additionally needed.
-
-### 2.12 Colosseum rooms fetch their logic over HTTP — DONE (lifecycle + fetch)
-
-The other half of §2.11, and larger. Counted across `$CORPUS/scripts/` and
-`$CORPUS/animanic_walk/`:
-
-| | Uses | Implemented |
-|---|---|---|
-| `HTTPGET` in room scripts | **50** | ❌ — our own classifier lists it as an *unregistered* name |
-| `ON HTTPRECEIVED` handlers | 7 | ❌ (the event is defined, never fired) |
-| `ON ROOMREADY` / `ON ROOMLOAD` | 8 / 8 | ❌ (events defined, never fired) |
-
-Real examples: `"http://api.animanic.de/deviantart/" HTTPGET`, and `"ludo/" HTTPGET` — a **relative**
-URL, so it resolves against the server's HTTP origin. We already have that origin:
-`state.banner.media_base`, used by the media fetcher.
-
-**The room lifecycle order is now known exactly**, taken from a reference call site
-(`$CORPUS/reference/repos/sparky/index.js`):
-
-```js
-ri(), Si(), C2(), e.setRoom(payload), Bc(payload.spots), w2(), Ze("ENTER", spots), y2()
-//                                                          ROOMLOAD   ENTER        ROOMREADY
-```
-
-So it is **ROOMLOAD → ENTER → ROOMREADY**. We fire only `ENTER`. Rooms put their fetches in
-`ON ROOMREADY {"ludo/" HTTPGET`, which is why they never run for us.
-
-`sparky` also gives the argument semantics, which are easy to get wrong:
-- `STATECHANGE` is **spot-scoped** and receives the **previous** state as `lastState`.
-- `NAMECHANGE` is room-level with `whoChangeId` + `lastName`; `USERLEAVE`/`USERENTER` are room-level
-  with `whoLeaveId`/`whoEnterId`; `SERVERMSG` with `chatStr`.
-- `HTTPRECEIVED` is **spot-scoped when the `HTTPGET` came from a spot's handler**, room-level
-  otherwise, and carries `httpContents`, `httpHeaders`, `httpContentType`, `httpFilename`, `httpUrl`.
-- Events the reference has that our enum lacks entirely: `USERENTER`, `FACECHANGE`, `COLORCHANGE`,
-  `USERMOVE`, `PROPCHANGE`, `IDLE`, `LOOSEPROPADDED`/`LOOSEPROPMOVED`/`LOOSEPROPDELETED`.
-
-- [x] Done in that order (`b62de07`): the room lifecycle events, then `HTTPGET` +
-  `HTTPRECEIVED`/`HTTPERROR`. `LOADSCRIPT` (§2.11) turned out to be exactly "fetch, then execute" on
-  the same mechanism, as predicted here.
-
-### 2.13 Commands Colosseum uses that this client does not act on, ranked
-
-Method: count uppercase tokens across `$CORPUS/scripts/` + `$CORPUS/animanic_walk/`, then
-subtract the command table (`crates/iptscrae-palace/src/commands.rs`), the interpreter's builtin
-registry (`crates/iptscrae/src/registry.rs`), **and the explicit recognised-but-unimplemented arm at
-`crates/palace-host/src/host.rs:694-704`**. Skipping that third set is what produced the first, wrong
-version of this list — count the operand signatures, not just the names.
-
-**The precise status of everything below: the command is recognised and its operands are consumed
-correctly (so the stack stays balanced and `IF` still parses), but `unimplemented()` reports it and
-nothing happens.** It is not "unknown to the VM".
-
-| Command | Uses | Note |
-|---|---|---|
-| `ADDPIC` | 115 | **done** — a local scene mutation, not a wire body (§2.24). The "undocumented client→server body" reading was wrong |
-| `SETSPOTSCRIPT` | 82 | **done** — merges `ON <EVENT> { … }` into the spot's source locally (§2.24); needs `Chunk::source` |
-| `ADDSPOT` | 81 | **done** — as `ADDPIC`, and returns the new id |
-| `LOADSCRIPT` | 51 | **done** — `b62de07` (§2.11 is stale) |
-| `HTTPGET` | 50 | **done** — `b62de07` (§2.12 is stale) |
-| `SETTOOLTIP` | 47 | hover text; needs ROLLOVER/ROLLOUT dispatch first |
-| `CLEARTOOLTIP` | 41 | as above |
-
-Work order, updated: the room lifecycle + HTTP (done, `b62de07`), and the
-`ADDPIC`/`ADDSPOT` family with `SETSPOTSCRIPT` (done — §2.24) are behind us. What is left from this
-list is the **hover pair** (ROLLOVER/ROLLOUT dispatch + the `SETTOOLTIP`/`CLEARTOOLTIP` commands),
-which is now the top of it.
-
-**Checked and NOT gaps** — recorded so nobody re-derives them as missing, which is what happened here:
-
-- `SGLOBAL` (74) — an alias of the core `GLOBAL`, registered at `commands.rs:215`, with
-  `sglobal_is_the_spot_scope_alias_of_global` covering it.
-- `STR` (1454) — implemented at `host.rs:690` (int or string to string). Its count is also misleading:
-  in these RPG scripts `STR` is overwhelmingly the **strength stat**.
-- `HTTP` (75) — an opcode name (`HTTPSERVER`, `opcode.rs:137`), not a command. The bare uses are a variable.
-- `IDLE` — an event our VM lacks but Colosseum never uses (0 occurrences).
-
-### 2.14 How the HTTP extension actually works: the response *is* a script
-
-This resolves the open question in §2.11/§2.12 — what a handler does with a fetched body. It does not
-read the body, it **executes** it. From `$CORPUS/reference/repos/sparky/index.js`:
-
-```js
-executeScriptSource(source, spotId, url, source, eventName = "HTTPRECEIVED")
-runCachedScripts(event, data)          // CACHESCRIPT'd sources re-run when that event fires
-```
-
-The fetch handler branches on content type:
-
-```js
-const [type, sub] = splitContentType(contentType);
-type === "text" && (sub === "iptscrae" || sub === "ipt") && iptscraeEnabled && body
-  && executeScriptSource(body, spotId, url, body)
-```
-
-So **a fetched resource whose content type is `text/iptscrae` (or `text/ipt`) is run as IPTSCRAE**. That
-is the mechanism behind both `"ludo/" HTTPGET` in `ON ROOMREADY` and `LOADSCRIPT "big-script.txt"`:
-the room fetches its own logic and the client executes it. `CACHESCRIPT` caches such a source so it can
-be re-run later for a named event, and `HTTPCANCEL` aborts one in flight.
-
-Consequences for the plan:
-
-- §2.11 and §2.12 are **one feature, not two**: `HTTPGET`, `LOADSCRIPT` and the `text/iptscrae` branch
-  are the same fetch-and-execute path.
-- The media pipeline already fetches files (that is how `notebarw.gif` arrives), so the smallest useful
-  step is the **content-type branch**: execute a fetched `text/iptscrae` response instead of storing it
-  as media. That alone may be what rooms like 31000 are missing.
-- The camelCase properties `httpContents` / `httpHeaders` / `httpContentType` / `httpFilename` /
-  `httpUrl` (sparky) are for handlers that want the raw payload rather than executing it. Their
-  *accessor spelling inside a script* is still undetermined — no reference spells it in a script, the
-  protocol reference has no `HTTPGET` section, and Colosseum's handlers delegate to `preload`, which is
-  defined in the very external script we cannot fetch. Determine that before implementing raw-data
-  access; do not guess it.
-- The concurrency guard matters: sparky rejects a request when too many are in flight
-  (`Uc(url, method)` against a cap), so an implementation should bound in-flight requests.
-
-- [ ] Implement as one task: the `text/iptscrae` execute branch on the fetch path, then `HTTPGET`
-  (absolute URL, or relative joined to `state.banner.media_base`, scoped to the executing hotspot),
-  then `CACHESCRIPT`/`HTTPCANCEL`.
-
-### 2.15 The prop bag
-
-Palace's "prop bag" (OpenPalace: `PropsWindow.mxml` + `model/PropBag.as`) is the user's **own collection
-of props**, plus **saved outfits**, with toggle-wear, delete, delete-all and "naked". It is not the same
-thing as `palace-prop`, which is the prop *file codec*; the bag is the collection on top of it.
-
-**There is a real bag on this machine.** `~/.local/share/PalaceChat/` is a live Palace client data
-directory, and `PropBag.bundle/` holds:
-
-| File | Meaning |
-|---|---|
-| `PalaceChat.pids` | the bag index — 61504 bytes |
-| `PalaceChat.props` | the props — 8939938 bytes |
-| `PalaceChat.favs`, `Trash.favs` | favourites and trash |
-| `Version`, `macro` | version byte, macros |
-
-**`PalaceChat.pids` format — confirmed, not inferred.** 16-byte big-endian records
-`(a: u32, b: u32, offset: u32, size: u32)`. Figures below are from the first measurement (the file
-grows while the client runs):
-
-- 61504 / 16 = 3844 with remainder 0; every record satisfies `offset + size <= 8939938` (0 violations);
-- offsets are non-decreasing and the blobs **tile `.props` contiguously — every adjacent pair
-  satisfies `off[i] + size[i] == off[i+1]`**;
-- **`(a, b)` is the prop's identity** — `BagThumbCache/*.png` is named `<a:08X>_<b:08X>.png` and
-  **11/11** of those keys are present in `.pids`. The client's own cache is keyed by the same pair,
-  which is why `(a, b)` is treated as the key rather than an index position;
-- each blob is a **fixed 32-byte metadata prefix** followed by a normal prop at `blob + 0x20`.
-  Verified across every record: **3846/3846 blobs have exactly `00 2c 00 2c` at offset 32** (a
-  big-endian 44x44 header). The prefix length is therefore constant; its *content* is not zero —
-  only **223/3846** are all-zero, the rest carry length-prefixed ASCII names (e.g. `explosion2`,
-  `NewProp`, `The Colosseum (1 vs 1)`).
-
-An earlier version of this section called that a "32-byte zero prefix", generalised from blobs 0 and
-1. That was wrong: it is a metadata prefix that happens to be empty on some props, and the fixed
-length is the part that matters. The reader skips 32 bytes.
-
-**`(a, b)` semantics — measured, not guessed.** `a` is the prop/asset **id** and `b` is the **payload
-CRC** (`asset_crc` over `prop[12..]`, the blob minus its 12-byte header):
-
-- `b == payload_crc(prop[12..])` for **3569/3846** records. Spot-check: record with
-  `a = 0x3a3ad1f7` has `b = 0xffa0f716`, which is exactly the CRC of its payload — and
-  `0x3a3ad1f7` is a real `.prp` record id the crate already documents.
-- The exceptions are the synthetic-id records (`a` in the `0x80000000` range with sequential small
-  `b`) plus ~66 large props with `0x400`/`0x800` flag bits set (sizes up to ~670 KB, evidently
-  animated/multi-frame) whose `b` is not the payload CRC over any slice tested. Undetermined for
-  those; do not assume.
-
-**The bag is live data.** It read 3844 records during the first measurement and 3846 minutes later,
-while the user's client was running. Read it read-only, and never hard-code a record count.
-
-Also on disk: `$MEDIA/Prop Files/` holds the source rosters (`Palace1.prp`, `AshFile*.prp`,
-`idk.prp`) — the same `.prp` container `prop-tool` already parses, ~180k props. The *bag* is the curated
-subset; the rosters are everything.
-
-**Wearing a prop is two messages** (`OpenPalace/.../rpc/PalaceClient.as`):
-
-- `ASSET_REGI` = `0x72417374` — uploads the prop's asset bytes, guarded to 44x44 with offsets in
-  −44..88 ("web service big prop... ignore request").
-- `USER_PROP` = `0x75737250` — **the same opcode as our incoming `USERPROP`**; sets the worn list as
-  `(userId, count, (propId, crc=0)*)`, and the reference **caps the list at 9 worn props** while still
-  writing the untruncated `count * 8 + 4` size field.
-
-Our wire crate has only the incoming half, so both encoders are new work.
-
-Plan, in dependency order:
-
-- [ ] `palace-prop`: reader for `PropBag.bundle` (`.pids` index + `.props` blobs) + `prop-tool bag`.
-- [ ] `palace-wire`: `ASSET_REGI` and `USER_PROP` encoders.
-- [ ] A props panel: tile grid of the bag, toggle-wear, delete, save/restore outfit.
-- [ ] Wear wiring in the runtime (last — it needs `runtime.rs`, and it is the piece that actually
-  changes the session, so it waits until the reader and encoders are proven).
-
-The bag is **live data belonging to a running client** — read it read-only; never write there.
-
-### 2.16 Wearing props: nothing reaches the server — CONFIRMED live
-
-A live run of the smoke harness (`crates/palace-client/src/bin/live-smoke.rs`) against
-`media.palace.example.info:9998`:
-
-```text
-PALACE_HOST=media.palace.example.info PALACE_USER=SmokeTest PALACE_SMOKE_SECS=20 \
-  cargo run -p palace-client --bin live-smoke
-```
-
-```text
-[room] #901 "Balamb Garden" users=0
-[script] ON ENTER: 1 handler(s) fired
-        effect: MIDILOOP "garden" x99
-        effect: SOUND "garden"
-[users] 1
-        #637 "SmokeTest" face=5 color=14 props=0 at (210,255)
-```
-
-Two things at once: **the room lifecycle fires live** (the point of §2.13), and **our own record
-carries `props=0`**.
-
-`HASPROP` reads `HostView::self_props`, built from our own entry in `state.users`
-(`runtime.rs:1339`), so `HASPROP` is **always false** and prop-gated room logic is unreachable. The
-second half of the cause is that nothing tells the server either — `Effect::SetProps`, `DonProp` and
-`DoffProp` mutate local state and return `Vec::new()` without sending a frame. The `USER_PROP` encoder
-already exists in `palace-wire` and is simply never called.
-
-Consequence, and the reason it was noticed: the Colosseum menu's **Audience** button is a chain of
-
-```text
-{ 14109 GOTOROOM }  cname "Cyan" ==                        IF
-{ 7592  GOTOROOM }  cname "Gogo" == 1020771340 HASPROP AND IF
-```
-
-so every branch is unreachable — the button does nothing. The **Red/Blue** team buttons work because
-they check only `USERNAME` (`USERNAME "Elly" == IFELSE`), which the server does know. That asymmetry
-is the signature of this bug: name-gated logic works, prop-gated logic cannot.
-
-- [ ] Send `USER_PROP` when the worn list changes (in progress).
-- [ ] Decide whether `ASSET_REGI` (uploading the art) is required for the server to accept a worn
-  prop, or whether `USER_PROP` alone suffices.
-
-### 2.17 The Colosseum "you get sent out" bounce is the prop bug — CORRECTED
-
-An earlier version of this section blamed a capacity guard (`NBRROOMUSERS 19 >`). **That was wrong.**
-The user pointed out the server had a single user on it, so that guard could not have fired. The real
-cause is in the arena rooms' `ON ENTER`:
-
-```text
-{ "wrongo.wav" SOUND } IPTVERSION 1 == IF
-"You are being sent out." LOCALMSG
-31743 GOTOROOM
-... 976933367 HASPROP NOT   NBRUSERPROPS 1 == NOT   OR IF
-```
-
-Read as: **if the user is not wearing prop `976933367`, or does not have exactly one prop, eject them
-to room 31743** with "You are being sent out." and `wrongo.wav`. That matches the observed
-`SOUND "wrongo.wav"` + `GOTOROOM 31743` alongside `ON ENTER` exactly.
-
-`976933367` is the pass prop: it appears **719 times** in the room scripts, and rooms hand it out on the
-way in with `[ 976933367 ] SETPROPS` immediately before teleporting you:
-
-```text
-rooms2/003.scr.txt:95:  ON SELECT { [ 976933367 ] SETPROPS  ME DEST GOTOROOM }
-```
-
-So the sequence is: the room tells us to wear the pass prop and sends us in, **and then ejects us for
-not wearing it** — because `SETPROPS` only mutates our local state and never reaches the server (§2.16),
-so the server-side `HASPROP` is false. This is the same root cause as the Audience button, and one fix
-addresses both.
-
-The capacity guard is real but was not what fired:
-
-```text
-{ "@512 0Too many audience members; space needed for players!"
-  LOCALMSG  "wrongo.wav" SOUND  { 31743 GOTOROOM } 80 ALARMEXEC }
-NBRROOMUSERS 19 > IF
-```
-
-Do not "fix" either by suppressing the teleport. `LOCALMSG` does reach the user — the runtime renders it
-as a `System` chat line (`runtime.rs:1612`) — so the user sees which of the two messages fired, which
-distinguishes them.
-
-### 2.18 Media comes from seeded directories, not (only) from fetching
-
-`src-tauri/src/lib.rs` builds the media roots as `seed_media()` plus the session cache:
-
-- `$CORPUS/http_harvest` (110 files) and `$MEDIA/colosseum-bgs` (280 files) — read-only seeds;
-- `~/.cache/palace-client/<host%3Aport>/media/http-cache/media/<hash>/` — per-session fetch cache.
-
-So the harness reports `background "sqoom23.gif" not found ... used flat backdrop` because it sets no
-seeds and fetched nothing in its 20s run — an artifact of the harness, **not** a user-facing bug: the
-app resolves art from the seeds (and has a populated fetch cache for other servers). Worth re-checking
-in the GUI if a room ever looks flat.
-
-### 2.19 Running the live harness
-
-`live-smoke` runs the real runtime against a real server and prints every `ClientEvent`. It is the only
-way to see script behaviour live, because the runtime has no logging of its own. Env: `PALACE_HOST`,
-`PALACE_PORT` (9998), `PALACE_USER`, `PALACE_SMOKE_SECS`, `PALACE_SMOKE_ROOM`, `PALACE_CLICK_ROOM`.
-It logs in as a normal user, so pick a name that makes the test obvious to anyone in the room.
-
-### 2.20 IPTSCRAE coverage — what the audit found
-
-`crates/iptscrae-palace/src/commands.rs` defines **121** Palace commands. The VM language itself is in
-good shape (72 documented core words: arithmetic, comparison, logic, `IF`/`IFELSE`/`WHILE`/`FOREACH`/
-`EXEC`/`RETURN`/`BREAK`, strings, `SINE`/`COSINE`/`TANGENT`/`RANDOM`, stack ops, `GLOBAL`/`DEF`,
-arrays, `ALARMEXEC`). **The hole is the Palace command set.**
-
-Four distinct kinds of incompleteness, in descending order of how badly they hide:
-
-1. **Dispatched but effect-nothing (looks implemented, does nothing).** The worst kind:
-   - `LOADPROPS` returns `Ok(Vec::new())` — pushes *no effect at all*, not even an "unsupported" note.
-   - `PAINTUNDO` pushes an effect that the client only answers with a note and a redraw; nothing
-     undoes anything, and it is not a wire effect either.
-   - `SOUND`, `MIDIPLAY`/`MIDILOOP`/`MIDISTOP` push effects that only become **notes** — no audio is
-     ever played. (This is why `SOUND "wrongo.wav"` appears as text and is never heard.)
-   - `GOTOURL`/`LAUNCHAPP` likewise become "reported, not opened/launched" notes.
-   - `LINE`/`LINETO` and `PAINT*`/`PEN*` do reach the wire as draw frames, but **nothing rasterizes**
-     locally, so our own view never shows strokes the way other clients do.
-   - `ISLOCKED` always returns false (`fn is_locked`), `GETPICDIMENSIONS` always pushes `(0,0)`,
-     `PROPDIMENSIONS`/`PROPOFFSETS` always push zeros, `has_prop_by_name` always returns false.
-
-2. **Recognised-but-unimplemented, and worse — *not even registered*.** The large
-   `|`-pattern arm at `host.rs:695-703` (HIDESMILEYS, LOCKUSERPROPS, AUTOUSERLAYER, SETTOOLTIP,
-   CLEARTOOLTIP, SETSPOTOPTIONS, ADDPIC, REMOVEPIC, DELPIC, ADDSPOT, SETSPOTSCRIPT, LOADSCRIPT,
-   HTTPGET, ROOMZOOM, ROOMUNZOOM, CIRCLE, FILL, PAINT, TEXT, PING, CLRPROPS, SHOWALLPROPS, HIDEPROPS,
-   SHOWPROPS, SETPROPSLOCAL, ADDPROP, PURGE, ROOMDESC, OFFLINE, ONLINE, NBRUSERS, GETWHOTALKING,
-   MSGTO, FLUSH, SETSPOTSTATEALL, AWAY, TOGGLECTRL, SETDESC, BAN, KICK) is **dead code**: those names
-   are not in `PALACE_COMMANDS`, so the lexer never treats them as commands — they lex as *variables*.
-   So a room that calls `ADDPIC` doesn't get "unsupported", it silently does something different.
-   That is why the corpus counts for these (ADDPIC 115, SETSPOTSCRIPT 82, ADDSPOT 81, LOADSCRIPT 51,
-   HTTPGET 50, tooltips 88) hurt: those rooms are misbehaving, not erroring.
-
-3. **Genuinely absent from the table** though dispatched in `host.rs` (also dead arms):
-   `PALACECHAT`, `ISRIGHTCLICK`, `MOUSEX`/`MOUSEY`, `LASTNAME`, `HTTPRECEIVED`, `STR`, `SETPICDIM`.
-   Separately, `SHELLCMD` was **documented but never dispatched** — the only reverse
-   mismatch found. **That is now resolved:** registering the dead-arm names (`af6035f`)
-   put `SHELLCMD` in the table with arity 1, so it dispatches and reaches the
-   unimplemented arm, which reports. It does not run shell commands, deliberately.
-
-4. **Dead effects**: `Effect::Beep` can never be pushed (`BEEP` is a core builtin, so `host.rs`'s
-   `BEEP` arm is unreachable), and `Effect::SetSpotAlarm` is never constructed (`SETALARM` schedules
-   directly). `is_wire_effect()` also claims `ClearLooseProps` is a wire effect, but `effect_frame`
-   has no encoder for it — that classification is test-only, so nothing breaks, but it is wrong.
-
-Work order for "fully implemented":
-
-- [ ] **Register** the dead-arm names in `commands.rs` with correct arity, so scripts at least
-  dispatch them, then implement them.
-- [ ] `SOUND`/`MIDI*` — actually play audio (the user sees these as notes today).
-- [ ] `ADDPIC`/`REMOVEPIC`/`DELPIC`, `ADDSPOT`/`SETSPOTSCRIPT`/`SETSPOTOPTIONS` — dynamic room content.
-- [ ] `LOADSCRIPT` + `HTTPGET` (+ `CACHESCRIPT`) — the §2.14 fetch-and-execute path.
-- [ ] `SETTOOLTIP`/`CLEARTOOLTIP`; `CIRCLE`/`FILL`/`PAINT`/`TEXT`; local rasterization for `LINE`.
-- [ ] The constant stubs: `ISLOCKED`, `GETPICDIMENSIONS`, `PROPDIMENSIONS`/`PROPOFFSETS`,
-  **`ISLOCKED` is done** (commit `7802e8e`): it answers from the room now - the id must name a
-  hotspot, its kind must be a shuttable (2) or lockable (3) door, and its state must be 1.
-  **`GETPICDIMENSIONS` is not a one-liner like that one.** The reference pops `(state, id)` - state
-  deepest - and returns the *drawn picture's* width and height for that state, substituting the
-  hotspot's current state when the requested state is negative (`GETPICDIMENSIONSCommand.as`,
-  `PalaceController.getPicDimensions` :590). That is the size of the image asset whose id is the
-  state's `pict_id`, and we track image dimensions nowhere: `SpotView::state_pics` carries
-  `(pict_id, dx, dy)` only, and `palace-asset` never records a decoded size. So it needs a source of
-  picture dimensions (the PNG `IHDR`, or the decode we already do), a way to carry `pict_id -> (w, h)`
-  into `HostView`, and the runtime populating it before dispatch. Leave the zeros until all three
-  exist - a guessed size would be worse than a known stub, because rooms branch on it.
-  `PROPDIMENSIONS`/`PROPOFFSETS` and `has_prop_by_name` will need the equivalent for props.
-  **`LOADPROPS` pushes nothing *by design*, so "make it push a real effect" was the wrong goal.**
-  The reference pops one array, throws `"You may only load up to 500 props at a time."` above 500
-  ids, and otherwise loads each integer id into the prop store *as a prefetch* with no further effect
-  (`LOADPROPSCommand.as`). So the real gaps are the 500-limit error (we accept anything silently) and
-  the prefetch itself - and the prefetch needs a prop store the host cannot reach yet, which is the
-  same plumbing the dimension work needs. Do these together or not at all.
-  `has_prop_by_name`, `LOADPROPS`, `PAINTUNDO`.
-- [x] Fix the `SHELLCMD` doc/dispatch mismatch and the `ClearLooseProps` wire classification.
-
-  `ClearLooseProps` is no longer claimed as a wire effect: it was the only effect claiming
-  wire-backing with no encoder in `wire.rs` — every sibling has one — and the protocol has
-  no such message, only a client-side room event (`PalaceRoomEvent.LOOSE_PROPS_CLEARED`).
-  The test that should have caught it asserted *exactly twenty* wire effects and included
-  `CLEARLOOSEPROPS` in its required list, so it counted the bad flag and locked the error
-  in; it now expects nineteen. Worth remembering: a test that derives its expectation
-  from the same table it is checking cannot catch an error in that table.
-
-### 2.21 Live diagnosis: the trace log
-
-`PALACE_TRACE=<file>` makes the runtime write every frame received and sent (opcode,
-length, ref, decoded meaning), every script event with its scope, handler count, effects and
-problems, every `ClientEvent`, and the state transitions that matter. Off unless set, standard
-library only, never able to fail a session. `live-smoke` honours it too.
-
-It exists because the runtime previously had **no logging at all**, so live behaviour could only
-be inferred from static scripts and from the four lines the interface happens to show — which is
-how a live bug was mis-diagnosed three times in a row.
-
-**What the first real session showed.** Entering Colosseum 5v5 (`31749`):
-
-```text
-send   opcode=navR(ROOMGOTO) ref=730 room=31749
-recv   opcode=room(ROOMDESC) id=31749 name="The Colosseum (5 vs 5)" hotspots=23 pictures=9 draws=0
-script event=ENTER fired=16 effects=[SETPROPS [976933367], STATUSMSG "Colosseum ...", SETSPOTSTATELOCAL spot=730 state=0]
-send   opcode=usrP(USERPROP) ref=730 len=12 msg=user props: id=730 props=976933367
-```
-
-The room hands the player the pass prop and the client sends it (§2.16). **No ejection, and no
-`GOTOROOM 31743` anywhere in the session.** So direct entry to the arena is clean; a bounce must
-come from a different route, and the trace will name the handler responsible.
-
-**The recurring disconnects are the server, not us:**
-
-```text
-recv opcode=bye (LOGOFF) ref=729 len=4
-recv opcode=down(SERVERDOWN) ref=10 len=0      <- the server announcing it is going down
-event [status] Error io: Connection reset by peer
-```
-
-`SERVERDOWN` appears in probes from **before** the prop work, so it is not something we send. The
-Colosseum server appears to be cycling; a restart mid-session drops the client out of its room and
-reconnects it elsewhere, which is an independent candidate for "booted back to the menu".
-
-**Still dropped on receive:** `draw(DRAW)` (five times in one short session) — the peer-drawing
-message. Its body is a **single draw record** in the same layout as one entry of the room's linked
-list (`OpenPalace` `handleDrawCommand` reads `size` bytes into `PalaceDrawRecord.readData`), where
-`DC_Delete` undoes the last command of the layer it was added to and `DC_Detonate` clears
-everything. `palace-room` already models these records; the live message and the rasterizer are a
-separate task.
-
-### 2.22 Audio: how the reference does it, and what the server actually serves
-
-`SOUND name` reaches `PalaceSoundPlayer.playSound(name)` (`OpenPalace/.../view/PalaceSoundPlayer.as`),
-which does two things:
-
-1. looks the name up, lowercased, in a **built-in map of bundled MP3s** — amen, applause, belch,
-   boom, chime, crunch, debut, doorClose, doorOpen, fader, fazein, guffaw, kiss, no, pop, teehee,
-   yes — and plays the embedded asset if it matches;
-2. otherwise strips a trailing `.wav`, lowercases, and loads **`mediaServer + name + ".mp3"`**.
-
-So a sound is either bundled or fetched by name from the server's media endpoint.
-
-**What Colosseum actually serves** (checked directly):
-
-| Requested | Result |
-|---|---|
-| `wrongo.wav` | **200**, `audio/x-wav`, 3570 bytes |
-| `garden` | **200**, `audio/midi`, 13050 bytes |
-| `chime.mp3` | 404 |
-| `boom.wav` | 404 |
-
-So the names rooms use are served as they are spelled — `wrongo.wav` comes back as a WAV, and the
-reference's `.mp3` rewrite is not what this server answers with. The fetch-by-name path is therefore
-the one that matters, and our media pipeline already fetches and caches arbitrary media by name
-(§2.18) — it fetches pictures that way today.
-
-`MIDIPLAY`/`MIDILOOP`/`MIDISTOP` are a separate and harder problem: they select **MIDI**, which needs
-a synthesizer, not just a decoder. Treating MIDI as a follow-up and `SOUND`/`BEEP` as the first
-deliverable is the pragmatic split.
-
-Two implementation routes, neither chosen yet:
-
-- **Rust side** — play the fetched bytes from the runtime. Straightforward for WAV, and keeps audio
-  independent of the interface; costs a dependency.
-- **Interface side** — hand the bytes to the web view and let it play them. No new Rust dependency
-  and the browser handles formats, but it needs a command or route in `src-tauri/`, and that layer
-  rebuilds slowly (it restarts the running app).
-
-### 2.23 The arena selection panel: ejection fixed, selection still not matching
-
-**Fixed.** The reported bounce was the client ejecting the player, and it is cured. The trace showed
-clicking hotspot 102 in room 7774 running `ON SELECT` with effects `[GOTOROOM 31743, SOUND
-"wrongo.wav"]` — the client sending the room change itself. That room hit-tests with `MOUSEPOS`, which
-nothing ever set, so it read `(0, 0)`; its handler ejects when x is below 78, and 0 was. The runtime now
-puts the pointer at the click's room position before the handler runs (`cbf7608`). After the fix the
-same clicks no longer eject.
-
-**Still open.** The panel does not navigate either now. The room's handler is a set of x-coordinate
-regions (from `pcap_extract/rooms2/009.scr.txt`, garbled):
-
-```text
-x GLOBAL MOUSEPOS SWAP x =
-{ 31743 GOTOROOM } x 78 < IF
-{ 31741 GOTOROOM } x 78 >  x 120 < AND IF    79-119   1v1
-{ 31746 GOTOROOM } x 120 > x 170 < AND IF    121-169  2v2
-{ 31747 GOTOROOM } x 179 > x 219 < AND IF    180-218  3v3
-{ 31748 GOTOROOM } x 219 > x 271 < AND IF    219-270  4v4
-{ 31000 GOTOROOM } x 271 > x 320 < AND IF    272-319  5v5
-{ 31001 GOTOROOM } x 320 > x 383 < AND IF    321-382
-```
-
-Live clicks and what the handler produced:
-
-| Click (room coords) | x lies in | Expected | Actual |
-|---|---|---|---|
-| (137,368), (140,368) | 121-169 | 31746 | `wrongo` only |
-| (211,308) | 180-218 | 31747 | `wrongo` only |
-| (366,367), (370,369) | 321-382 | 31001 | `wrongo` only |
-
-So **no region matches any click**, including clicks plainly inside one — the handler always falls
-through to its `wrongo` fallback. Either the value reaching the script is not in the room's coordinate
-space, or our VM mishandles the `x GLOBAL MOUSEPOS SWAP x =` assignment idiom, or the extracted script
-is too garbled to read. The live screen reported `buffer 1024x768 scale 1.073 dpr 2` for a 512x384 room,
-and device pixel ratio and zoom are exactly what the test fixtures never exercise — a constant ratio
-(2x, or 1.073x) explaining every click would settle it.
-
-Under investigation by comparing our reported click coordinates against hotspot 102's real geometry
-from the room descriptor. Do not special-case room 7774; whichever of these it is affects every room
-that hit-tests this way.
-
-### 2.24 The arena blocker: the room builds its own interface from a fetched script we never load
-
-**This is the answer to "why does the arena refuse me", and it is not the click.**
-
-Room 7774's `ON ENTER` fetches a script:
-
-```text
-ON ENTER { "http://chat.animanic.de/media/custo2.txt" LOADSCRIPT }
-```
-
-That URL is real and served — fetched directly, **HTTP 200, 25,620 bytes** — and the script it returns
-is what *constructs the room's interface*:
-
-```text
-[1000,0 537,0 537,363 933,363 933,396 1000,396] 0,0 ADDSPOT but1 =     creates a hotspot at runtime
-"cust.gif" but1 ADDPIC 768,198 0 but1 SETPICLOCLOCAL                   pushes a picture
-2 1 1 but1 SETSPOTOPTIONS                                              configures it
-{ na2 GLOBAL na GLOBAL mx GLOBAL my GLOBAL MOUSEPOS my = mx = ... }    hit-tests with the pointer
-```
-
-`LOADSCRIPT` is unimplemented (§2.11), so the script never loads; `ADDSPOT`, `ADDPIC`,
-`SETSPOTOPTIONS` and `SETPICLOCLOCAL` are unimplemented (§2.20), so even if it loaded, the interface
-would not be built. The panel's hotspots and picture therefore never exist, the room's own guard stays
-false, and every click falls through to its `wrongo.wav` else-branch.
-
-The investigation that established this also cleared the suspects it replaced. The click coordinate is
-correct (x = 278 and 295 both fall inside the live room's 5v5 band), the viewport transform is correct,
-`MOUSEPOS` order is correct (a reversed push is caught by a test), the `GLOBAL`/`SWAP`/`=` assignment
-idiom is correct, and the hit test selects hotspot 102, the panel itself. Seeding the guard's globals
-(`cname`, `in69`) makes the *same clicks* navigate:
-
-```text
-click at room (137,368)  unseeded -> SOUND "wrongo.wav"
-click at room (137,368)  seeded   -> GOTOROOM 31741
-click at room (278,375)  seeded   -> GOTOROOM 31747
-```
-
-So the room is not rejecting the click; it is rejecting a session whose interface was never built.
-`in69` appears nowhere in the room's own scripts, which is consistent with it arriving from a fetched
-one. The same mechanism explains the 5v5's `ON ROOMREADY {"ludo/" HTTPGET}` (§2.14).
-
-**The fix was three parts, not two, and all three are implemented.** The latest update in `STATUS.md`
-has the evidence; the real 25,620-byte `media_custo2.txt` runs through the host and emits the
-interface-building effects.
-
-- [x] `LOADSCRIPT` + `HTTPGET` — fetch the URL, and when the response type is `text/iptscrae` execute
-  the body as a script, firing `HTTPRECEIVED` spot-scoped (§2.14 has the mechanism). Since `b62de07`.
-- [x] `ADDPIC`/`ADDSPOT`/`SETSPOTOPTIONS`/`SETPICLOCLOCAL` — the commands that script uses to build the
-  interface. **Local-only scene mutations**, not wire effects: the reference mutates its own store and
-  sends nothing, so §2.13's "needs the client→server body, may be permanently blocked" was wrong.
-  Arg order is push order, which the table's prose reads backwards (`ADDPIC`'s `args[0]` is the
-  filename; `SETSPOTOPTIONS` is `flags, topLayer, type, spot`), and `ADDSPOT` returns `max(id,0)+1`,
-  so the host carries a counter for two `ADDSPOT`s in one handler.
-- [x] **A third part §2.24 did not have: the `comma_separator` lexer extension.** The served body
-  separates values with `,` and the lexer rejected `,`, so the script could not parse at all and the
-  two parts above were unreachable. Long recorded in `$CORPUS/tools/grammar_check.py` (~:292) as an
-  extension the tokenizer "is forced to handle explicitly". Now handled.
-- [x] **And a fourth the plan also missed: `SETSPOTSCRIPT`** attaches the panel's
-  `MOUSEMOVE`/`ROLLOUT`/`SELECT` handlers to the spots `ADDSPOT` created. It needed a core-VM addition
-  (`Chunk::source`, the text between a block's braces) because the reference re-emits the block's
-  original source, plus a per-spot re-parse (`ScriptEngine::set_spot_script`) or the merged handler
-  never fires.
-
-**Not yet verified live**, and `SETTOOLTIP`/`CLEARTOOLTIP` remain unimplemented.
+---
+
+## 8. Needs a human, not a script
+
+- [ ] **Click the real zoom slider once.** The visual pass goes through the
+  runtime command path, not a mouse drag, because the project forbids driving the
+  desktop. The numeric sweep matches the tested transform; a human should still
+  click it.
+- [ ] **Open the right-click menu and the avatar picker once.** Their numeric
+  core is verified (the sheet is exactly `572×704 = 13×44 × 16×44`, and the
+  picker addresses the same cell the renderer reads); appearance is unverified.
+- [ ] **Walk somewhere on a live server.** Click-to-walk is tested against the
+  mock harness only.
+- [ ] **Watch a real second user's face change arrive.** The receive path is
+  verified against the mock harness only; a busy server has not been available.
 
 ---
 
-## Part 3 — How to verify
+## 9. How to verify
 
 ```bash
 cd $REPO
 
 cargo fmt --all -- --check
-cargo clippy -p palace-client -p palace-wire -p palace-app \
-             -p palace-host -p palace-probe -p palace-render \
+cargo clippy -p palace-client -p palace-wire -p palace-host -p palace-probe \
+             -p palace-render -p palace-prop -p palace-asset \
+             -p iptscrae -p iptscrae-palace -p palace-room \
              --all-targets -- -D warnings
-cargo test -p palace-client -p palace-wire -p palace-render   # scoped; see the --workspace warning below
+cargo test -p palace-wire -p palace-room -p palace-prop -p palace-asset \
+           -p palace-probe -p palace-render -p palace-client \
+           -p iptscrae -p iptscrae-palace -p palace-host
 
 bun run check && bun run build                 # frontend
 cargo run -p palace-client --bin live-smoke    # headless live check
 ```
 
-**Never run `--workspace` cargo commands in a fresh worktree.** A new worktree has no `target/`, so it
-compiles the entire Tauri/WebKit tree from scratch — 5.6 GB, 20–40 minutes — and again for each cargo
-invocation. From outside this is indistinguishable from a hang. Scope to the crate, or set
-`CARGO_TARGET_DIR` to reuse the warm target directory.
+**Never run `--workspace` cargo commands in a fresh worktree.** A new worktree
+has no `target/`, so it compiles the entire Tauri/WebKit tree from scratch
+(5.6 GB, 20–40 minutes) and again for each cargo invocation. Scope to the crate,
+or set `CARGO_TARGET_DIR` to reuse the warm target directory.
 
 ---
 
-## Part 4 — Hard boundaries (do not cross)
+## 10. Hard boundaries
 
-Carried from `STATUS.md`, because they exist for a reason: a subagent once reached for `input-tool`
-(kernel-level input injection) on this live desktop while trying to satisfy a "watch the window
-resize" instruction.
-
-- **Never inject input into the desktop** — no `input-tool`, `input-tool`, `input-tool`, `xte`, or synthetic input.
-- **Never unlock, wake or inhibit the screen.** A locked screen ends the QA run: stop and report.
-- **Never screenshot the whole desktop.** App window only.
-- **Never activate or focus the user's windows.**
-- **Never ask for or use the user's password or any credential.**
-
-Drive the app's own command path instead (`invoke("set_viewport", …)`), verify numerically or via
-headless renders, and say plainly that a human still needs to click the real control once.
-
-**Never write a definition of done that can only be satisfied by driving the user's desktop.**
-
-Also: stage explicit paths, never `git add -A`, while another agent or agent-runner instance may share the
-worktree — `-A` sweeps a concurrent editor's half-written files into your commit. And never
-`pkill -f "<pattern>"` where the pattern appears in your own command string; it kills the shell
-running it. Use `pgrep -x`/`pkill -x` or kill by PID.
+See **`STATUS.md` → Hard boundaries**. In short: never inject desktop input,
+never unlock or screenshot the user's screen, never activate their windows, never
+ask for a credential. Drive the app's own command path instead, and never write a
+definition of done that can only be satisfied by driving the user's desktop.

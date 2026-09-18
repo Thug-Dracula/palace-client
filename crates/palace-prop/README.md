@@ -158,9 +158,12 @@ bit  7 6 5 4 | 3 2 1 0
 - A row ends when exactly `width` columns have been accounted for. If control bytes
   overshoot (`x < 0`) the reference marks the prop bad; we return
   `PropError::RleRowOverflow`.
-- A `0x00` control byte advances nothing. The reference spins until its **6000
-  control-byte** runaway guard fires and marks the prop bad; we return
-  `PropError::RleRunaway` immediately, which is the same outcome without the spin.
+- A `0x00` control byte advances nothing. The reference keeps consuming bytes
+  past the end of the payload (a read past the end yields `0` and still advances
+  the cursor) until its **6000-control-byte** runaway guard fires and marks the
+  prop bad. **We mirror that**: `codec::eight` uses the same 6000-control-byte
+  budget (`MAX_CONTROL_BYTES`) and returns `PropError::RleRunaway` with the same
+  row the reference reports.
 - If the payload ends inside the *final* row's pixel run, the reference's
   `if (data.length > n)` guard leaves those pixels untouched and the prop still
   renders. **We reproduce that tolerance**, because five props in `pserver.prp`
@@ -495,7 +498,7 @@ of them is covered by a test.
   rather than derived from the header. We derive it, which is identical on every
   prop in existence (§5).
 - **`pserver_full.prp` is corrupt, in a specific and reproducible way.** 136,513
-  of its 178,839 records hold a blob whose first 16 bytes are foreign data and
+  of its 178,838 records hold a blob whose first 16 bytes are foreign data and
   whose last 16 bytes are missing: for 136,507 of them,
   `blob[16 .. 16+size-16]` is the first `size-16` bytes of the corresponding
   `pserver.prp` prop, and `0` records match the whole prop. In other words the

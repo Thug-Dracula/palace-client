@@ -9,7 +9,7 @@ It produces **complete, CRC-verified asset blobs**. Decoding a prop into pixels
 is `palace-prop`'s job; compositing those pixels is `palace-render`'s. This crate
 knows exactly one thing about prop bytes: which slice the CRC covers.
 
-**Status:** built and validated. 138 tests pass offline in ~1 s, plus one opt-in
+**Status:** built and validated. 146 tests pass offline in ~1 s, plus one opt-in
 live test that has been run successfully against `localhost:9998`.
 
 ---

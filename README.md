@@ -42,175 +42,62 @@ window at all and prints what the server said: the handshake, the room list and
 the user list. It is useful for checking a server, capturing replayable test
 files, and comparing results with the reference Python client.
 
-The server this project was developed and tested against is `localhost:9998`,
-known as Balamb Garden. It is only the development server, not a limitation:
-the client accepts any host and port, either from the command line
+The client accepts any host and port, either from the command line
 (`--host`/`--port`, `PALACE_HOST` and friends) or from the connect box in the
 window, and the protocol is the same everywhere.
 
-## Project status
+## Status
 
-An honest snapshot: what is finished, what is not, and what stands between this
-and 1.0. Unit and offline integration tests pass, and line coverage is 90.6%
-against an 80% gate — but test coverage is not the same as completeness, and the
-gaps below are where the difference shows.
+Palace Client is a working desktop client. It logs on as a guest, assembles a
+room into one composited picture, fetches the room's artwork, lists and walks
+between rooms, sends and receives chat, and runs the room's own IPTSCRAE scripts
+in a sandbox with no ambient authority. The protocol layer, the prop codec, the
+compositor and the script engine are complete and covered by the test suite.
+Audio playback, live verification of the HTTP fetch-and-execute path, and the
+tail of the Palace command set are the remaining work.
 
-### Finished
-
-- **The protocol layer** — framing, logon, the room-description message, the
-  opcode table, and byte order handled whatever the server uses. Cross-checked
-  against captured traffic and against three independent reference
-  implementations.
-- **The prop codec**, validated against roughly 228,000 real props with zero
-  disagreements against the reference decoder.
-- **A working desktop client** — rooms assemble into one picture, avatars and
-  name tags draw, chat sends and receives (including the encrypted forms some
-  servers use), doors walk, and the room and user lists are live.
-- **The script engine** — the IPTSCRAE language (72 core words: arithmetic,
-  logic, strings, maths, stack operations and control flow) plus the Palace
-  command host. Scripts run sandboxed, with no network, filesystem or process
-  access.
-- **Script events** — entering, leaving, selecting, chat, lock, unlock, state
-  change, rename, user leave, and the room lifecycle (`ROOMLOAD`, `ENTER`,
-  `ROOMREADY`) in the order the reference client fires it.
-- **Reading a real prop bag** — the `.bundle` format is decoded, and worn props
-  are sent to the server so other clients can see them.
-
-### Not finished
-
-**The command set is the largest gap.** The *language* is in good shape; the
-Palace *commands* are not. There are four kinds of gap, in descending order of
-how badly they hide:
-
-1. **Commands that run but do nothing.** `SOUND`, `MIDIPLAY`, `MIDILOOP` and
-   `MIDISTOP` are surfaced to the interface but never reach an audio device, so
-   a room's soundscape is silent while appearing to work. `LOADPROPS` has no
-   effect at all. `PAINTUNDO` undoes nothing. `ISLOCKED` always answers false,
-   and `GETPICDIMENSIONS` always answers zero.
-2. **Commands that are not registered at all.** A room calling one of these does
-   not get an "unsupported" report — the name is treated as a variable instead,
-   so the room misbehaves quietly. Around forty names are in this state,
-   including `ADDPIC` (115 uses in the rooms available to test against),
-   `SETSPOTSCRIPT` (82), `ADDSPOT` (81), `LOADSCRIPT` (51), `HTTPGET` (50) and
-   the tooltip pair (88 between them).
-3. **Commands missing from the dictionary** although the host could dispatch
-   them, plus one that is documented but never dispatched.
-4. **Two effects that can never be produced.**
-
-Alongside those, these subsystems are missing or incomplete:
-
-- **Audio.** Nothing plays.
-- **Drawing.** Other people's strokes now render: the `DRAW` message is decoded
-  and rasterized with front and back layers, undo and clear-all, and our own
-  `LINE` strokes are painted locally as well as sent to the server. Still
-  missing: `CIRCLE`, `FILL`, `PAINT` and `TEXT`, and `DRAW`'s text operands,
-  whose layout the references leave undetermined. Chat text is not painted into
-  the room image.
-- **Dynamic room content.** `ADDPIC`, `ADDSPOT` and `SETSPOTSCRIPT` — the
-  commands rooms use to build their own interfaces.
-- **HTTP.** `HTTPGET` and `LOADSCRIPT`. The response to a fetch is itself a
-  script, which is how several Colosseum rooms load their logic.
-- **A props panel.** Worn props now reach the server, but nothing in the
-  interface can *set* them, so the feature is only half reachable.
-- **Authentication.** A server requiring a password is refused, with the request
-  reported rather than silently ignored.
-
-### Known limitations
-
-- **Placeholder art.** Some visual gaps cannot be closed without real assets.
-- **Live verification is thinner than the unit tests.** Several receive paths
-  are proven against a mock harness but have not been exercised against a busy
-  server.
-- **No live big-endian or HTTP-tunnel server has been reachable.** Both paths
-  exist and are unit-tested, but neither has been proven end to end against a
-  real server.
-- **Asset transfer for other users' avatars** is untested against a real peer.
-- **Multi-block asset transfer and 16-bit props** are reference-derived, and the
-  loose-prop artwork for the available corpus is missing from local stores.
-- **One deep opcode (`durl`) remains unresolved.**
-
-### Roadmap to 1.0
-
-1. **Diagnosis tooling first** — a trace log, so live behaviour can be inspected
-   rather than inferred from static scripts.
-2. **Settle authentication** — implement the reply, which first needs a decision
-   about where a credential should live.
-3. **Complete the command set**, in order of use: register and implement the
-   dead names, then audio, then dynamic room content, then HTTP and
-   `LOADSCRIPT`, then drawing and tooltips.
-4. **Build the props panel**, so the prop bag is usable from the interface.
-5. **Replace the constant-answering stubs** with real answers, and turn any
-   remaining silent no-op into an explicit report.
-6. **Publish** and retire the remaining safety-net branches.
+Current state, evidence and known gaps: **[STATUS.md](STATUS.md)**.
+Live work queue: **[palace-todo.md](palace-todo.md)**.
 
 ---
+
 ## The repository
 
 This is a Rust workspace with eleven members: ten crates under `crates/` and the
 `src-tauri/` application. The wire protocol, the file formats, the room model,
 the renderer and the scripting engine are separate crates, and the desktop app is
-Tauri plus SvelteKit on top of them. Everything below is a working client rather
-than a skeleton: the GUI, the compositor and the IPTSCRAE engine are all present
-and covered by the test suite.
+Tauri plus SvelteKit on top of them. Everything is a working client rather than a
+skeleton: the GUI, the compositor and the IPTSCRAE engine are all present and
+covered by the test suite.
 
 ---
 
 ## Quick start
 
 ```bash
-cd $REPO
+git clone <repository-url> palace-client
+cd palace-client
 
-# Unit + offline integration tests (no network).
+# Headless crates (no Tauri system libraries needed).
+cargo test -p palace-wire -p palace-room -p palace-prop -p palace-asset \
+           -p palace-probe -p palace-render -p palace-client \
+           -p iptscrae -p iptscrae-palace -p palace-host
+
+# The whole workspace, including the Tauri app. Install Tauri's system
+# dependencies first (the list is in `.github/workflows/ci.yml`).
 cargo test --workspace
 
-# Connect, log on, print the room and user lists.
-cargo run -p palace-probe -- --host localhost --port 9998 --user RustProbe
+# Run the desktop app. `bun run tauri dev` starts Vite and the Tauri shell.
+bun install
+bun run tauri dev
 
-# Same, while writing a replayable fixture corpus.
-cargo run -p palace-probe -- --host localhost --port 9998 --user RustProbe \
-    --capture fixtures/logon-run1
-
-# Print every known opcode.
-cargo run -p palace-probe -- --list-opcodes
-
-# Differential check against the Python oracle (needs the live server).
-python3 tools/diff_walker.py
+# Run the headless probe: connect, log on, print the room and user lists.
+cargo run -p palace-probe -- --host your.server --port 9998 --user RustProbe
 ```
 
-`--help` lists every option. `--json` emits a machine-readable summary,
-`--verbose` prints every frame in the logon burst.
-
-### Example session
-
-```text
-connected to localhost:9998 — server speaks little-endian, assigned user id 16
-sending MSG_LOGON (regi) as "RustProbe"
-logon burst: 9 frames
-  entered room 901 "Balamb Garden" (picture "sqoom23.gif")
-requesting MSG_LISTOFALLROOMS (rLst)
-requesting MSG_LISTOFALLUSERS (uLst)
-sending MSG_LOGOFF (bye )
-
-== session ==
-  byte order   : little
-  user id      : 16
-  server name  : Balamb Garden
-  version      : 1.22
-  media server : https://media.palace.example.info/palace/media
-  logon frames : 9
-
-== room list: 81 rooms ==
-     105  users=  0  flags=0x0010  ~Triple Triad A~
-     ...
-     901  users=  2  flags=0x0114  Balamb Garden
-     ...
-
-== user list: 2 users ==
-      12  room=   901  flags=0x0000  RustProbe
-      10  room=   901  flags=0x0000  Queen Kat
-
-SUMMARY rooms=81 users=2
-```
+`--help` lists every probe option. `--json` emits a machine-readable summary and
+`--verbose` prints every frame in the logon burst. Fixture capture and the
+differential oracle commands are documented in [protocol.md](protocol.md).
 
 ---
 
@@ -253,6 +140,7 @@ message and the opcode table live in **[protocol.md](protocol.md)**. This file
 stays focused on what the client is and how to use it.
 
 ---
+
 ## Provenance
 
 Protocol facts come from the official Communities.com *Palace Protocol

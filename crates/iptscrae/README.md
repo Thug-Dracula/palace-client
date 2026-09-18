@@ -148,7 +148,7 @@ A variable is auto-vivified to integer `0` on first mention. Assignment is
 *activation*) sees it: if the local was assigned, its value is copied into the
 global, then the local is rebound to the global. `SGLOBAL` is PalaceChat's
 spot-scoped spelling of the same operation; the corpus uses it interchangeably
-with `GLOBAL`, so this crate registers it as an alias.
+with `GLOBAL`, so `iptscrae-palace` registers it as an alias of `GLOBAL`.
 
 ### Control flow
 
@@ -194,8 +194,10 @@ while lexing, so adding a host dictionary changes what lexes as a command.
 | comparison | `==` `!=` `<>` `<` `<=` `>` `>=` |
 | control flow | `IF` `IFELSE` `WHILE` `FOREACH` `EXEC` `RETURN` `BREAK` `EXIT` `ALARMEXEC` |
 | variables | `=` `DEF` `GLOBAL` |
-| arrays | `ARRAY` `[` `]` `GET` `PUT` `LENGTH` |
+| arrays | `ARRAY` `GET` `PUT` `LENGTH` |
 | misc | `IPTVERSION` `_TRACE` `TRACESTACK` `_BREAKPOINT` `DELAY` `BEEP` |
+
+`[` and `]` are lexer delimiters for array literals, not registry commands.
 
 Notable stack effects (operands listed top-first):
 
@@ -278,7 +280,7 @@ are inert elsewhere.
 
 Host commands receive **dereferenced operands in push order** and return the
 values to push; the data stack itself stays private to the VM. That is what
-makes the boundary auditable: a command cannot inspect or corrupt the stack, and
+makes the boundary inspectable: a command cannot inspect or corrupt the stack, and
 a host that declares the wrong arity fails loudly instead of silently
 desynchronising it.
 
@@ -322,19 +324,18 @@ tokenizer gaps: a stray `(` (`11054_hs1.txt`), two stray `)` (`13009_hs0.txt`,
 tokenizer throws on exactly these characters, so no implementation could have run
 them. (a) is zero *by construction*: `reference_accepts` is asserted against the
 lexer's character set in `classify::tests` and is enforced at lex time, so a
-tokenizer gap would have to be a set-membership contradiction.
+  tokenizer gap would have to be a set-membership conflict.
 
 **Run failures (14) — 7 (b), 7 (c).**
 
 1. **(b) Six `ON ROOMREADY` handlers** (`7022_hs2`, `7028_hs0`, `7030_hs0`,
-   `7031_hs0`, `7034_hs0`, `7035_hs0`) call `HTTPGET`, a PalaceChat-5 extension
-   with no documented signature. It lexes as a variable — exactly as it would in
-   OpenPalace, which does not know it either — so the operands it should have
-   consumed shift the stack and the next `IF` sees a string. Every one of these
-   handlers also names `CONFIRMBOX` and `PALACECHAT`. A later milestone adds
-   them.
-2. **(b) `167_hs0`** names `ENCODEURL` (and `SETTOOLTIP`/`CLEARTOOLTIP` elsewhere)
-   but the fault actually fires *before* `ENCODEURL`: see the hand trace below.
+   `7031_hs0`, `7034_hs0`, `7035_hs0`) call PalaceChat-5 extensions this crate
+   does not register (`CONFIRMBOX`, `PALACECHAT`, `aptSM`, `setobjsplash`). Each
+   unregistered name lexes as a variable — exactly as it would in OpenPalace,
+   which does not know them either — so the operands they should have consumed
+   shift the stack and the next `IF` sees a string. A later milestone adds them.
+2. **(b) `167_hs0`** names `ENCODEURL`, but the fault actually fires *before*
+   `ENCODEURL`: see the hand trace below.
    This is the one case where the automatic class and the true cause differ, which
    is why the report prints the unregistered names next to every failure.
 3. **(c) Five handlers read globals set by a different script** (`144_hs1`,
@@ -342,12 +343,13 @@ tokenizer gap would have to be a set-membership contradiction.
    friends read a global that another hotspot (or the cyborg) set. The harness
    isolates globals per file, so those reads see `0`, `EXEC 0` is the documented
    silent no-op, and the next assignment underflows. Running with
-   `--shared-globals` proves the point: **3796 of 3805 handlers (99.8%) run
-   clean** and the (c) count falls from 7 to 2.
-4. **(c) The two that survive `--shared-globals`** (`5308_hs4`, `889_hs0`) still
-   underflow inside a `&`, because the global they need is set by a script that
-   is not in this corpus directory at all (the harvest is per-hotspot; the
-   room-wide script is a separate payload).
+   `--shared-globals` rescues handlers and changes which ones fail: **3793 of
+   3805 handlers (99.7%) run clean**, and the (c) count falls from 7 to 5.
+4. **(c) The residue under `--shared-globals`** is mixed: some handlers still
+   underflow inside a `&` because the global they need is set by a script that is
+   not in this corpus directory at all (the harvest is per-hotspot; the room-wide
+   script is a separate payload), and others run a `WHILE` past the 7500-iteration
+   budget once the shared globals that drive them are present.
 
 ### Hand trace: the `&` divergence (category (c), one script)
 
@@ -432,7 +434,7 @@ Iptscrae Language Guide* (Communities.com, February 2000).
 | 31 | Do handler names compare case-sensitively? | The reference preserves case and compares exactly; we preserve case and compare case-insensitively (a superset that cannot change a well-formed script). |
 | 32 | Are `\f`/`\v` whitespace? | The reference's main tokenizer accepts only space/tab/CR/LF; its `ON` lookahead uses `/^\s/`, which also accepts `\f`/`\v`. We use the four-character set everywhere, so `ON\fENTER` is not recognised. No corpus occurrence. |
 | 33 | `SGLOBAL` | Not in OpenPalace. The corpus uses `sym SGLOBAL` exactly as `sym GLOBAL` (54 `DUP GLOBAL` vs 12 `DUP SGLOBAL`, always immediately before a condition), and IF only balances if `SGLOBAL` consumes one operand. Registered as an alias of `GLOBAL`. |
-| 34 | Extended PalaceChat commands | Not registered. This crate has no source for their stack effects; registering a guessed arity would corrupt the stack. As variables they behave as they do in OpenPalace. The corpus names 25+ of them (`HTTPGET`, `CONFIRMBOX`, `PALACECHAT`, `ENCODEURL`, `HIDESMILEYS`, `LOCKUSERPROPS`, …). |
+| 34 | Extended PalaceChat commands | Not registered. This crate has no source for their stack effects; registering a guessed arity would corrupt the stack. As variables they behave as they do in OpenPalace. The corpus names several of them (`CONFIRMBOX`, `PALACECHAT`, `ENCODEURL`, `HIDESMILEYS`, `LOCKUSERPROPS`, …). |
 | 35 | Regex | `GREPSTR` is host-provided. The bundled engine supports `^ $ . […] [^…] * + ? () \|` and `\xNN`, is step-bounded, and returns only the whole match, so `GREPSUB` substitutes `$0` but leaves `$1`…`$9` alone. A production host supplies a complete engine. |
 | 36 | `STRLEN`/`STRINDEX`/`SUBSTRING` units | AS3 counts UTF-16 code units; we match (`encode_utf16().count()`), except `SUBSTRING` which slices by `char`. Identical for ASCII, which is all the corpus contains. |
 | 37 | `ITOA`/`LOWERCASE`/`UPPERCASE` case mapping | Rust's Unicode mapping, not AS3's. Identical for ASCII. |

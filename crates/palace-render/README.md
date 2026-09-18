@@ -70,11 +70,12 @@ The four overlay bands are not arbitrary: `Hotspot.flags` selects them and
 (`0x01` → above all, `0x04` → above props/avatars, `0x40` → above name tags,
 otherwise above nothing). Priority follows the reference: above-all wins.
 
-**Layers 4, 8 and 11 are not rasterized in this milestone.** All 799 corpus
-rooms declare zero draw commands, and chat text is font work for the
-presentation layer. They are listed so the ordering is on record rather than
-rediscovered later. **Layer 9 (name tags) is rasterized** by `nametag`, from an
-embedded Liberation Sans Bold face (see below).
+**Only layer 11 (chat text) is not rasterized.** Layers 4 and 8 (draw commands)
+are rasterized by `crate::draw`, and **layer 9 (name tags)** is rasterized by
+`nametag`, from an embedded Liberation Sans Bold face (see below). No room in the
+799-payload corpus declares a draw command, and chat text is font work for the
+presentation layer; the layers are listed so the ordering is on record rather
+than rediscovered later.
 
 **Image overlays are selected, not drawn wholesale.** A hotspot's *current state*
 (`Hotspot.state`) names a picture id; that id selects a `PictureOverlay` from the
@@ -168,7 +169,7 @@ nearest for sprites and smooth for photographic backgrounds.
 | Exact-RGB transparency match | reference compares through a `0x00AAFF00` mask, which ignores the blue channel (a Flash `threshold` artefact) | **deliberate divergence** |
 | Prop id → blob via `.prp` `id → dataOffset` | `PRP-FORMAT.md`; cross-checked against 180,661 roster records | **verified** |
 | Name tag geometry, font, glow | `NameTag.mxml`: `x = user.x - 1 - width/2`, `y = user.y + 17`, Arial 12 bold white, `GlowFilter(blur=2, strength=5)` | **verified** (glow is a documented 2 px dilation, not a Gaussian blur) |
-| Draw commands / chat text | — | **not implemented** (0/799 rooms use draw commands) |
+| Chat text | — | **not implemented**; draw commands and name tags are (0/799 rooms use a draw command) |
 
 **The 1 px avatar discrepancy.** `linpal`'s C++ client draws the avatar box at
 `x-22, y-22` and each prop at `x + hOffset - 22`; OpenPalace's AS3 client and the
@@ -250,7 +251,7 @@ checker placeholder. Both are reported as `AssetNote`s and printed by the CLI.
 ## Tests
 
 ```console
-cargo test -p palace-render                 # 50 unit + 1 corpus test
+cargo test -p palace-render                 # 93 lib + 1 corpus + 22 CLI = 116
 PALACE_ROOM_CORPUS=/path/to/payloads \
   cargo test -p palace-render --test corpus_render -- --nocapture
 ```
@@ -262,12 +263,12 @@ reported. It skips cleanly when the corpus is absent.
 
 ## Not in this milestone
 
-Tauri, windowing, network, asset *fetching*, IPTSCRAE, chat text, draw command
-rasterization, prop animation (the clock is injected but the scene is static),
-Type 1 avatars, and per-picture effects. Name tags *are* rasterized, but only in
-the fixed Liberation Sans Bold face — there is no font selection or user-supplied
-font. Multi-frame prop animation
-needs the `ANIMATE`/`BOUNCE` frame sequence, which is a later milestone.
+Tauri, windowing, network, asset *fetching*, IPTSCRAE, chat text, prop animation
+(the clock is injected but the scene is static), Type 1 avatars, and per-picture
+effects. Draw commands and name tags *are* rasterized; name tags only in the fixed
+Liberation Sans Bold face — there is no font selection or user-supplied font.
+Multi-frame prop animation needs the `ANIMATE`/`BOUNCE` frame sequence, which is a
+later milestone.
 
 ## Sources
 

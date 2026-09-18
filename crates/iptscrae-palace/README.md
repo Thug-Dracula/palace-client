@@ -4,10 +4,11 @@ The `iptscrae` crate implements the language and deliberately knows nothing abou
 Palace. This crate adds the layer that does:
 
 * **`PalaceHost`** — the capability trait every Palace command is written
-  against. It mirrors OpenPalace's `IPalaceController` (83 methods there); this
-  crate's trait declares 111 (`src/traits.rs`): `chat`, `goto_room`, `set_props`,
-  `get_spot_state`, the paint and sound operations, and so on. Every method has a
-  default, so a headless or cyborg-only host is a few
+  against. It mirrors OpenPalace's `IPalaceController`; this crate's trait
+  declares 110 methods (`src/traits.rs`): `chat`, `goto_room`, `set_props`,
+  `get_spot_state`, the paint and sound operations, and so on. (The 111th `fn`
+  in that file is the free helper `unavailable`, not a trait method.) Every
+  method has a default, so a headless or cyborg-only host is a few
   lines, and an unsupported operation fails with
   `IptError::CommandUnavailable` rather than silently doing nothing.
 * **`PALACE_COMMANDS`** — every Palace command whose stack effect the reference
@@ -69,10 +70,11 @@ the engine directly.
 
 Two deliberate omissions, both recorded in the `iptscrae` README:
 
-* **Extended PalaceChat commands** (175 names: `WEBEMBED`, `SETSPOTSCRIPT`,
-  `DRAWTEXT`, …) are *not* registered. This crate has no source for their stack
-  effects, and a guessed arity would corrupt the stack. Unregistered, they lex as
-  variables — which is what OpenPalace does, since it does not know them either.
+* **Extended PalaceChat commands** (`WEBEMBED`, `DRAWTEXT`, `CONFIRMBOX`,
+  `PALACECHAT`, `ENCODEURL`, …) are *not* registered. This crate has no source
+  for their stack effects, and a guessed arity would corrupt the stack.
+  Unregistered, they lex as variables — which is what OpenPalace does, since it
+  does not know them either.
 * **`SGLOBAL`** *is* registered, as an alias of the core `GLOBAL`. It is not in
   OpenPalace, but the corpus uses `sym SGLOBAL` exactly as `sym GLOBAL`, and `IF`
   only balances if `SGLOBAL` consumes one operand.
@@ -93,8 +95,21 @@ exercises. See the `iptscrae` README for the current numbers and a
 classification of every failure.
 
 `--shared-globals` runs the whole corpus through one global store instead of
-isolating each file, which is how a real session behaves. It is the evidence for
-the report's claim that the residual failures are environmental: sharing globals
-rescues 5 handlers (3791 → 3796 of 3805 clean) and leaves the 7 (b) failures
-untouched. Both modes are gated by `tests/corpus.rs` when `IPTSCRAE_CORPUS` is
-set.
+isolating each file, which is how a real session behaves. It rescues handlers and
+changes which ones fail: **3793 of 3805 handlers (99.7%) run clean** with sharing,
+against 3791 without, and the (c) failure count falls from 7 to 5. Both modes are
+gated by `tests/corpus.rs` when `IPTSCRAE_CORPUS` is set.
+
+## Command surface
+
+`PALACE_COMMANDS` defines **133** Palace commands. `PalaceCommands` implements
+nine of them as proof that the layers fit together (`SAY`, `CHAT`, `SAYAT`,
+`PRIVATEMSG`, `USERNAME`, `USERID`, `WHOME`, `SETPOS`, `GOTOROOM`, listed in
+`src/commands.rs` as `IMPLEMENTED`); the live runtime does not use that adapter —
+`palace-host` wires the engine directly and implements the full surface.
+
+The host dispatches 24 `ON <event>` names, measured against the harvested corpus:
+`ENTER`, `SELECT`, `LEAVE`, `OUTCHAT`, `INCHAT`, `ALARM`, `ROLLOVER`, `ROLLOUT`,
+`ROOMREADY`, `ROOMLOAD`, `NAMECHANGE`, `KEYDOWN`, `SERVERMSG`, `LOCK`, `UNLOCK`,
+`HTTPRECEIVED`, `HTTPRECIEVED` (the corpus spelling), `HTTPERROR`, `USERLEAVE`,
+`STATECHANGE`, `SIGNON`, `MOUSEUP`, `MOUSEDRAG`, `MOUSEMOVE`.

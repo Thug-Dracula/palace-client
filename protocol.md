@@ -93,13 +93,11 @@ honest ones:
 | `ul2DEngineCaps` / `ul2DGraphicsCaps` | 1 / 1 | |
 | `ul3DEngineCaps` | 0 | |
 
-> **Note on `reserved`.** The task brief called this field `"OPNPAL"`, which is
-> what OpenPalace writes; Taj writes `"example-host-1"` and the captured PalaceChat 5
-> client wrote `"example-host-2"`. `palace_walker.py` overwrites it with `"SCOUT1"`, and
-> the brief also says to mirror the walker exactly — so `SCOUT1` is the default
-> here, verified working against the live server. The field is logged by the
-> server and not validated; `ReferenceProfile` exposes it if a different tag is
-> ever wanted.
+> **Note on `reserved`.** OpenPalace writes `"OPNPAL"`, Taj writes `"example-host-1"`,
+> and the captured PalaceChat 5 client wrote `"example-host-2"`. This client mirrors
+> `palace_walker.py`, which overwrites the field with `"SCOUT1"` — verified
+> working against the live server. The field is logged by the server and not
+> validated; `ReferenceProfile` exposes it if a different tag is wanted.
 
 ### Logon burst, keepalive, exit
 
@@ -419,15 +417,15 @@ the column and `color` is the row**. The reference draws it directly:
   <s:BitmapImage source="@Embed(source='assets/faces/defaultsmileys.png')" />
 ```
 
-**Cell geometry.** In the reference `defaultsmileys.png` the cells are 45px, but
-the face art inside each one is 42×42 at offset (1,1), with a transparent border
-around it. The reference compensates by drawing the 45px cell as a 44×44 bitmap at
-`(-1,-1)`, so the art lands at the avatar's origin.
+**Cell geometry.** The reference `defaultsmileys.png` uses a 45-pixel stride: the
+face art inside each cell is 42×42 at offset (1,1) with a transparent border, and
+the reference draws the cell as a 44×44 bitmap at `(-1,-1)` so the art lands at the
+avatar's origin.
 
 This client ships a **repacked** sheet, `crates/palace-render/assets/smileys.png`:
-13 columns × 16 rows of 42×42 with the border trimmed, so a cell address is simply
-`(color * 42, face * 42)` and it is drawn at offset `(0, 0)` with no fudge.
-`tools/extract-smileys.py` regenerates it from the reference sheet.
+a 13 (face, the column) × 16 (colour, the row) grid of 44×44 cells with the
+transparent border trimmed. The sheet is 572×704, a cell is addressed
+`(face * 44, color * 44)`, and it is drawn at offset `(0, 0)` with no fudge.
 
 **When the built-in face is hidden.** If a user wears a prop whose header carries
 the `head` flag, the face is not drawn — the worn head replaces it. The reference
@@ -451,7 +449,8 @@ clamp them rather than index a sheet with whatever arrived.
 
 75 opcodes are named, taken from the 1999 protocol reference, Taj's
 `MessageTypes.cs` and QPalace's `message.hpp`. The `observed live` column marks
-the ones this server actually sent during a probe session (12).
+the ones this server actually sent during a probe session (12). Of the 75, 39 are
+decoded by `palace-wire`; the rest fall to `Message::Unknown`.
 
 | mnemonic | name | value | observed live |
 |---|---|---|---|
@@ -537,7 +536,8 @@ Run `cargo run -p palace-probe -- --list-opcodes` for the same table.
 
 ## Implementation and verification
 
-How this client implements and tests the protocol, what is verified rather than assumed, and how to regenerate the fixtures. Moved here from the README.
+How this client implements and tests the protocol, what is verified rather than assumed, and how to regenerate the fixtures.
+
 ## Fixtures
 
 `fixtures/logon-run1/` is a complete real session:
@@ -588,7 +588,9 @@ decoded form, and `load` treats a mismatch as corruption.
 ## Tests
 
 ```bash
-cargo test --workspace     # 621 passed, 0 failed, 2 ignored
+cargo test -p palace-wire -p palace-room -p palace-prop -p palace-asset \
+           -p palace-probe -p palace-render -p palace-client \
+           -p iptscrae -p iptscrae-palace -p palace-host
 ```
 
 The suite spans every crate in the workspace, not just the protocol layer:
@@ -609,8 +611,9 @@ The suite spans every crate in the workspace, not just the protocol layer:
   unterminated script) and assert a `RoomWarning` instead of a panic.
 - **`palace-room/tests/corpus_replay.rs`** decodes all 799 live payloads
   (804 records) with zero failures and zero warnings, and asserts the four
-  concatenated captures split correctly. **`corpus_scripts.rs`** extracts and
-  validates 2400/2400 hotspot scripts, and **`logon_room_fixture.rs`** pins the
+  concatenated captures split correctly. **`corpus_scripts.rs`** extracts
+  2400/2400 hotspot scripts from the corpus; IPTSCRAE parses 2396 of the 2400
+  (the four failures are malformed source), and **`logon_room_fixture.rs`** pins the
   Balamb Garden `room` frame from `fixtures/logon-run1/`.
 - **`palace-prop`** tests cover round-trips, malformed inputs and the 227,874-prop
   corpus. **`palace-asset`** tests cover the `qAst`/`sAst`/`rAst` state machines,
@@ -623,10 +626,11 @@ The suite spans every crate in the workspace, not just the protocol layer:
   surface; **`palace-host`** tests script loading, event dispatch and wire effect
   encoding.
 
-Two tests are ignored by default because they need resources this machine may not
-have: `palace-asset/tests/live_server.rs` needs a live pserver at
-`localhost:9998`, and `palace-prop/tests/corpus.rs` needs the local prop corpus.
-Run them with `cargo test -- --ignored` once those are available.
+Three tests are ignored by default because they need resources this machine may
+not have: `palace-asset/tests/live_server.rs` needs a live pserver at
+`localhost:9998`, and `palace-prop/tests/corpus.rs` and
+`palace-prop/tests/bag.rs` need the local prop corpus and prop bag. Run them with
+`cargo test -- --ignored` once those are available.
 
 Endianness is not skipped because "the server is little-endian anyway": the
 logon packet is asserted byte-for-byte against `palace_walker.py`, the
@@ -645,7 +649,7 @@ Runs the probe and `$CORPUS/tools/palace_walker.py` against the same server,
 back to back, and compares room id sets and names. `palace_walker.py` is
 **executed read-only** and nothing under `$CORPUS/` is modified.
 
-Result recorded on 2026-09-16:
+A back-to-back run against the development server:
 
 ```text
 probe  : 81 rooms, 2 users (byte order little, server 'Balamb Garden')
@@ -665,7 +669,7 @@ The walker has no user-list support, so the user count is validated against the
 - Framing, the `tiyr`/`ryit`/`pser` banner and endianness detection.
 - The full 128-byte `AuxRegistrationRec` (byte-for-byte vs `palace_walker.py`).
 - The logon burst message set and its exact fields (see
-  [protocol.md](protocol.md#logon-burst-keepalive-exit)).
+  [the logon burst](#logon-burst-keepalive-exit)).
 - `rLst` and `uLst` record layouts and count semantics (including the
   uninitialised `PString` padding, which the protocol reference permits).
 - `UserRec` is 124 bytes, confirmed by the live `nprs`.
@@ -689,8 +693,8 @@ The walker has no user-list support, so the user count is validated against the
 
 - **Hotspots, pictures, draw commands and loose props inside `room`** are decoded
   by `palace-room`; the raw buffer is still kept as `RoomDescription::var_data`.
-  What is missing is painting: draw commands, name tags and chat text are not
-  rasterized into the frame.
+  What is missing is painting: chat text is not rasterized into the frame.
+  Draw commands and name tags are.
 - **Asset transfer (`qAst`/`sAst`/`rAst`)** is implemented in `palace-asset` and
   drives live media fetching. Multi-block transfer is derived from the reference
   implementations only; no real capture of a multi-block transfer exists.
