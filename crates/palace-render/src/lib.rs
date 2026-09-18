@@ -42,9 +42,8 @@
 //!
 //! ## Not in this milestone
 //!
-//! No Tauri, no windowing, no network, no IPTSCRAE. Draw commands are parsed by
-//! `palace-room` but not rasterized (0 of 799 corpus rooms contain one); name
-//! tags and chat text are font work for the presentation layer.
+//! No Tauri, no windowing, no network, no IPTSCRAE. Draw commands, name tags and
+//! chat text all rasterize; the two text layers are font work that lives here.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -55,11 +54,13 @@
 pub mod assets;
 pub mod build;
 pub mod canvas;
+pub mod chattext;
 pub mod compositor;
 pub mod corpus;
 pub mod draw;
 pub mod error;
 pub mod face;
+mod glyph;
 pub mod image_clut;
 pub mod nametag;
 pub mod scene;
@@ -71,6 +72,10 @@ pub use build::{
     AVATAR_SIZE, MAX_ROOM_DIMENSION,
 };
 pub use canvas::Canvas;
+pub use chattext::{
+    chat_position, chat_text, draw_chat_text, ChatRender, ChatStyle, ChatText, CHAT_GLOW_RADIUS,
+    CHAT_X_GAP, CHAT_Y_OFFSET, MAX_CHAT_TEXT_CHARS,
+};
 pub use compositor::{draw_into, render, sort_avatars, AnimationClock, RenderOptions};
 pub use corpus::RoomSource;
 pub use draw::{
@@ -78,7 +83,10 @@ pub use draw::{
     rasterize_layer, DrawLayer, DrawList,
 };
 pub use error::{AssetNote, RenderError};
-pub use face::{face_sheet_png, smiley_cell, COLOR_VARIANTS, FACE_CELL, FACE_VARIANTS};
+pub use face::{
+    face_grid_json, face_rows, face_sheet_png, smiley_cell, COLOR_VARIANTS, FACE_CELL,
+    FACE_VARIANTS,
+};
 pub use nametag::{
     draw_name_tag, measure_text, name_tag, name_tag_position, NameTag, MAX_NAME_TAG_CHARS,
     NAME_TAG_FONT_PX, NAME_TAG_GLOW_RADIUS, NAME_TAG_X_FUDGE, NAME_TAG_Y_OFFSET,

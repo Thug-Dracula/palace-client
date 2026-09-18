@@ -21,9 +21,9 @@ use palace_host::{
     WireContext,
 };
 use palace_render::{
-    clamp_avatar_position, clamp_dpr, render, AnimationClock, AvatarSpec, MediaStore, PointF,
-    PropStore, RenderOptions, SceneBuilder, SizeF, ViewTransform, COLOR_VARIANTS, FACE_VARIANTS,
-    FLAG_PICTURES_ABOVE_ALL,
+    clamp_avatar_position, clamp_dpr, render, AnimationClock, AvatarSpec, ChatStyle, ChatText,
+    MediaStore, PointF, PropStore, RenderOptions, SceneBuilder, SizeF, ViewTransform,
+    COLOR_VARIANTS, FACE_VARIANTS, FLAG_PICTURES_ABOVE_ALL,
 };
 use palace_wire::byteorder::Writer;
 use palace_wire::error::WireError;
@@ -1147,6 +1147,7 @@ fn run_session(
                         }
                     }
                     shared.emit(ClientEvent::Chat { line });
+                    dirty_render = true;
                 }
                 if applied.render {
                     dirty_render = true;
@@ -1482,6 +1483,7 @@ fn compose(
     // list is the room's own commands plus every `DRAW` received since, so it is
     // authoritative. `compose` is the only path that turns state into pixels.
     scene.draw = state.draw.clone();
+    scene.chat = visible_chat_lines(state, scene.size.0 as i32, scene.size.1 as i32);
     let (logical_w, logical_h) = scene.logical_size();
     let viewport = shared.viewport();
     let dpr = clamp_dpr(viewport.dpr);
@@ -1555,6 +1557,52 @@ fn visible_avatars(state: &SessionState, props: &PropStore) -> (Vec<AvatarSpec>,
         (Vec::new(), 0)
     } else {
         avatar_specs(&state.users_in_room(), props)
+    }
+}
+
+/// How many of the most recent chat lines the frame draws.
+///
+/// The reference keeps each bubble on screen for `3000 + 70ms/char` and then
+/// fades it (`PalaceRoomView.mxml:607-609`), which needs a wall clock this
+/// renderer deliberately does not read. A bounded tail of the transcript is the
+/// deterministic stand-in.
+const VISIBLE_CHAT_LINES: usize = 6;
+
+/// The chat lines the frame draws, in transcript order.
+///
+/// A spoken line is anchored at its speaker's avatar position, clamped exactly
+/// as the avatar itself is; a line with no speaker (a client or server notice)
+/// falls back to the reference's `(0, 10)` (`PalaceRoomView.mxml:483-488`).
+fn visible_chat_lines(state: &SessionState, room_width: i32, room_height: i32) -> Vec<ChatText> {
+    let from = state.chat.len().saturating_sub(VISIBLE_CHAT_LINES);
+    state.chat[from..]
+        .iter()
+        .map(|line| {
+            let (x, y) = match state.users.get(&line.user_id) {
+                Some(user) => clamp_avatar_position(
+                    i32::from(user.x),
+                    i32::from(user.y),
+                    room_width,
+                    room_height,
+                ),
+                None => (0, 10),
+            };
+            ChatText {
+                text: line.text.clone(),
+                x,
+                y,
+                style: chat_style(line.kind),
+            }
+        })
+        .collect()
+}
+
+fn chat_style(kind: ChatKind) -> ChatStyle {
+    match kind {
+        ChatKind::Talk => ChatStyle::Talk,
+        ChatKind::Whisper => ChatStyle::Whisper,
+        ChatKind::System => ChatStyle::System,
+        ChatKind::Error => ChatStyle::Error,
     }
 }
 

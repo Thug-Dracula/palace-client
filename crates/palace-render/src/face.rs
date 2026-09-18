@@ -41,6 +41,61 @@ pub const FACE_VARIANTS: i16 = 13;
 /// Number of colour variants. Valid `color` values are `0..COLOR_VARIANTS`.
 pub const COLOR_VARIANTS: i16 = 16;
 
+/// How the picker should lay the faces out, as rows of face indices.
+///
+/// Presentation only, and ours to choose: the reference has no equivalent
+/// grouping. It lives here, not in the picker, so a sheet with a different face
+/// count cannot drift from the grid it is drawn on.
+#[must_use]
+pub fn face_rows() -> Vec<Vec<i16>> {
+    const PER_ROW: &[usize] = &[3, 5, 5];
+    let mut rows = Vec::with_capacity(PER_ROW.len());
+    let mut next = 0i16;
+    for &width in PER_ROW {
+        if next >= FACE_VARIANTS {
+            break;
+        }
+        let row: Vec<i16> = (0..width)
+            .map(|offset| next + offset as i16)
+            .take_while(|&face| face < FACE_VARIANTS)
+            .collect();
+        if row.is_empty() {
+            break;
+        }
+        next = row.last().copied().unwrap_or(next) + 1;
+        rows.push(row);
+    }
+    debug_assert!(
+        rows.iter().flatten().all(|&face| face < FACE_VARIANTS),
+        "a row must never offer a face the sheet does not have"
+    );
+    rows
+}
+
+/// The face sheet geometry, as JSON for the picker.
+///
+/// The picker shares the sheet image with [`smiley_cell`] but cannot see these
+/// constants, so it reads them over the `palace://` scheme rather than keeping a
+/// copy that could disagree.
+#[must_use]
+pub fn face_grid_json() -> String {
+    // Keys stay short: the picker fetches this payload every time it opens.
+    let rows: Vec<String> = face_rows()
+        .iter()
+        .map(|row| {
+            let cells: Vec<String> = row.iter().map(i16::to_string).collect();
+            format!("[{}]", cells.join(","))
+        })
+        .collect();
+    format!(
+        "{{\"cell\":{},\"faces\":{},\"colors\":{},\"rows\":[{}]}}",
+        FACE_CELL,
+        FACE_VARIANTS,
+        COLOR_VARIANTS,
+        rows.join(",")
+    )
+}
+
 /// The decoded sheet, decoded exactly once for the life of the process.
 fn sheet() -> &'static PropImage {
     static SHEET: OnceLock<PropImage> = OnceLock::new();
@@ -144,5 +199,53 @@ mod tests {
             smiley_cell(4, 6),
             "face and colour differ"
         );
+    }
+
+    #[test]
+    fn the_rows_cover_every_face_exactly_once() {
+        let rows = face_rows();
+        let flat: Vec<i16> = rows.iter().flatten().copied().collect();
+        assert_eq!(
+            flat,
+            (0..FACE_VARIANTS).collect::<Vec<_>>(),
+            "the picker must be offered every face, in order, with none repeated"
+        );
+        assert!(rows.iter().all(|row| !row.is_empty()), "no empty rows");
+    }
+
+    #[test]
+    fn the_grid_payload_reports_the_real_constants() {
+        let json = face_grid_json();
+        assert!(json.contains(&format!("\"cell\":{FACE_CELL}")));
+        assert!(json.contains(&format!("\"faces\":{FACE_VARIANTS}")));
+        assert!(json.contains(&format!("\"colors\":{COLOR_VARIANTS}")));
+        assert!(json.contains("[[0,1,2],[3,4,5,6,7],[8,9,10,11,12]]"));
+    }
+
+    #[test]
+    fn the_grid_payload_has_no_json_syntax_errors() {
+        // Checks shape, not a substring: an unbalanced format string would leave
+        // the picker with undefined fields and a blank grid.
+        let json = face_grid_json();
+        assert_eq!(json.matches('{').count(), 1, "one object");
+        assert_eq!(json.matches('[').count(), json.matches(']').count());
+        assert_eq!(json.matches('{').count(), json.matches('}').count());
+        assert!(!json.contains("\\"), "no escaping needed for these keys");
+        assert!(
+            json.starts_with("{\"cell\":") && json.ends_with("]}"),
+            "payload is one flat object: {json}"
+        );
+    }
+
+    #[test]
+    fn the_rows_stop_at_the_face_count() {
+        // Asserts the invariant, not the 3+5+5 layout: this guards the drift.
+        let rows = face_rows();
+        let highest = rows.iter().flatten().max().copied().unwrap_or(-1);
+        assert_eq!(highest, FACE_VARIANTS - 1);
+        assert!(rows
+            .iter()
+            .flatten()
+            .all(|&f| (0..FACE_VARIANTS).contains(&f)));
     }
 }

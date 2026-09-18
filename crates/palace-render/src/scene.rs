@@ -23,6 +23,7 @@
 
 use palace_prop::PropImage;
 
+use crate::chattext::ChatText;
 use crate::draw::DrawList;
 use crate::error::AssetNote;
 
@@ -174,6 +175,10 @@ pub struct Scene {
     /// Whether the compositor draws name tags. Defaults to `true`; a UI toggle
     /// can clear it on a built scene without rebuilding anything.
     pub name_tags_visible: bool,
+    /// Chat lines, drawn at layer 11 between the *pictures above name tags* and
+    /// *pictures above all* overlay bands. Each carries its text, its speaker's
+    /// avatar anchor and its fill style; see [`crate::chattext`].
+    pub chat: Vec<ChatText>,
 }
 
 impl Default for Scene {
@@ -192,6 +197,7 @@ impl Default for Scene {
             draw: DrawList::new(),
             notes: Vec::new(),
             name_tags_visible: true,
+            chat: Vec::new(),
         }
     }
 }
@@ -214,6 +220,7 @@ impl Scene {
             draw: DrawList::new(),
             notes: Vec::new(),
             name_tags_visible: true,
+            chat: Vec::new(),
         }
     }
 

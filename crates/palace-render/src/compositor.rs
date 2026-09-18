@@ -21,10 +21,9 @@
 //! | 12 | hotspot-state overlays flagged *pictures above all* | `hotSpotAboveEverythingCanvas` |
 //!
 //! Layers 4 and 8 are rasterized by [`crate::draw`] from [`crate::scene::Scene::draw`].
-//! Layers 9 and 11 are **not rasterized here**: chat text is font-dependent and
-//! belongs with the presentation layer (name tags are drawn by [`crate::nametag`]
-//! at layer 9). The list stays here so the ordering is on record rather than
-//! rediscovered.
+//! Layer 9 is rasterized by [`crate::nametag`] from each avatar's name, and layer
+//! 11 by [`crate::chattext`] from [`crate::scene::Scene::chat`]. The list stays
+//! here so the ordering is on record rather than rediscovered.
 //!
 //! ## Avatar y-sort
 //!
@@ -167,6 +166,9 @@ pub fn draw_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationClock) {
         }
     }
     blit_layer(canvas, &scene.overlays_above_name_tags);
+    for chat in &scene.chat {
+        crate::chattext::draw_chat_text(canvas, chat);
+    }
     blit_layer(canvas, &scene.overlays_above_everything);
 }
 
@@ -541,6 +543,66 @@ mod tests {
             }
         }
         panic!("a rendered tag always has an opaque pixel");
+    }
+
+    /// A frame coordinate that the chat text of `item` paints, derived from its
+    /// image and its placement in a `128×96` room.
+    fn chat_pixel_frame_position(item: &crate::chattext::ChatText) -> (i32, i32) {
+        let render = crate::chattext::chat_text(item).expect("the chat renders");
+        for y in 0..render.image.height() {
+            for x in 0..render.image.width() {
+                let opaque = render.image.pixel(x, y).is_some_and(|p| p[3] == 255);
+                if !opaque {
+                    continue;
+                }
+                let (text_x, text_y) = crate::chattext::chat_position(
+                    item.x,
+                    item.y,
+                    render.text_width,
+                    render.text_height,
+                    128.0,
+                    96.0,
+                );
+                let fx = (text_x - f64::from(render.origin_x) + f64::from(x)).floor() as i32;
+                let fy = (text_y - f64::from(render.origin_y) + f64::from(y)).floor() as i32;
+                return (fx, fy);
+            }
+        }
+        panic!("a rendered chat line always has an opaque pixel");
+    }
+
+    /// Layer 11 is above the `AboveNameTags` band and below the
+    /// `AboveEverything` band. Both halves are asserted at one shared pixel.
+    #[test]
+    fn chat_text_draws_above_the_name_tags_band_and_below_the_above_everything_band() {
+        let item = crate::chattext::ChatText {
+            text: "Chat".to_string(),
+            x: 64,
+            y: 40,
+            style: crate::chattext::ChatStyle::Talk,
+        };
+        let (fx, fy) = chat_pixel_frame_position(&item);
+        let (ux, uy) = (fx as u32, fy as u32);
+
+        let mut scene = Scene::new(128, 96);
+        scene.avatars = vec![named_avatar("Bob", 64, 40)];
+        scene.chat = vec![item.clone()];
+        scene.overlays_above_name_tags = vec![sprite(RED, fx, fy, 0)];
+        let c = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_ne!(
+            px(&c, ux, uy),
+            RED,
+            "the chat text must cover an AboveNameTags sprite at the same pixel"
+        );
+
+        scene.overlays_above_name_tags.clear();
+        scene.overlays_above_everything = vec![sprite(GREEN, fx, fy, 0)];
+        let c = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(
+            px(&c, ux, uy),
+            GREEN,
+            "an AboveEverything sprite must cover the chat text at the same pixel"
+        );
     }
 
     #[test]

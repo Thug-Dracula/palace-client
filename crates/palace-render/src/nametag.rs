@@ -15,9 +15,9 @@
 //!
 //! ## Font
 //!
-//! The reference asks for Arial, which is proprietary. This embeds Liberation
-//! Sans Bold instead ([`assets/LiberationSans-Bold.ttf`], SIL OFL 1.1): it is
-//! metric-compatible with Arial, so the advance widths and line metrics that
+//! The reference asks for Arial, which is proprietary. This uses the shared
+//! embedded face in `crate::glyph`: Liberation Sans Bold (SIL OFL 1.1), which
+//! is metric-compatible with Arial, so the advance widths and line metrics that
 //! drive the layout match. The face is parsed once per process and every glyph
 //! is rasterized once into a process-wide cache, so a frame with many avatars
 //! pays that cost once, not per avatar.
@@ -30,7 +30,8 @@
 //! by dilating the glyph mask over the integer offsets within a 2 px radius
 //! (a Max filter) and composites that under the white fill. The result is a hard
 //! black halo rather than a soft gradient — visually close over busy room art,
-//! but **an approximation** of the reference filter, not the filter itself.
+//! but **an approximation** of the reference filter, not the filter itself. See
+//! `crate::glyph` for the shared pipeline.
 //!
 //! ## Bounds
 //!
@@ -42,20 +43,16 @@
 //! glyph bitmap. 255 characters at 12 px is already about twice the width of the
 //! widest Palace room.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-
-use fontdue::{Font, FontSettings};
 use palace_prop::PropImage;
 
 use crate::canvas::Canvas;
+use crate::glyph;
 
-/// The embedded face. Liberation Sans Bold, SIL OFL 1.1; see the licence note
-/// beside it in `assets/`.
-const FONT_TTF: &[u8] = include_bytes!("../assets/LiberationSans-Bold.ttf");
+#[cfg(test)]
+use crate::glyph::font;
 
 /// The reference font size (`fontSize="12"`).
-pub const NAME_TAG_FONT_PX: f32 = 12.0;
+pub const NAME_TAG_FONT_PX: f32 = glyph::FONT_PX;
 /// The reference `y` term (`y="{user.y + 17}"`).
 pub const NAME_TAG_Y_OFFSET: i32 = 17;
 /// The reference `x` fudge (`x="{user.x - 1 - width/2}"`).
@@ -67,92 +64,11 @@ pub const MAX_NAME_TAG_CHARS: usize = 255;
 
 const FILL: [u8; 3] = [0xFF, 0xFF, 0xFF];
 
-/// One glyph, rasterized at [`NAME_TAG_FONT_PX`] and kept in the process-wide
-/// cache, so repeated names never re-rasterize.
-struct RasterGlyph {
-    advance: f32,
-    xmin: i32,
-    ymin: i32,
-    width: usize,
-    height: usize,
-    coverage: Arc<[u8]>,
-}
-
-impl RasterGlyph {
-    fn blank() -> Self {
-        RasterGlyph {
-            advance: 0.0,
-            xmin: 0,
-            ymin: 0,
-            width: 0,
-            height: 0,
-            coverage: Arc::from(Vec::<u8>::new()),
-        }
-    }
-}
-
-/// A glyph positioned at the text origin: `(x, y)` is the bitmap's top-left in
-/// text-box coordinates.
-struct PlacedGlyph {
-    x: f32,
-    y: f32,
-    glyph: Arc<RasterGlyph>,
-}
-
-/// The parsed face, parsed at most once for the life of the process.
-fn font() -> Option<&'static Font> {
-    static FONT: OnceLock<Option<Font>> = OnceLock::new();
-    FONT.get_or_init(|| Font::from_bytes(FONT_TTF, FontSettings::default()).ok())
-        .as_ref()
-}
-
-/// The cached raster for `character`, rasterizing it on first use.
-fn glyph(character: char) -> Arc<RasterGlyph> {
-    static CACHE: OnceLock<Mutex<HashMap<char, Arc<RasterGlyph>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-
-    let cached = cache
-        .lock()
-        .ok()
-        .and_then(|map| map.get(&character).cloned());
-    if let Some(existing) = cached {
-        return existing;
-    }
-
-    let raster = match font() {
-        Some(font) => {
-            let (metrics, bitmap) = font.rasterize(character, NAME_TAG_FONT_PX);
-            RasterGlyph {
-                advance: metrics.advance_width,
-                xmin: metrics.xmin,
-                ymin: metrics.ymin,
-                width: metrics.width,
-                height: metrics.height,
-                coverage: Arc::from(bitmap.into_boxed_slice()),
-            }
-        }
-        None => RasterGlyph::blank(),
-    };
-    let raster = Arc::new(raster);
-    if let Ok(mut map) = cache.lock() {
-        map.insert(character, Arc::clone(&raster));
-    }
-    raster
-}
-
-/// Truncate to [`MAX_NAME_TAG_CHARS`] characters without splitting a `char`.
-fn bounded(name: &str) -> &str {
-    match name.char_indices().nth(MAX_NAME_TAG_CHARS) {
-        Some((end, _)) => &name[..end],
-        None => name,
-    }
-}
-
 /// The measured advance width of `name` at [`NAME_TAG_FONT_PX`], in logical
 /// pixels. This is the `width` in the reference's `x - 1 - width/2`.
 #[must_use]
 pub fn measure_text(name: &str) -> f32 {
-    bounded(name).chars().map(|c| glyph(c).advance).sum()
+    glyph::measure(name, MAX_NAME_TAG_CHARS)
 }
 
 /// The reference placement of the tag's text box for an avatar anchor.
@@ -184,126 +100,33 @@ pub struct NameTag {
 /// the embedded face cannot be parsed, which also makes every glyph blank).
 #[must_use]
 pub fn name_tag(name: &str) -> Option<NameTag> {
-    let text = bounded(name);
+    let text = glyph::bounded(name, MAX_NAME_TAG_CHARS);
     if text.is_empty() || text.chars().all(char::is_whitespace) {
         return None;
     }
-    let font = font()?;
-    let line = font.horizontal_line_metrics(NAME_TAG_FONT_PX)?;
-    let ascent = line.ascent.max(NAME_TAG_FONT_PX * 0.5);
-    let descent = line.descent.min(0.0);
-
-    let mut placed: Vec<PlacedGlyph> = Vec::new();
-    let mut cursor = 0.0f32;
-    let mut min_x = 0.0f32;
-    let mut max_x = 0.0f32;
-    let mut min_y = 0.0f32;
-    let mut max_y = ascent - descent;
-    for character in text.chars() {
-        let raster = glyph(character);
-        if raster.width > 0 && raster.height > 0 {
-            let x = cursor + raster.xmin as f32;
-            let top = ascent - (raster.ymin + raster.height as i32) as f32;
-            let bottom = ascent - raster.ymin as f32;
-            min_x = min_x.min(x);
-            max_x = max_x.max(x + raster.width as f32);
-            min_y = min_y.min(top);
-            max_y = max_y.max(bottom);
-            placed.push(PlacedGlyph {
-                x,
-                y: top,
-                glyph: Arc::clone(&raster),
-            });
-        }
-        cursor += raster.advance;
-    }
-    max_x = max_x.max(cursor);
+    let layout = glyph::layout_line(text)?;
 
     let pad = NAME_TAG_GLOW_RADIUS;
-    let content_x0 = min_x.floor() as i32;
-    let content_y0 = min_y.floor() as i32;
-    let content_x1 = max_x.ceil() as i32;
-    let content_y1 = max_y.ceil() as i32;
+    let content_x0 = layout.min_x.floor() as i32;
+    let content_y0 = layout.min_y.floor() as i32;
+    let content_x1 = layout.max_x.ceil() as i32;
+    let content_y1 = layout.max_y.ceil() as i32;
     let width = ((content_x1 - content_x0).max(1) + 2 * pad) as usize;
     let height = ((content_y1 - content_y0).max(1) + 2 * pad) as usize;
     let pixels = width.checked_mul(height)?;
-    let len = pixels.checked_mul(4)?;
 
     let origin_x = pad - content_x0;
     let origin_y = pad - content_y0;
 
     let mut mask = vec![0u8; pixels];
-    for p in &placed {
-        let left = origin_x + p.x.floor() as i32;
-        let top = origin_y + p.y.floor() as i32;
-        for row in 0..p.glyph.height {
-            let y = top + row as i32;
-            if y < 0 || y as usize >= height {
-                continue;
-            }
-            let row_start = row * p.glyph.width;
-            for col in 0..p.glyph.width {
-                let x = left + col as i32;
-                if x < 0 || x as usize >= width {
-                    continue;
-                }
-                let Some(&coverage) = p.glyph.coverage.get(row_start + col) else {
-                    continue;
-                };
-                if coverage == 0 {
-                    continue;
-                }
-                let at = y as usize * width + x as usize;
-                mask[at] = mask[at].max(coverage);
-            }
-        }
-    }
-
-    let mut glow = vec![0u8; pixels];
-    for y in 0..height {
-        for x in 0..width {
-            let mut best = 0u8;
-            for dy in -pad..=pad {
-                for dx in -pad..=pad {
-                    if dx * dx + dy * dy > pad * pad {
-                        continue;
-                    }
-                    let sx = x as i32 + dx;
-                    let sy = y as i32 + dy;
-                    if sx < 0 || sy < 0 || sx as usize >= width || sy as usize >= height {
-                        continue;
-                    }
-                    best = best.max(mask[sy as usize * width + sx as usize]);
-                }
-            }
-            glow[y * width + x] = best;
-        }
-    }
-
-    let mut rgba = vec![0u8; len];
-    for (i, (&glow_alpha, &fill_alpha)) in glow.iter().zip(&mask).enumerate() {
-        if glow_alpha == 0 && fill_alpha == 0 {
-            continue;
-        }
-        let black = f32::from(glow_alpha) / 255.0;
-        let white = f32::from(fill_alpha) / 255.0;
-        let out_alpha = white + black * (1.0 - white);
-        if out_alpha <= 0.0 {
-            continue;
-        }
-        let at = i * 4;
-        for channel in 0..3 {
-            rgba[at + channel] = (f32::from(FILL[channel]) * white / out_alpha)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-        }
-        rgba[at + 3] = (out_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
-    }
+    glyph::paint_mask(&mut mask, width, height, origin_x, origin_y, &layout.placed);
+    let glow = glyph::dilate(&mask, width, height, pad);
+    let rgba = glyph::composite(FILL, &mask, &glow)?;
 
     let image = PropImage::from_rgba(width as u32, height as u32, rgba).ok()?;
     Some(NameTag {
         image,
-        text_width: cursor,
+        text_width: layout.width,
         origin_x,
         origin_y,
     })
