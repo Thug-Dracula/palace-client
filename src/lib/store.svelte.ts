@@ -1,4 +1,5 @@
 import type {
+  AudioState,
   ChatLine,
   ClientEvent,
   ConnectionStatus,
@@ -46,7 +47,13 @@ class PalaceStore {
   tooltip = $state<string | null>(null);
   notes = $state<string[]>([]);
   notices = $state<string[]>([]);
-  settings = $state<Settings>({ host: "localhost", port: 9998, username: "Guest" });
+  settings = $state<Settings>({ host: "localhost", port: 9998, username: "Guest", soundfont: null });
+  audio = $state<AudioState>({
+    enabled: true,
+    volume: 1,
+    soundfont: null,
+    soundfont_exists: false,
+  });
   roomFilter = $state("");
 
   zoom = $state(1);
@@ -80,6 +87,10 @@ class PalaceStore {
     void api.setVisibility(names, avatars).catch(() => {});
   }
 
+  setProps(props: number[]): void {
+    void api.setProps(props).catch(() => {});
+  }
+
   setZoom(value: number): void {
     const clamped = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, value));
     this.zoom = Math.round(clamped * 100) / 100;
@@ -87,6 +98,26 @@ class PalaceStore {
 
   nudgeZoom(delta: number): void {
     this.setZoom(this.zoom + delta);
+  }
+
+  async loadAudio(): Promise<void> {
+    this.audio = await api.getAudioState();
+  }
+
+  async chooseSoundfont(path: string | null): Promise<void> {
+    await api.setSoundfont(path);
+    this.audio = await api.getAudioState();
+  }
+
+  async setAudioEnabled(enabled: boolean): Promise<void> {
+    await api.setAudioEnabled(enabled);
+    this.audio = await api.getAudioState();
+  }
+
+  async setAudioVolume(volume: number): Promise<number> {
+    const applied = await api.setVolume(volume);
+    this.audio = await api.getAudioState();
+    return applied;
   }
 
   apply(event: ClientEvent): void {

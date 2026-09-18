@@ -41,6 +41,7 @@ pub fn handle(slot: &FrameSlot, request: &Request<Vec<u8>>, responder: UriScheme
     match path.as_str() {
         "frame" => handle_frame(slot, responder),
         "faces" => responder.respond(png(palace_render::face_sheet_png().to_vec())),
+        "faces.json" => responder.respond(json(palace_render::face_grid_json())),
         _ => responder.respond(status(StatusCode::NOT_FOUND)),
     }
 }
@@ -66,6 +67,16 @@ fn png(bytes: Vec<u8>) -> Response<Vec<u8>> {
         .header("Cache-Control", "no-store")
         .header("Access-Control-Allow-Origin", "*")
         .body(bytes)
+        .unwrap_or_else(|_| Response::new(Vec::new()))
+}
+
+fn json(body: String) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("Cache-Control", "no-store")
+        .header("Access-Control-Allow-Origin", "*")
+        .body(body.into_bytes())
         .unwrap_or_else(|_| Response::new(Vec::new()))
 }
 

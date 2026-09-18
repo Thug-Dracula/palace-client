@@ -5,17 +5,12 @@
 
   let { onclose }: { onclose: () => void } = $props();
 
-  const FACES = 13;
-  const COLORS = 16;
-  const CELL = 44;
-  const SHEET_W = FACES * CELL;
-  const SHEET_H = COLORS * CELL;
-  const FACE_ROWS = [
-    [0, 1, 2],
-    [3, 4, 5, 6, 7],
-    [8, 9, 10, 11, 12],
-  ];
-  const COLOR_ROW = Array.from({ length: COLORS }, (_, index) => index);
+  // Geometry comes from the renderer over palace://faces.json, so the picker
+  // cannot disagree with the sheet it is cropping.
+  let faces = $state(13);
+  let colors = $state(16);
+  let cell = $state(44);
+  let faceRows = $state<number[][]>([[0, 1, 2], [3, 4, 5, 6, 7], [8, 9, 10, 11, 12]]);
 
   const self = store.self;
   const sheet = api.facesUrl();
@@ -26,11 +21,9 @@
   let error = $state<string | null>(null);
   let dialog: HTMLDivElement | undefined = $state();
 
-  // The sheet is 13 columns x 16 rows of 44px cells: face is the column,
-  // colour the row, so a cell is addressed by a negative background offset.
-  function sprite(f: number, c: number, size = CELL): string {
-    const scale = size / CELL;
-    return `background-image:url('${sheet}'); background-size:${SHEET_W * scale}px ${SHEET_H * scale}px; background-position:-${f * size}px -${c * size}px;`;
+  function sprite(f: number, c: number, size = cell): string {
+    const scale = size / cell;
+    return `background-image:url('${sheet}'); background-size:${(faces * cell) * scale}px ${(colors * cell) * scale}px; background-position:-${f * size}px -${c * size}px;`;
   }
 
   async function accept() {
@@ -73,7 +66,21 @@
     }
   }
 
-  onMount(() => {
+  onMount(async () => {
+    try {
+      const grid = await api.facesGrid();
+      if (grid.faces > 0 && grid.colors > 0 && grid.cell > 0) {
+        faces = grid.faces;
+        colors = grid.colors;
+        cell = grid.cell;
+        faceRows = grid.rows;
+        face = Math.min(face, faces - 1);
+        color = Math.min(color, colors - 1);
+      }
+    } catch {
+      // Keep the sequential fallback: a picker that draws the wrong grid is
+      // worse than one that draws a plain one.
+    }
     dialog?.querySelector<HTMLButtonElement>(".face-cell.selected")?.focus();
   });
 </script>
@@ -98,7 +105,7 @@
       <p class="dialog-hint">Click an avatar to represent you:</p>
 
       <div class="face-grid">
-        {#each FACE_ROWS as row}
+        {#each faceRows as row}
           <div class="face-row">
             {#each row as index (index)}
               <button
@@ -118,7 +125,7 @@
       <div class="colour-block">
         <span class="block-label" id="colour-label">Colour</span>
         <div class="colour-row" role="group" aria-labelledby="colour-label">
-          {#each COLOR_ROW as index (index)}
+          {#each Array.from({ length: colors }, (_, index) => index) as index (index)}
             <button
               class="colour-cell"
               class:selected={color === index}

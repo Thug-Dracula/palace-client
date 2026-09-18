@@ -9,6 +9,14 @@ export interface Settings {
   host: string;
   port: number;
   username: string;
+  soundfont: string | null;
+}
+
+export interface AudioState {
+  enabled: boolean;
+  volume: number;
+  soundfont: string | null;
+  soundfont_exists: boolean;
 }
 
 export interface ServerBanner {
@@ -103,11 +111,31 @@ export type ClientEvent =
       effects: string[];
       problems: string[];
     }
-  | { type: "note"; text: string };
+  | { type: "note"; text: string }
+  | { type: "sound"; name: string }
+  | { type: "midi_play"; name: string }
+  | { type: "midi_loop"; name: string; loops: number }
+  | { type: "midi_stop" }
+  | { type: "beep" };
 
 export const frameUrl = (version: number): string => `palace://localhost/frame?v=${version}`;
 
 export const facesUrl = (): string => "palace://localhost/faces";
+
+export interface FaceGrid {
+  cell: number;
+  faces: number;
+  colors: number;
+  rows: number[][];
+}
+
+export const facesGrid = async (): Promise<FaceGrid> => {
+  const response = await fetch("palace://localhost/faces.json");
+  if (!response.ok) {
+    throw new Error(`face grid: HTTP ${response.status}`);
+  }
+  return (await response.json()) as FaceGrid;
+};
 
 export const getSettings = (): Promise<Settings> => invoke("get_settings");
 
@@ -145,6 +173,18 @@ export const setVisibility = (names: boolean, avatars: boolean): Promise<void> =
 
 export const setAvatar = (face: number, color: number): Promise<void> =>
   invoke("set_avatar", { face, color });
+
+export const setProps = (props: number[]): Promise<void> => invoke("set_props", { props });
+
+export const getAudioState = (): Promise<AudioState> => invoke("get_audio_state");
+
+export const setSoundfont = (path: string | null): Promise<void> =>
+  invoke("set_soundfont", { path });
+
+export const setAudioEnabled = (enabled: boolean): Promise<void> =>
+  invoke("set_audio_enabled", { enabled });
+
+export const setVolume = (volume: number): Promise<number> => invoke("set_volume", { volume });
 
 export const onEvent = (handler: (event: ClientEvent) => void): Promise<UnlistenFn> =>
   listen<ClientEvent>(EVENT_NAME, (message) => handler(message.payload));
