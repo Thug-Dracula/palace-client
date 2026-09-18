@@ -7,6 +7,55 @@ This file exists so a **fresh session** can resume without carrying a long conve
 
 ---
 
+## Update 2026-09-17 (late) — read this before the sections below
+
+**Everything below predates this.** Those sections describe the 2026-09-16 interactive-client
+milestone; the day since changed the client materially, and the live record of that work is
+`palace-todo.md` §2.11–§2.24. Summary, so a fresh session is not misled by the older text:
+
+**Shipped, tested and published:**
+- `LOADSCRIPT`/`HTTPGET` fetch-and-execute (`b62de07`): the response *is* a script when its
+  content-type says so, and `HTTPRECEIVED` fires at the fetching hotspot. Together with the ~40
+  previously unreachable command names now registered (`af6035f`), rooms can load their own logic.
+- `ISLOCKED` answers from the room (`7802e8e`): the id must name a hotspot that is a shuttable (2) or
+  lockable (3) door in state 1. Mutation-verified — note the pre-existing test had passed for the
+  wrong reason, because the stub answered `false` to everything.
+- `CLEARLOOSEPROPS` is no longer claimed as a wire effect (`b8b2c21`): it was the only effect claiming
+  wire-backing with no encoder, and the protocol has only a client-side event for it.
+- Props: bag reader (`e059f33`), `USER_PROP`/`ASSET_REGI` encoders (`2c780b3`), wearing reaching the
+  server (`8837789`). `IPTVERSION` now reports 2 (`81180db`).
+- Tracing to a file via `PALACE_TRACE` (`ea295a4`); `DRAW` decoded and rasterized (`ddbf9e7`,
+  `f682ca5`); the click-pointer fix that stopped room ejections (`cbf7608`).
+- Release **`v0.2.0-alpha.2`** is Latest (AppImage + both Windows artifacts) and **verified to contain
+  the two fixes above**. `v0.1.0` and `v0.2.0-alpha` are older snapshots.
+
+**The hard blocker is unchanged:** authentication is unimplemented (tracker §2.1) and needs a
+**decision** about where a credential lives before any code is written.
+
+**Three premises that were wrong — recorded so they are not acted on:**
+1. `SETPICLOCLOCAL` is *not* missing; it is dispatched at `host.rs:423`.
+2. `LOADPROPS` pushes nothing **by design** — a prefetch with a 500-id limit. It is not a broken no-op.
+3. A release is a snapshot: `v0.2.0-alpha` did *not* contain that day's fixes, which is why
+   `v0.2.0-alpha.2` was cut. Never assume "Latest" includes work committed after it.
+
+**Verification lessons, all of which cost real time:**
+- **Local clippy is weaker than CI** unless the toolchains match. CI tracks rolling stable and was on
+  1.98 while this machine was on 1.95, so `unneeded_wildcard_pattern` passed locally and failed the
+  release. Now on 1.98.1, verified clean across every crate except `palace-app`.
+- **A test that derives its expectation from the table it checks cannot catch an error in that table.**
+  The wire-set test asserted "exactly twenty" and counted a bad flag, locking the mistake in.
+- **Check the cheapest thing first.** Three completion claims in this session were contradicted by one
+  command — run afterwards instead of before.
+
+**Lost, and must be re-derived:** two 36-minute research passes (the hit-test rule and its blast
+radius; the constant-stub semantics). Their outputs were cleaned up and subagent access is refused, so
+go to `$CORPUS/reference/repos/sparky/index.js` and OpenPalace's spot class directly.
+
+**State when this was written:** tree clean; `cargo test -p palace-host` green; clippy 1.98.1 clean
+across every non-Tauri crate; public source scrub-verified at 132 commits; `v0.2.0-alpha.2` released.
+
+---
+
 ## HARD BOUNDARIES — agents must not cross these
 
 These exist because a subagent, trying to satisfy a "watch the window resize" instruction, went hunting for desktop input-injection tooling and reached for **`input-tool` (kernel-level mouse injection) on a live desktop**. It abandoned the path after ~11s and used the app's own command path instead — but it should never have been available to it.
