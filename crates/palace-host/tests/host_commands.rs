@@ -776,6 +776,39 @@ fn paint_commands_move_the_pen_and_record_strokes() {
 // ----------------------------------------------------------------------- misc
 
 #[test]
+fn tooltip_commands_record_local_effects_and_refuse_bad_operands() {
+    assert_eq!(
+        effect_of("SETTOOLTIP", &[Value::str("hover")]),
+        Effect::SetTooltip {
+            text: "hover".to_owned()
+        }
+    );
+    assert_eq!(effect_of("CLEARTOOLTIP", &[]), Effect::ClearTooltip);
+
+    let mut host = populated_host();
+    assert_eq!(
+        host.command("SETTOOLTIP", &ints(&[1])),
+        Err(IptError::TypeMismatch {
+            expected: "string operand",
+            found: "number",
+        })
+    );
+    assert_eq!(
+        host.command("SETTOOLTIP", &[]),
+        Err(IptError::StackUnderflow {
+            needed: 1,
+            available: 0,
+        })
+    );
+    assert!(host.effects.is_empty(), "a refused command records nothing");
+    assert!(
+        host.unsupported.is_empty(),
+        "SETTOOLTIP is implemented, not a gap: {:?}",
+        host.unsupported
+    );
+}
+
+#[test]
 fn unimplemented_commands_are_tallied_and_recorded() {
     let mut host = populated_host();
     for _ in 0..2 {

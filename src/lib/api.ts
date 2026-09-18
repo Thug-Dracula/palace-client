@@ -95,6 +95,7 @@ export type ClientEvent =
   | { type: "room_entered"; room: RoomInfo }
   | { type: "chat"; line: ChatLine }
   | { type: "screen"; screen: ScreenState }
+  | { type: "tooltip"; text: string | null }
   | {
       type: "script";
       event: string;
@@ -134,6 +135,10 @@ export const setViewport = (
 export const refresh = (): Promise<void> => invoke("refresh");
 
 export const click = (x: number, y: number): Promise<void> => invoke("click", { x, y });
+
+export const mousemove = (x: number, y: number): Promise<void> => invoke("mousemove", { x, y });
+
+export const mouseLeave = (): Promise<void> => invoke("mouse_leave");
 
 export const setVisibility = (names: boolean, avatars: boolean): Promise<void> =>
   invoke("set_visibility", { names, avatars });

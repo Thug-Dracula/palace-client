@@ -57,7 +57,8 @@ fn report(event: &ClientEvent) -> bool {
         | ClientEvent::Banner { .. }
         | ClientEvent::RoomEntered { .. }
         | ClientEvent::Chat { .. }
-        | ClientEvent::Note { .. } => {}
+        | ClientEvent::Note { .. }
+        | ClientEvent::Tooltip { .. } => {}
     }
     matches!(event, ClientEvent::Screen { .. })
 }

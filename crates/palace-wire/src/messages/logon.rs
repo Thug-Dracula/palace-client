@@ -252,6 +252,44 @@ pub fn reference_logon_record(user_name: &str, desired_room: i16) -> AuxRegistra
     ReferenceProfile::default().to_record(user_name, desired_room)
 }
 
+/// The logon profile this client actually advertises.
+///
+/// It is the [`ReferenceProfile`] with [`aux_flags::AUTHENTICATE`] cleared. That
+/// bit promises the server an authentication challenge will be answered, but
+/// `AUTHRESPONSE` is not implemented: a server that believes the advertisement
+/// sends `AUTHENTICATE` and then waits in silence. The application sends this
+/// profile so it never claims a capability it cannot honour. The reference
+/// profile keeps the bit because it mirrors the captured client byte for byte;
+/// see its documentation for why that matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientProfile(ReferenceProfile);
+
+impl Default for ClientProfile {
+    fn default() -> Self {
+        // Start from every reference value and remove only the one bit this
+        // client cannot back up, so the two profiles cannot drift apart.
+        ClientProfile(ReferenceProfile {
+            aux_flags: ReferenceProfile::default().aux_flags & !aux_flags::AUTHENTICATE,
+            ..ReferenceProfile::default()
+        })
+    }
+}
+
+impl ClientProfile {
+    /// Build an [`AuxRegistrationRec`] for `user_name` entering `desired_room`.
+    pub fn to_record(self, user_name: &str, desired_room: i16) -> AuxRegistrationRec {
+        self.0.to_record(user_name, desired_room)
+    }
+}
+
+/// Build the logon record this client sends for `user_name`.
+///
+/// Unlike [`reference_logon_record`] it does not advertise
+/// [`aux_flags::AUTHENTICATE`], because the reply is not implemented.
+pub fn client_logon_record(user_name: &str, desired_room: i16) -> AuxRegistrationRec {
+    ClientProfile::default().to_record(user_name, desired_room)
+}
+
 /// `MSG_AUTHENTICATE` (`auth`): the server asking the client to authenticate.
 ///
 /// The body is empty — "there are no parameters in this message, so the length
@@ -346,6 +384,45 @@ mod tests {
             record.aux_flags & aux_flags::AUTHENTICATE,
             aux_flags::AUTHENTICATE
         );
+    }
+
+    #[test]
+    fn client_profile_clears_only_the_authenticate_bit() {
+        // The unnamed OS tag the reference client writes in the low nibble.
+        const OS_TAG_8: u32 = 0x0000_0008;
+
+        let reference = reference_logon_record("Rico", 0);
+        let client = client_logon_record("Rico", 0);
+
+        // The oracle advertises the capability; what we send does not.
+        assert_eq!(
+            reference.aux_flags & aux_flags::AUTHENTICATE,
+            aux_flags::AUTHENTICATE
+        );
+        assert_eq!(client.aux_flags & aux_flags::AUTHENTICATE, 0);
+        assert_eq!(
+            reference.aux_flags ^ client.aux_flags,
+            aux_flags::AUTHENTICATE,
+            "the profiles must agree on every other auxFlags bit"
+        );
+
+        // And the encoding differs only within the `auxFlags` word at offset 72.
+        let ref_bytes = reference.encode_to_vec(ByteOrder::Little);
+        let client_bytes = client.encode_to_vec(ByteOrder::Little);
+        assert_eq!(ref_bytes.len(), client_bytes.len());
+        let differing: Vec<usize> = (0..ref_bytes.len())
+            .filter(|&i| ref_bytes[i] != client_bytes[i])
+            .collect();
+        assert!(!differing.is_empty(), "the profiles must differ");
+        assert!(
+            differing.iter().all(|&i| (72..76).contains(&i)),
+            "only the auxFlags word may differ, got {differing:?}"
+        );
+        assert_eq!(
+            &ref_bytes[72..76],
+            &(aux_flags::AUTHENTICATE | OS_TAG_8).to_le_bytes()
+        );
+        assert_eq!(&client_bytes[72..76], &OS_TAG_8.to_le_bytes());
     }
 
     #[test]

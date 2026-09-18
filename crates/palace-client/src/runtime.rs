@@ -26,8 +26,9 @@ use palace_render::{
     FLAG_PICTURES_ABOVE_ALL,
 };
 use palace_wire::byteorder::Writer;
+use palace_wire::error::WireError;
 use palace_wire::frame::{user_color_frame, user_face_frame, user_move_frame, Frame};
-use palace_wire::messages::{reference_logon_record, AssetSpec, Point, Talk, UserProp};
+use palace_wire::messages::{client_logon_record, AssetSpec, Point, Talk, UserProp};
 use palace_wire::opcode;
 use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -137,6 +138,14 @@ pub enum ClientCommand {
         x: f64,
         y: f64,
     },
+    /// The pointer moved to a viewport pixel. The runtime maps it to a room
+    /// point and dispatches the hover pair and `MOUSEMOVE`.
+    MouseMove {
+        x: f64,
+        y: f64,
+    },
+    /// The pointer left the viewport, so no hotspot is under it any more.
+    MouseLeave,
     SetVisibility {
         names: bool,
         avatars: bool,
@@ -191,6 +200,10 @@ pub enum ClientEvent {
     },
     Screen {
         screen: ScreenState,
+    },
+    /// The hover tooltip changed: `Some` shows it, `None` hides it.
+    Tooltip {
+        text: Option<String>,
     },
     Script {
         event: String,
@@ -348,6 +361,16 @@ impl ClientHandle {
         self.send(ClientCommand::Click { x, y });
     }
 
+    /// Report pointer movement, in viewport pixels.
+    pub fn move_mouse(&self, x: f64, y: f64) {
+        self.send(ClientCommand::MouseMove { x, y });
+    }
+
+    /// Report the pointer leaving the viewport.
+    pub fn mouse_leave(&self) {
+        self.send(ClientCommand::MouseLeave);
+    }
+
     /// Run a bare IPTSCRAE instruction sequence against the live host.
     pub fn run_script(&self, source: impl Into<String>) {
         self.send(ClientCommand::RunScript(source.into()));
@@ -481,6 +504,18 @@ impl ClientRuntime {
     }
 }
 
+/// How one session ended, which decides what the supervisor does next.
+enum SessionOutcome {
+    /// The user asked to reconnect, or the session ended while still healthy:
+    /// dial again at once.
+    Reconnect,
+    /// The peer closed the socket: retry after the reconnect backoff.
+    Retry,
+    /// The server ended the session and said why. It must not be hammered by a
+    /// reconnect loop, so the supervisor stops.
+    Ended,
+}
+
 fn supervisor_loop(shared: Arc<Shared>, mut cmd_rx: UnboundedReceiver<ClientCommand>) {
     let mut backoff_ms = 1_500u64;
     loop {
@@ -492,8 +527,8 @@ fn supervisor_loop(shared: Arc<Shared>, mut cmd_rx: UnboundedReceiver<ClientComm
             return;
         }
         match run_session(&shared, &mut cmd_rx) {
-            Ok(true) => backoff_ms = 1_500,
-            Ok(false) => {
+            Ok(SessionOutcome::Reconnect) => backoff_ms = 1_500,
+            Ok(SessionOutcome::Retry) => {
                 if !shared.running.load(Ordering::Relaxed) {
                     shared.emit(ClientEvent::Status {
                         status: ConnectionStatus::Disconnected,
@@ -510,6 +545,7 @@ fn supervisor_loop(shared: Arc<Shared>, mut cmd_rx: UnboundedReceiver<ClientComm
                 }
                 backoff_ms = (backoff_ms * 2).min(20_000);
             }
+            Ok(SessionOutcome::Ended) => return,
             Err(e) => {
                 shared.emit(ClientEvent::Status {
                     status: ConnectionStatus::Error,
@@ -561,7 +597,7 @@ fn sleep_interruptible(
 fn run_session(
     shared: &Arc<Shared>,
     cmd_rx: &mut UnboundedReceiver<ClientCommand>,
-) -> Result<bool> {
+) -> Result<SessionOutcome> {
     let cfg = &shared.cfg;
     let session_root = session_cache_dir(cfg);
     let mut workspace = AssetWorkspace::new(&session_root)?;
@@ -598,7 +634,25 @@ fn run_session(
         .ok();
 
     let mut conn = Connection::connect(&cfg.host, cfg.port, Duration::from_secs(8))?;
-    let handshake = conn.handshake(Duration::from_secs(12))?;
+    let handshake = match conn.handshake(Duration::from_secs(12)) {
+        Ok(handshake) => handshake,
+        // A `down` reply to the opening banner is a refusal with a reason, not
+        // a transient failure: report it and stop, do not retry.
+        Err(ClientError::Wire(WireError::ServerDown { reason })) => {
+            let text = reason.reason_text();
+            shared.emit(ClientEvent::Status {
+                status: ConnectionStatus::Disconnected,
+                message: Some(text.clone()),
+            });
+            shared.chat(
+                ChatKind::System,
+                format!("the server ended the session: {text}"),
+            );
+            shared.running.store(false, Ordering::Relaxed);
+            return Ok(SessionOutcome::Ended);
+        }
+        Err(e) => return Err(e),
+    };
     let order = handshake.byte_order;
     let user_id = handshake.user_id();
     crate::trace::frame_in(&handshake.frame, order);
@@ -616,6 +670,9 @@ fn run_session(
     let mut scripts = ScriptEngine::with_palace_limits();
     let mut signon_pending = true;
     let mut click_pending: Option<(f64, f64)> = None;
+    let mut mousemove_pending: Option<(f64, f64)> = None;
+    let mut mouse_leave_pending = false;
+    let mut hover_spot: Option<i32> = None;
     let mut run_source_pending: Option<String> = None;
     let mut occupied_room = false;
 
@@ -626,7 +683,7 @@ fn run_session(
         banner: state.banner.clone(),
     });
 
-    let record = reference_logon_record(&cfg.username, cfg.desired_room);
+    let record = client_logon_record(&cfg.username, cfg.desired_room);
     conn.send(&record.logon_frame(order))?;
     let _ = conn.send(&Frame::empty(opcode::LISTOFALLROOMS, 0));
     let _ = conn.send(&Frame::empty(opcode::LISTOFALLUSERS, 0));
@@ -667,6 +724,8 @@ fn run_session(
                 }
                 ClientCommand::Say(text) => say = Some(text),
                 ClientCommand::Click { x, y } => click_pending = Some((x, y)),
+                ClientCommand::MouseMove { x, y } => mousemove_pending = Some((x, y)),
+                ClientCommand::MouseLeave => mouse_leave_pending = true,
                 ClientCommand::SetVisibility { names, avatars } => {
                     if apply_visibility(&mut state, &mut builder, names, avatars) {
                         dirty_render = true;
@@ -749,7 +808,11 @@ fn run_session(
             if let Some(handle) = script_thread {
                 let _ = handle.join();
             }
-            return Ok(clean);
+            return Ok(if clean {
+                SessionOutcome::Reconnect
+            } else {
+                SessionOutcome::Retry
+            });
         }
 
         if resync {
@@ -825,6 +888,37 @@ fn run_session(
                 conn.send(&Frame::new(opcode::TALK, user_id, writer.into_vec()))?;
             } else {
                 shared.note("an ON OUTCHAT script suppressed the outgoing line");
+            }
+        }
+        if let Some((x, y)) = mousemove_pending.take() {
+            if let Some((rx, ry)) = click_room_point(shared, x, y) {
+                for event in dispatch_pointer_move(
+                    &mut scripts,
+                    &mut state,
+                    shared,
+                    &mut conn,
+                    &mut dirty_render,
+                    &mut hover_spot,
+                    (rx, ry),
+                ) {
+                    shared.emit(event);
+                }
+            }
+        }
+        if mouse_leave_pending {
+            mouse_leave_pending = false;
+            if let Some(left) = hover_spot.take() {
+                for event in run_dispatch(
+                    &mut scripts,
+                    ScriptEvent::RollOut,
+                    &mut state,
+                    shared,
+                    &mut conn,
+                    &mut dirty_render,
+                    Some(left),
+                ) {
+                    shared.emit(event);
+                }
             }
         }
         if let Some((x, y)) = click_pending.take() {
@@ -976,6 +1070,10 @@ fn run_session(
                     });
                 }
                 if applied.room_entered {
+                    hover_spot = None;
+                    if state.tooltip.take().is_some() {
+                        shared.emit(ClientEvent::Tooltip { text: None });
+                    }
                     if let Some(room) = state.current_room.clone() {
                         shared.emit(ClientEvent::RoomEntered { room: room.clone() });
                         crate::trace::room_arrived(room.id, &room.name);
@@ -1053,6 +1151,27 @@ fn run_session(
                 if applied.render {
                     dirty_render = true;
                 }
+                if let Some(down) = applied.disconnect {
+                    let reason = down.reason_text();
+                    shared.emit(ClientEvent::Status {
+                        status: ConnectionStatus::Disconnected,
+                        message: Some(reason.clone()),
+                    });
+                    shared.chat(
+                        ChatKind::System,
+                        format!("the server ended the session: {reason}"),
+                    );
+                    shared.running.store(false, Ordering::Relaxed);
+                    drop(media_tx);
+                    drop(script_fetch_tx);
+                    if let Some(handle) = media_thread {
+                        let _ = handle.join();
+                    }
+                    if let Some(handle) = script_thread {
+                        let _ = handle.join();
+                    }
+                    return Ok(SessionOutcome::Ended);
+                }
             }
             Ok(None) => {}
             Err(ClientError::Disconnected) => {
@@ -1065,7 +1184,7 @@ fn run_session(
                 if let Some(handle) = script_thread {
                     let _ = handle.join();
                 }
-                return Ok(false);
+                return Ok(SessionOutcome::Retry);
             }
             Err(e) => {
                 drop(media_tx);
@@ -1518,6 +1637,65 @@ fn click_room_point(shared: &Arc<Shared>, x: f64, y: f64) -> Option<(i32, i32)> 
     let transform = shared.transform()?;
     let point = transform.viewport_to_room(PointF::new(x, y));
     Some((point.x.round() as i32, point.y.round() as i32))
+}
+
+/// Dispatch the hover pair and `MOUSEMOVE` for one pointer movement.
+///
+/// When the hotspot under the pointer changes, the hotspot left gets `ROLLOUT`
+/// and the one entered gets `ROLLOVER`, in that order; both are scoped to their
+/// own script with `fire_spot`. `MOUSEMOVE` is a hotspot event too, so it is
+/// scoped to the hotspot the pointer is over and fires on every movement, not
+/// only on a change. A move into empty space therefore fires only the `ROLLOUT`.
+fn dispatch_pointer_move(
+    scripts: &mut ScriptEngine,
+    state: &mut SessionState,
+    shared: &Arc<Shared>,
+    conn: &mut Connection,
+    dirty_render: &mut bool,
+    hover: &mut Option<i32>,
+    point: (i32, i32),
+) -> Vec<ClientEvent> {
+    let (rx, ry) = point;
+    shared.set_mouse(rx, ry);
+    let current = host_view(state, shared).spot_at(rx, ry).map(|spot| spot.id);
+    let mut out = Vec::new();
+    if *hover != current {
+        if let Some(left) = *hover {
+            out.extend(run_dispatch(
+                scripts,
+                ScriptEvent::RollOut,
+                state,
+                shared,
+                conn,
+                dirty_render,
+                Some(left),
+            ));
+        }
+        if let Some(entered) = current {
+            out.extend(run_dispatch(
+                scripts,
+                ScriptEvent::RollOver,
+                state,
+                shared,
+                conn,
+                dirty_render,
+                Some(entered),
+            ));
+        }
+        *hover = current;
+    }
+    if let Some(spot) = current {
+        out.extend(run_dispatch(
+            scripts,
+            ScriptEvent::MouseMove,
+            state,
+            shared,
+            conn,
+            dirty_render,
+            Some(spot),
+        ));
+    }
+    out
 }
 
 /// The room position a bare floor click asks the signed-in user to walk to.
@@ -2005,6 +2183,24 @@ fn apply_effect(
                     no_change_suffix(changed)
                 ),
             }]
+        }
+        Effect::SetTooltip { text } => {
+            let changed = state.tooltip.as_deref() != Some(text.as_str());
+            state.tooltip = Some(text.clone());
+            if changed {
+                vec![ClientEvent::Tooltip {
+                    text: Some(text.clone()),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+        Effect::ClearTooltip => {
+            if state.tooltip.take().is_some() {
+                vec![ClientEvent::Tooltip { text: None }]
+            } else {
+                Vec::new()
+            }
         }
         // The frame was already sent above by `effect_frame`, which computes the
         // target with the same `move_target` used here, so the position applied

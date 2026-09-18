@@ -43,6 +43,7 @@ class PalaceStore {
   room = $state<RoomInfo | null>(null);
   chat = $state<LocalChatLine[]>([]);
   screen = $state<ScreenState | null>(null);
+  tooltip = $state<string | null>(null);
   notes = $state<string[]>([]);
   notices = $state<string[]>([]);
   settings = $state<Settings>({ host: "localhost", port: 9998, username: "Guest" });
@@ -115,6 +116,9 @@ class PalaceStore {
         if (!event.screen.geometry.native) {
           this.zoom = event.screen.geometry.zoom;
         }
+        break;
+      case "tooltip":
+        this.tooltip = event.text;
         break;
       case "script": {
         const summary = `ON ${event.event}: ${event.fired} handler(s)`;

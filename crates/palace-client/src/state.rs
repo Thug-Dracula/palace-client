@@ -126,6 +126,10 @@ pub struct Applied {
     /// The runtime dispatches each exactly once, after the model has taken the
     /// frame's change, so a handler sees the state the frame produced.
     pub scripts: Vec<ScriptStimulus>,
+    /// Set when the frame was a `SERVERDOWN`: the server's reason for ending
+    /// the session, which the runtime turns into a status and a transcript line
+    /// and acts on by stopping without reconnecting.
+    pub disconnect: Option<messages::ServerDown>,
 }
 
 /// The live model of one session.
@@ -144,6 +148,9 @@ pub struct SessionState {
     pub avatars_hidden: bool,
     /// Client-side `SETPICOPACITY`, keyed by hotspot id and state index.
     pub pic_opacity: BTreeMap<(i16, i16), f64>,
+    /// The hover tooltip text a script set with `SETTOOLTIP`, or `None` after
+    /// `CLEARTOOLTIP`. Local-only: it is never sent to the server.
+    pub tooltip: Option<String>,
     /// The current room's paint: the room's own stored draw commands plus every
     /// `DRAW` that has arrived since. Scoped to one room, so a `DRAW` for a room
     /// this session has left cannot appear on the new room's canvas.
@@ -182,6 +189,7 @@ impl SessionState {
             room_dim: 1.0,
             avatars_hidden: false,
             pic_opacity: BTreeMap::new(),
+            tooltip: None,
             draw: DrawList::new(),
             pending_fetches: Vec::new(),
             pending_fetch_room: None,
@@ -690,6 +698,10 @@ impl SessionState {
                         frame.payload.len()
                     ),
                 ));
+            }
+            Message::ServerDown(down) => {
+                self.status = ConnectionStatus::Disconnected;
+                applied.disconnect = Some(down);
             }
             Message::Unknown { opcode: op, .. } if op.is_known() => {
                 let line = self.system_line(

@@ -488,6 +488,14 @@ pub trait PalaceHost: Host {
     fn get_chat_string(&self) -> String {
         String::new()
     }
+    /// Show `text` as the hover tooltip (`SETTOOLTIP`).
+    fn set_tooltip(&mut self, _text: &str) -> Result<()> {
+        Err(unavailable("SETTOOLTIP"))
+    }
+    /// Hide the hover tooltip (`CLEARTOOLTIP`).
+    fn clear_tooltip(&mut self) -> Result<()> {
+        Err(unavailable("CLEARTOOLTIP"))
+    }
 }
 
 fn unavailable(command: &str) -> IptError {

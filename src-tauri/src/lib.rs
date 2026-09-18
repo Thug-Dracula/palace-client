@@ -174,6 +174,8 @@ pub fn run() {
             commands::goto_room,
             commands::say,
             commands::click,
+            commands::mousemove,
+            commands::mouse_leave,
             commands::set_visibility,
             commands::set_avatar,
             commands::set_viewport,

@@ -132,6 +132,15 @@ pub enum Effect {
         /// The block's inner source text, without the braces.
         script: String,
     },
+    /// `SETTOOLTIP` — show `text` as the hover tooltip.
+    ///
+    /// Local-only, like [`Effect::AddSpot`]: the reference keeps the tooltip in
+    /// its own UI state and no wire body exists for it.
+    SetTooltip { text: String },
+    /// `CLEARTOOLTIP` — hide the hover tooltip.
+    ///
+    /// Local-only, like [`Effect::SetTooltip`].
+    ClearTooltip,
     /// `LOCK` — lock a door.
     Lock { spot: i32 },
     /// `UNLOCK` — unlock a door.
@@ -242,6 +251,8 @@ impl Effect {
             Effect::AddPic { .. } => "ADDPIC",
             Effect::SetSpotOptions { .. } => "SETSPOTOPTIONS",
             Effect::SetSpotScript { .. } => "SETSPOTSCRIPT",
+            Effect::SetTooltip { .. } => "SETTOOLTIP",
+            Effect::ClearTooltip => "CLEARTOOLTIP",
             Effect::Lock { .. } => "LOCK",
             Effect::Unlock { .. } => "UNLOCK",
             Effect::SelectSpot { .. } => "SELECT",
@@ -379,6 +390,8 @@ impl fmt::Display for Effect {
                 f,
                 "SETSPOTSCRIPT spot={spot} event={event} script={script:?}"
             ),
+            Effect::SetTooltip { text } => write!(f, "SETTOOLTIP {text:?}"),
+            Effect::ClearTooltip => write!(f, "CLEARTOOLTIP"),
             Effect::Lock { spot } => write!(f, "LOCK {spot}"),
             Effect::Unlock { spot } => write!(f, "UNLOCK {spot}"),
             Effect::SelectSpot { spot } => write!(f, "SELECT {spot}"),

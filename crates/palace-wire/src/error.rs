@@ -28,6 +28,12 @@ pub enum WireError {
     UnsupportedTransport { banner: [u8; 4] },
     /// The first four bytes were not a recognised Palace banner.
     UnknownBanner { banner: [u8; 4] },
+    /// The server's first packet was `SERVERDOWN` (`down`): it ended the
+    /// connection before the logon handshake completed, and for a reason.
+    ServerDown {
+        /// The decoded reason and, for `K_Verbose`, the server's own message.
+        reason: crate::messages::ServerDown,
+    },
     /// A fixed-size field was consumed but bytes were left over.
     TrailingBytes { remaining: usize },
     /// A prop cannot be registered with `ASSET_REGI` because the reference
@@ -79,6 +85,9 @@ impl fmt::Display for WireError {
                 "unexpected server banner {:?} (expected 'ryit', 'tiyr' or 'pser')",
                 String::from_utf8_lossy(banner)
             ),
+            WireError::ServerDown { reason } => {
+                write!(f, "server ended the session: {}", reason.reason_text())
+            }
             WireError::TrailingBytes { remaining } => {
                 write!(f, "{remaining} unparsed byte(s) remained after decode")
             }

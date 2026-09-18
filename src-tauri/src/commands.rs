@@ -82,6 +82,18 @@ pub fn click(state: State<'_, AppState>, x: f64, y: f64) -> Result<(), String> {
     with_client(&state, |client| client.click(x, y))
 }
 
+/// Report pointer movement in viewport pixels; the runtime dispatches hover.
+#[tauri::command]
+pub fn mousemove(state: State<'_, AppState>, x: f64, y: f64) -> Result<(), String> {
+    with_client(&state, |client| client.move_mouse(x, y))
+}
+
+/// Report the pointer leaving the viewport.
+#[tauri::command]
+pub fn mouse_leave(state: State<'_, AppState>) -> Result<(), String> {
+    with_client(&state, |client| client.mouse_leave())
+}
+
 /// Show or hide name tags and avatars.
 #[tauri::command]
 pub fn set_visibility(

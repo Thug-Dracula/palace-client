@@ -550,6 +550,11 @@ impl Host for ScriptHost {
                 });
                 Ok(Vec::new())
             }
+            "SETTOOLTIP" => {
+                let text = text_arg(args, 0)?;
+                self.set_tooltip(&text).map(|()| Vec::new())
+            }
+            "CLEARTOOLTIP" => self.clear_tooltip().map(|()| Vec::new()),
             "LOCK" => {
                 self.effects.push(Effect::Lock {
                     spot: int_arg(args, 0)? as i32,
@@ -800,12 +805,12 @@ impl Host for ScriptHost {
                 Some(Value::Str(s)) => s.to_string(),
                 _ => String::new(),
             })]),
-            "HIDESMILEYS" | "LOCKUSERPROPS" | "AUTOUSERLAYER" | "SETTOOLTIP" | "CLEARTOOLTIP"
-            | "REMOVEPIC" | "DELPIC" | "ROOMZOOM" | "ROOMUNZOOM" | "CIRCLE" | "FILL" | "PAINT"
-            | "TEXT" | "PING" | "CLRPROPS" | "SHOWALLPROPS" | "HIDEPROPS" | "SHOWPROPS"
-            | "SETPROPSLOCAL" | "ADDPROP" | "PURGE" | "ROOMDESC" | "OFFLINE" | "ONLINE"
-            | "NBRUSERS" | "GETWHOTALKING" | "MSGTO" | "FLUSH" | "SETSPOTSTATEALL" | "AWAY"
-            | "TOGGLECTRL" | "SETDESC" | "BAN" | "KICK" => self.unimplemented(name, pushes, push),
+            "HIDESMILEYS" | "LOCKUSERPROPS" | "AUTOUSERLAYER" | "REMOVEPIC" | "DELPIC"
+            | "ROOMZOOM" | "ROOMUNZOOM" | "CIRCLE" | "FILL" | "PAINT" | "TEXT" | "PING"
+            | "CLRPROPS" | "SHOWALLPROPS" | "HIDEPROPS" | "SHOWPROPS" | "SETPROPSLOCAL"
+            | "ADDPROP" | "PURGE" | "ROOMDESC" | "OFFLINE" | "ONLINE" | "NBRUSERS"
+            | "GETWHOTALKING" | "MSGTO" | "FLUSH" | "SETSPOTSTATEALL" | "AWAY" | "TOGGLECTRL"
+            | "SETDESC" | "BAN" | "KICK" => self.unimplemented(name, pushes, push),
 
             _ => self.unimplemented(name, pushes, push),
         }
@@ -1065,6 +1070,18 @@ impl PalaceHost for ScriptHost {
             state: state as i32,
             opacity,
         });
+        Ok(())
+    }
+
+    fn set_tooltip(&mut self, text: &str) -> Result<()> {
+        self.effects.push(Effect::SetTooltip {
+            text: text.to_owned(),
+        });
+        Ok(())
+    }
+
+    fn clear_tooltip(&mut self) -> Result<()> {
+        self.effects.push(Effect::ClearTooltip);
         Ok(())
     }
 

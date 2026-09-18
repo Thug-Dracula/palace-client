@@ -23,8 +23,8 @@ use std::io::Read;
 
 use crate::byteorder::{ByteOrder, Reader, Writer};
 use crate::error::{Result, WireError, MAX_PAYLOAD_LEN};
-use crate::messages::Point;
-use crate::opcode::{Opcode, ROOMDESCEND, TIYID};
+use crate::messages::{Point, ServerDown};
+use crate::opcode::{Opcode, ROOMDESCEND, SERVERDOWN, TIYID};
 
 /// Size of the fixed frame header: `eventType` + `length` + `refNum`.
 pub const HEADER_LEN: usize = 12;
@@ -175,7 +175,14 @@ impl Handshake {
 pub fn read_handshake<R: Read>(source: &mut R) -> Result<Handshake> {
     let mut banner = [0u8; 4];
     source.read_exact(&mut banner)?;
-    let byte_order = ByteOrder::from_banner(&banner)?;
+    // A `down` first packet is a refusal, not a banner, but its opcode still
+    // spells the server's byte order (`down` big-endian, `nwod` little), so the
+    // order is recoverable and the reason can be surfaced.
+    let byte_order = match &banner {
+        b"down" => ByteOrder::Big,
+        b"nwod" => ByteOrder::Little,
+        _ => ByteOrder::from_banner(&banner)?,
+    };
 
     let mut rest = [0u8; HEADER_LEN - 4];
     source.read_exact(&mut rest)?;
@@ -214,9 +221,13 @@ pub fn read_handshake<R: Read>(source: &mut R) -> Result<Handshake> {
         payload,
     };
 
+    if frame.opcode == SERVERDOWN {
+        let mut r = Reader::new(&frame.payload, byte_order);
+        let reason = ServerDown::decode(frame.ref_num, &mut r)
+            .unwrap_or_else(|_| ServerDown::from_ref_num(frame.ref_num));
+        return Err(WireError::ServerDown { reason });
+    }
     if frame.opcode != TIYID {
-        // Some servers send a trivial error packet first (e.g. `down` when the
-        // server is shutting down). Surface it rather than mis-parsing.
         return Err(WireError::UnknownBanner { banner });
     }
     Ok(Handshake { byte_order, frame })
@@ -301,7 +312,10 @@ pub fn is_room_desc_end(opcode: Opcode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opcode::{LOGON, PING, ROOMDESC, USERCOLOR, USERFACE, USERMOVE, USERNAME};
+    use crate::messages::ServerDownReason;
+    use crate::opcode::{
+        LOGON, PING, ROOMDESC, SERVERDOWN, USERCOLOR, USERFACE, USERMOVE, USERNAME,
+    };
 
     fn sample(order: ByteOrder) -> Vec<u8> {
         let mut w = Writer::new(order);
@@ -440,6 +454,54 @@ mod tests {
         let hs = read_handshake(&mut w.as_slice()).unwrap();
         assert_eq!(hs.frame.payload, b"xyz");
         assert_eq!(hs.user_id(), 9);
+    }
+
+    #[test]
+    fn handshake_surfaces_a_server_down_refusal_in_both_orders() {
+        for (order, banner) in [(ByteOrder::Little, *b"nwod"), (ByteOrder::Big, *b"down")] {
+            let mut w = Writer::new(order);
+            w.write_u32(SERVERDOWN.value());
+            w.write_u32(0);
+            w.write_i32(12);
+            let bytes = w.into_vec();
+            assert_eq!(&bytes[..4], &banner);
+            let err = read_handshake(&mut bytes.as_slice()).unwrap_err();
+            match err {
+                WireError::ServerDown { reason } => {
+                    assert_eq!(reason.reason, ServerDownReason::Banished);
+                    assert!(reason.reason_text().contains("banished"));
+                }
+                other => panic!("expected a ServerDown refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn handshake_surfaces_a_verbose_server_down_body() {
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_u32(SERVERDOWN.value());
+        w.write_u32(22);
+        w.write_i32(16);
+        w.write_cstring("scheduled maintenance");
+        let err = read_handshake(&mut w.as_slice()).unwrap_err();
+        match err {
+            WireError::ServerDown { reason } => {
+                assert_eq!(reason.reason, ServerDownReason::Verbose);
+                assert_eq!(reason.message.as_deref(), Some("scheduled maintenance"));
+                assert_eq!(reason.reason_text(), "scheduled maintenance");
+            }
+            other => panic!("expected a ServerDown refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handshake_still_rejects_a_plain_http_banner() {
+        // A plain HTTP response must remain an unknown banner, not be mistaken
+        // for a `down` refusal.
+        let mut bytes = b"HTTP/1.1 ".to_vec();
+        bytes.extend_from_slice(&[0u8; 4]);
+        let err = read_handshake(&mut bytes.as_slice()).unwrap_err();
+        assert!(matches!(err, WireError::UnknownBanner { .. }));
     }
 
     #[test]

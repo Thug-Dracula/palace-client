@@ -260,6 +260,15 @@ fn every_effect() -> Vec<(Effect, &'static str, bool, &'static str)> {
         (Effect::Unlock { spot: 4 }, "UNLOCK", true, "UNLOCK 4"),
         (Effect::SelectSpot { spot: 5 }, "SELECT", false, "SELECT 5"),
         (
+            Effect::SetTooltip {
+                text: "hover".to_owned(),
+            },
+            "SETTOOLTIP",
+            false,
+            "SETTOOLTIP \"hover\"",
+        ),
+        (Effect::ClearTooltip, "CLEARTOOLTIP", false, "CLEARTOOLTIP"),
+        (
             Effect::AddLooseProp {
                 prop: 7,
                 x: 10,

@@ -668,6 +668,25 @@ input[type="range"]::-webkit-slider-thumb {
   line-height: 1.6;
 }
 
+.viewport .tooltip {
+  position: absolute;
+  z-index: 4;
+  max-width: 260px;
+  padding: 4px var(--sp-2);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--text-1);
+  white-space: pre-wrap;
+  background: rgba(5, 7, 10, 0.92);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  /* A tooltip must never take the click meant for the hotspot under it. */
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 .viewport-wrap {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);

@@ -28,7 +28,10 @@ use palace_client::{
 use palace_wire::byteorder::{ByteOrder, Reader, Writer};
 use palace_wire::fixture::{default_fixture_dir, Fixture};
 use palace_wire::frame::Frame;
-use palace_wire::messages::{reference_logon_record, AssetSpec, Message, Point, UserProp, UserRec};
+use palace_wire::messages::{
+    aux_flags, client_logon_record, reference_logon_record, AssetSpec, Message, Point, UserProp,
+    UserRec,
+};
 use palace_wire::opcode;
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
 
@@ -248,6 +251,22 @@ fn spot_move_frame(order: ByteOrder, room_id: i16, spot_id: i16, pos: Point) -> 
     Frame::new(opcode::SPOTMOVE, 0, w.into_vec())
         .encode(order)
         .expect("coLs encodes")
+}
+
+/// A `down` frame. The reason code is the frame `refNum`; only `K_Verbose`
+/// (16) carries a body, written here as a `CString` when `message` is given.
+fn server_down_frame(order: ByteOrder, reason: i32, message: Option<&str>) -> Vec<u8> {
+    let payload = match message {
+        Some(text) => {
+            let mut w = Writer::new(order);
+            w.write_cstring(text);
+            w.into_vec()
+        }
+        None => Vec::new(),
+    };
+    Frame::new(opcode::SERVERDOWN, reason, payload)
+        .encode(order)
+        .expect("down encodes")
 }
 
 /// A server-side `talk` frame, used as an ordered marker: frames are processed
@@ -635,6 +654,17 @@ fn notes(events: &[ClientEvent]) -> Vec<&str> {
         .collect()
 }
 
+/// Every tooltip report, `Some(text)` to show and `None` to hide.
+fn tooltips(events: &[ClientEvent]) -> Vec<Option<&str>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Tooltip { text } => Some(text.as_deref()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn error_chats(events: &[ClientEvent]) -> Vec<&str> {
     events
         .iter()
@@ -814,9 +844,9 @@ fn the_runtime_replays_the_recorded_logon_burst() {
         notes(&events)
     );
 
-    // The real bytes of the client's reply went out over the socket: the logon
-    // the runtime built for the configured user matches the reference record
-    // byte for byte, and matches the captured client frame.
+    // The real bytes of the client's reply went out over the socket: the runtime
+    // built its logon from the honest client profile, which differs from the
+    // reference record only in the cleared `AUTHENTICATE` bit.
     assert!(
         wait_for(
             || !server.received_bytes().is_empty(),
@@ -830,19 +860,46 @@ fn the_runtime_replays_the_recorded_logon_burst() {
         .find(|frame| frame.opcode == opcode::LOGON)
         .expect("the runtime sent a logon");
     assert_eq!(logon.ref_num, 0);
-    let expected = reference_logon_record("RustProbe", 0).logon_frame(order);
+    let expected = client_logon_record("RustProbe", 0).logon_frame(order);
     assert_eq!(
         logon.payload, expected.payload,
-        "the configured user's logon"
+        "the configured user's logon is the client profile, byte for byte"
     );
+
+    // The capture still holds the reference client's logon, unchanged.
     let captured_logon = fixture
         .client_frames()
         .find(|captured| captured.frame.opcode == opcode::LOGON)
         .expect("the capture holds the real client's logon");
+    let reference = reference_logon_record("RustProbe", 0).logon_frame(order);
     assert_eq!(
-        logon.payload, captured_logon.frame.payload,
-        "the runtime sent the same logon the real client did"
+        captured_logon.frame.payload, reference.payload,
+        "the capture still reproduces the reference logon"
     );
+
+    // The sent logon must differ from that capture in the `auxFlags` word at
+    // offset 72 and nowhere else, and there only in the cleared bit.
+    let captured = &captured_logon.frame.payload;
+    assert_eq!(captured.len(), logon.payload.len());
+    let differing: Vec<usize> = (0..captured.len())
+        .filter(|&i| captured[i] != logon.payload[i])
+        .collect();
+    assert!(
+        !differing.is_empty(),
+        "the runtime logon must differ from the capture"
+    );
+    assert!(
+        differing.iter().all(|&i| (72..76).contains(&i)),
+        "the runtime logon differs from the capture only in auxFlags, got {differing:?}"
+    );
+    let sent_flags = u32::from_le_bytes(logon.payload[72..76].try_into().expect("four bytes"));
+    let captured_flags = u32::from_le_bytes(captured[72..76].try_into().expect("four bytes"));
+    assert_eq!(
+        captured_flags ^ sent_flags,
+        aux_flags::AUTHENTICATE,
+        "the only auxFlags difference is the cleared AUTHENTICATE bit"
+    );
+    assert_eq!(sent_flags & aux_flags::AUTHENTICATE, 0);
     assert!(
         sent.iter()
             .any(|frame| frame.opcode == opcode::LISTOFALLROOMS),
@@ -1584,6 +1641,161 @@ fn a_server_that_closes_mid_session_is_reported_and_retried() {
     );
     assert!(!statuses(&shut_down, ConnectionStatus::Disconnected).is_empty());
     assert!(!handle.is_running());
+
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_server_down_reason_reaches_the_client_without_reconnecting() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(server_down_frame(order, 12, None)); // K_Banished
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("server-down-cache");
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            !statuses(collected, ConnectionStatus::Disconnected).is_empty()
+                && chats(collected)
+                    .iter()
+                    .any(|text| text.contains("banished"))
+        },
+        Duration::from_secs(15),
+    );
+
+    let disconnected = statuses(&events, ConnectionStatus::Disconnected);
+    assert!(
+        disconnected.iter().any(|message| message
+            .as_deref()
+            .is_some_and(|text| text.contains("banished"))),
+        "the server's reason reached the status stream: {disconnected:?}"
+    );
+    assert!(
+        chats(&events).iter().any(|text| text.contains("banished")),
+        "the transcript names the reason: {:?}",
+        chats(&events)
+    );
+    assert!(
+        !chats(&events)
+            .iter()
+            .any(|text| text.contains("ignored unimplemented opcode")),
+        "SERVERDOWN must not fall through to the unimplemented-opcode note: {:?}",
+        chats(&events)
+    );
+    assert!(
+        statuses(&events, ConnectionStatus::Connecting).is_empty(),
+        "a server that ended the session must not be retried: {:?}",
+        statuses(&events, ConnectionStatus::Connecting)
+    );
+    assert!(wait_for(|| !handle.is_running(), Duration::from_secs(2)));
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        server.connections(),
+        1,
+        "the mock saw exactly one connection, so no reconnect was attempted"
+    );
+
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_server_down_as_the_first_packet_is_reported_without_reconnecting() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    // A server-full refusal instead of the `tiyr` banner.
+    let frames = vec![server_down_frame(order, 8, None)];
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("server-down-handshake-cache");
+    let seed = unique_temp_dir("server-down-handshake-seed");
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            !statuses(collected, ConnectionStatus::Disconnected).is_empty()
+                && chats(collected).iter().any(|text| text.contains("full"))
+        },
+        Duration::from_secs(10),
+    );
+
+    assert!(
+        statuses(&events, ConnectionStatus::Disconnected)
+            .iter()
+            .any(|message| message.as_deref().is_some_and(|text| text.contains("full"))),
+        "the refusal's reason reached the status stream: {:?}",
+        statuses(&events, ConnectionStatus::Disconnected)
+    );
+    assert!(
+        statuses(&events, ConnectionStatus::Error).is_empty(),
+        "a refused handshake is a disconnect with a reason, not a retryable wire error: {:?}",
+        statuses(&events, ConnectionStatus::Error)
+    );
+    assert!(statuses(&events, ConnectionStatus::Connecting).is_empty());
+    assert!(wait_for(|| !handle.is_running(), Duration::from_secs(2)));
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(server.connections(), 1, "the refusal must not be retried");
+
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_verbose_server_down_shows_the_servers_own_message() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(server_down_frame(order, 16, Some("scheduled maintenance")));
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("verbose-down-cache");
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            !statuses(collected, ConnectionStatus::Disconnected).is_empty()
+                && chats(collected)
+                    .iter()
+                    .any(|text| text.contains("scheduled maintenance"))
+        },
+        Duration::from_secs(15),
+    );
+
+    assert!(
+        statuses(&events, ConnectionStatus::Disconnected)
+            .iter()
+            .any(|message| message.as_deref() == Some("scheduled maintenance")),
+        "the server's own message is the status: {:?}",
+        statuses(&events, ConnectionStatus::Disconnected)
+    );
+    assert!(
+        chats(&events)
+            .iter()
+            .any(|text| text.contains("scheduled maintenance")),
+        "the transcript carries the server's own message: {:?}",
+        chats(&events)
+    );
+    assert!(statuses(&events, ConnectionStatus::Connecting).is_empty());
+    assert!(wait_for(|| !handle.is_running(), Duration::from_secs(2)));
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(server.connections(), 1);
 
     drop(server);
     cleanup(&cache);
@@ -3169,6 +3381,142 @@ fn a_click_puts_the_pointer_where_the_click_landed() {
         spot.loc.v,
         notes(&events)
     );
+}
+
+#[test]
+fn hovering_a_hotspot_dispatches_rollover_and_leaving_dispatches_rollout() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("86");
+    let room = palace_room::decode_payload(&payload, order).expect("room 86 decodes");
+    let spot = room
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot
+                .script
+                .as_deref()
+                .is_some_and(|script| script.contains("ON ROLLOVER"))
+        })
+        .expect("room 86 has a hotspot with ON ROLLOVER");
+    let spot_id = i32::from(spot.id);
+
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("hover-cache");
+    let seed = seed_media_dir(&room);
+    let props_seed = unique_temp_dir("hover-props");
+    let mut cfg = config_for(server.port, cache.clone(), seed.clone());
+    cfg.seed_props = vec![props_seed.clone()];
+    let (handle, stream) = ClientRuntime::spawn(cfg);
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| screens(collected).iter().any(|screen| screen.room_id == 86),
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 86)
+        .expect("a frame was composed for room 86");
+    let (vx, vy) = hotspot_click(spot, screen);
+    let empty = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(-500.0, -500.0));
+
+    // Attach the handlers this test observes: a tooltip on entry, an empty
+    // MOUSEMOVE so the movement event is visible, and a clear on leaving.
+    handle.run_script(format!(
+        "{{ \"hover tooltip\" SETTOOLTIP }} \"ROLLOVER\" {spot_id} SETSPOTSCRIPT \
+         {{ \"mv\" STATUSMSG }} \"MOUSEMOVE\" {spot_id} SETSPOTSCRIPT \
+         {{ CLEARTOOLTIP }} \"ROLLOUT\" {spot_id} SETSPOTSCRIPT"
+    ));
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .filter(|text| text.contains("SETSPOTSCRIPT"))
+                .count()
+                >= 3
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .filter(|text| text.contains("SETSPOTSCRIPT"))
+            .count()
+            >= 3,
+        "the three handlers attached: {:?}",
+        notes(&events)
+    );
+
+    handle.move_mouse(vx, vy);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "ROLLOVER")
+                && script_runs(collected)
+                    .iter()
+                    .any(|run| run.event == "MOUSEMOVE")
+                && tooltips(collected).contains(&Some("hover tooltip"))
+        },
+        Duration::from_secs(10),
+    );
+    let runs = script_runs(&events);
+    assert!(
+        runs.iter()
+            .any(|run| run.event == "ROLLOVER" && run.fired >= 1),
+        "entering the hotspot runs its ON ROLLOVER: {runs:?}"
+    );
+    assert!(
+        runs.iter()
+            .any(|run| run.event == "MOUSEMOVE" && run.fired >= 1),
+        "the movement itself runs the hotspot's ON MOUSEMOVE: {runs:?}"
+    );
+    assert!(
+        tooltips(&events).contains(&Some("hover tooltip")),
+        "SETTOOLTIP reached the client: {:?}",
+        tooltips(&events)
+    );
+
+    handle.move_mouse(empty.x, empty.y);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "ROLLOUT")
+        },
+        Duration::from_secs(10),
+    );
+    let runs = script_runs(&events);
+    assert!(
+        runs.iter()
+            .any(|run| run.event == "ROLLOUT" && run.fired >= 1),
+        "leaving the hotspot runs its ON ROLLOUT: {runs:?}"
+    );
+    assert!(
+        tooltips(&events).iter().any(Option::is_none),
+        "CLEARTOOLTIP reached the client: {:?}",
+        tooltips(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+    cleanup(&props_seed);
 }
 
 /// The room id of the first `ROOMGOTO` (`navR`) frame the client sent, if any.

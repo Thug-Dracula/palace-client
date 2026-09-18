@@ -25,12 +25,15 @@ pub use chat::{Talk, Whisper};
 pub use draw::Draw;
 pub use lists::{RoomList, RoomListRec, UserList, UserListRec};
 pub use logon::{
-    aux_flags, reference_logon_record, Authenticate, AuxRegistrationRec, ReferenceProfile,
+    aux_flags, client_logon_record, reference_logon_record, Authenticate, AuxRegistrationRec,
+    ClientProfile, ReferenceProfile,
 };
 pub use pictures::PictMove;
 pub use props::{PropDel, PropMove, PropNew};
 pub use room::{NavError, RoomDescription, RoomRec};
-pub use server::{AltLogonReply, HttpServer, ServerInfo, ServerVersion, UserLog};
+pub use server::{
+    AltLogonReply, HttpServer, ServerDown, ServerDownReason, ServerInfo, ServerVersion, UserLog,
+};
 pub use spots::{DoorLock, SpotDel, SpotMove, SpotNew, SpotState};
 pub use user::{
     AssetSpec, Point, UserColor, UserDesc, UserExit, UserFace, UserMove, UserName, UserNew,
@@ -57,6 +60,9 @@ pub enum Message {
     ServerInfo(ServerInfo),
     /// `HTTP` — media server base URL.
     HttpServer(HttpServer),
+    /// `down` — the server is dropping the connection; the reason is the frame
+    /// `refNum`.
+    ServerDown(ServerDown),
     /// `log ` — a user logged onto the server.
     UserLog(UserLog),
     /// `rLst` — the room list.
@@ -161,6 +167,7 @@ impl Message {
             opcode::VERSION => Message::ServerVersion(ServerVersion::from_ref_num(ref_num)),
             opcode::SERVERINFO => Message::ServerInfo(ServerInfo::decode(r)?),
             opcode::HTTPSERVER => Message::HttpServer(HttpServer::decode(r)?),
+            opcode::SERVERDOWN => Message::ServerDown(ServerDown::decode(ref_num, r)?),
             opcode::USERLOG => Message::UserLog(UserLog::decode(ref_num, r)?),
             opcode::LISTOFALLROOMS => Message::RoomList(RoomList::decode(ref_num, r)?),
             opcode::LISTOFALLUSERS => Message::UserList(UserList::decode(ref_num, r)?),
@@ -236,6 +243,7 @@ impl Message {
                 summarize_server_permissions(i.permissions)
             ),
             Message::HttpServer(h) => format!("media server: {}", h.url),
+            Message::ServerDown(d) => d.describe(),
             Message::UserLog(l) => {
                 format!("user logon: user_id={} total_users={}", l.user_id, l.user_count)
             }
@@ -427,7 +435,8 @@ mod tests {
     use crate::byteorder::Writer;
     use crate::opcode::{
         AUTHENTICATE, DOORLOCK, DOORUNLOCK, DRAW, LISTOFALLROOMS, LOGOFF, NAVERROR, PICTMOVE, PING,
-        PROPMOVE, SPOTDEL, SPOTMOVE, SPOTNEW, SPOTSTATE, TALK, USERFACE, USERNAME, USERPROP,
+        PROPMOVE, SERVERDOWN, SPOTDEL, SPOTMOVE, SPOTNEW, SPOTSTATE, TALK, USERFACE, USERNAME,
+        USERPROP,
     };
 
     #[test]
@@ -463,6 +472,38 @@ mod tests {
     #[test]
     fn malformed_known_message_is_an_error() {
         assert!(Message::decode(LISTOFALLROOMS, 5, &[0u8; 3], ByteOrder::Little).is_err());
+    }
+
+    #[test]
+    fn the_server_down_message_reaches_its_arm() {
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let down = Message::decode(SERVERDOWN, 12, &[], order).unwrap();
+            assert_eq!(
+                down,
+                Message::ServerDown(ServerDown {
+                    reason: ServerDownReason::Banished,
+                    message: None,
+                }),
+                "the refNum is the reason and the body is empty"
+            );
+            assert!(
+                !matches!(down, Message::Unknown { .. }),
+                "down must no longer fall through to Unknown"
+            );
+            assert!(down.describe().contains("banished"));
+
+            let mut w = Writer::new(order);
+            w.write_cstring("you were ejected");
+            let verbose = Message::decode(SERVERDOWN, 16, &w.into_vec(), order).unwrap();
+            assert_eq!(
+                verbose,
+                Message::ServerDown(ServerDown {
+                    reason: ServerDownReason::Verbose,
+                    message: Some("you were ejected".to_string()),
+                })
+            );
+            assert!(verbose.describe().contains("you were ejected"));
+        }
     }
 
     #[test]

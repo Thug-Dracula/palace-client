@@ -10,6 +10,14 @@
 
   let menu = $state<{ x: number; y: number } | null>(null);
   let avatarOpen = $state(false);
+  let pointer = $state<{ x: number; y: number } | null>(null);
+
+  // The webview fires mousemove far faster than the runtime needs it. Coalesce
+  // to one report per animation frame and drop repeats of the same CSS pixel,
+  // so the runtime is not flooded with sub-pixel noise.
+  let moveFrame = 0;
+  let pendingMove: { x: number; y: number } | null = null;
+  const lastSent = { x: -1, y: -1 };
 
   function onContextMenu(event: MouseEvent) {
     event.preventDefault();
@@ -44,7 +52,13 @@
       observer.observe(element);
     }
     push();
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      if (moveFrame) {
+        cancelAnimationFrame(moveFrame);
+        moveFrame = 0;
+      }
+    };
   });
 
   $effect(() => {
@@ -72,6 +86,16 @@
 
   const geometry = $derived(store.screen?.geometry ?? null);
 
+  const tooltipAt = $derived.by(() => {
+    if (pointer) {
+      return { x: pointer.x + 14, y: pointer.y + 16 };
+    }
+    if (geometry) {
+      return { x: geometry.content_x + 12, y: geometry.content_y + 12 };
+    }
+    return { x: 12, y: 12 };
+  });
+
   // Hotspot clicks go to the runtime in viewport pixels; it maps them through
   // the same transform that placed the frame, then hit-tests the room.
   function onClick(event: MouseEvent) {
@@ -82,6 +106,46 @@
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
     void api.click(x, y).catch(() => {});
+  }
+
+  function onMouseMove(event: MouseEvent) {
+    if (!element) {
+      return;
+    }
+    const rect = element.getBoundingClientRect();
+    pointer = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    pendingMove = pointer;
+    if (moveFrame) {
+      return;
+    }
+    moveFrame = requestAnimationFrame(() => {
+      moveFrame = 0;
+      const next = pendingMove;
+      pendingMove = null;
+      if (!next) {
+        return;
+      }
+      const rx = Math.round(next.x);
+      const ry = Math.round(next.y);
+      if (rx === lastSent.x && ry === lastSent.y) {
+        return;
+      }
+      lastSent.x = rx;
+      lastSent.y = ry;
+      void api.mousemove(next.x, next.y).catch(() => {});
+    });
+  }
+
+  function onMouseLeave() {
+    pointer = null;
+    if (moveFrame) {
+      cancelAnimationFrame(moveFrame);
+      moveFrame = 0;
+    }
+    pendingMove = null;
+    lastSent.x = -1;
+    lastSent.y = -1;
+    void api.mouseLeave().catch(() => {});
   }
 </script>
 
@@ -123,6 +187,8 @@
     onclick={onClick}
     onkeydown={() => {}}
     oncontextmenu={onContextMenu}
+    onmousemove={onMouseMove}
+    onmouseleave={onMouseLeave}
   >
     {#if store.screen && geometry}
       <img
@@ -153,6 +219,10 @@
       <div class="notes">
         {#each [...store.notes, ...store.notices].slice(-4) as note}<div>{note}</div>{/each}
       </div>
+    {/if}
+
+    {#if store.tooltip}
+      <div class="tooltip" style="left:{tooltipAt.x}px; top:{tooltipAt.y}px;">{store.tooltip}</div>
     {/if}
   </div>
 

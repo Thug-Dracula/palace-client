@@ -120,6 +120,10 @@ fn run(args: &cli::Args) -> std::result::Result<(), Box<dyn std::error::Error>> 
         ),
     );
 
+    // The probe is a diagnostic, not the application: it deliberately mirrors
+    // the reference client's logon byte for byte, including the `AUTHENTICATE`
+    // claim the application clears, so its captures stay comparable with
+    // `palace_walker.py`.
     let record = palace_wire::messages::reference_logon_record(&args.user, args.desired_room);
     log(
         args,
@@ -147,6 +151,18 @@ fn run(args: &cli::Args) -> std::result::Result<(), Box<dyn std::error::Error>> 
                 );
             }
             Some(Message::RoomUsers(users)) => report.room_user_count = users.users.len(),
+            Some(Message::ServerDown(down)) => {
+                log(
+                    args,
+                    &format!("  server is ending the session: {}", down.reason_text()),
+                );
+            }
+            Some(Message::Authenticate) => {
+                log(
+                    args,
+                    "  server asked this client to authenticate (autr is not implemented)",
+                );
+            }
             Some(_) => {}
             None => {}
         }

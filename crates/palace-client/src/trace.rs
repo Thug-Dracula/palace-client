@@ -436,6 +436,10 @@ pub fn describe_client_event(event: &ClientEvent) -> String {
             problems.join("; ")
         ),
         ClientEvent::Note { text } => format!("[note] {text}"),
+        ClientEvent::Tooltip { text } => match text {
+            Some(text) => format!("[tooltip] {text:?}"),
+            None => "[tooltip] cleared".to_string(),
+        },
     }
 }
 

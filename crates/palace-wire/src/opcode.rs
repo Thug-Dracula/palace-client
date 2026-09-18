@@ -109,6 +109,11 @@ pub const AUTHENTICATE: Opcode = Opcode(0x6175_7468);
 /// `0x7345_7272` — the server refused a room change; the failure code is the
 /// frame's `refNum` and the body is empty (protocol reference :1371).
 pub const NAVERROR: Opcode = Opcode(0x7345_7272);
+/// `0x646f_776e` — the server is dropping the connection. The reason code is
+/// the frame's `refNum`; the body is empty unless the reason is
+/// `K_Verbose` (16), when it is a `CString` explanation (protocol reference
+/// :1800-1828).
+pub const SERVERDOWN: Opcode = Opcode(0x646f_776e);
 
 /// Full opcode table: every message type we have a name for, taken from the
 /// official 1999 protocol reference, Taj's `MessageTypes.cs`, and QPalace's
