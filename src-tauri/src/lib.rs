@@ -182,6 +182,7 @@ pub fn run() {
             commands::set_avatar,
             commands::set_props,
             commands::set_viewport,
+            commands::set_ui_scale,
             commands::refresh,
             commands::get_audio_state,
             commands::set_soundfont,

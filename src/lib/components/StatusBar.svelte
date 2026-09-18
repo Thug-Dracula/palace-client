@@ -41,7 +41,7 @@
   {/if}
 
   <span class="spacer"></span>
-  <span class="kv"><span>zoom</span><b>×{store.zoom.toFixed(2)}</b></span>
+  <span class="kv"><span>scale</span><b>{Math.round(store.scale * 100)}%</b></span>
   <span class="kv"><span>mode</span><b>{store.native ? "1:1" : "fit"}</b></span>
   {#if store.screen}<span class="kv"><span>frame</span><b>#{store.screen.version}</b></span>{/if}
 </footer>

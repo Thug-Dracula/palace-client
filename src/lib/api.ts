@@ -160,6 +160,8 @@ export const setViewport = (
   native: boolean,
 ): Promise<void> => invoke("set_viewport", { width, height, dpr, zoom, native });
 
+export const setUiScale = (scale: number): Promise<number> => invoke("set_ui_scale", { scale });
+
 export const refresh = (): Promise<void> => invoke("refresh");
 
 export const click = (x: number, y: number): Promise<void> => invoke("click", { x, y });

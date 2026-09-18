@@ -10,6 +10,16 @@
   import StatusBar from "./components/StatusBar.svelte";
   import "./styles/app.css";
 
+  const SCALE_STEP = 0.05;
+
+  function onWheel(event: WheelEvent) {
+    if (!event.ctrlKey) {
+      return;
+    }
+    event.preventDefault();
+    store.setScale(store.scale + (event.deltaY < 0 ? SCALE_STEP : -SCALE_STEP));
+  }
+
   function onKeydown(event: KeyboardEvent) {
     const target = event.target as HTMLElement | null;
     if (event.key === "Escape") {
@@ -26,14 +36,14 @@
     switch (event.key) {
       case "+":
       case "=":
-        store.nudgeZoom(0.25);
+        store.setScale(store.scale + SCALE_STEP);
         break;
       case "-":
       case "_":
-        store.nudgeZoom(-0.25);
+        store.setScale(store.scale - SCALE_STEP);
         break;
       case "0":
-        store.setZoom(1);
+        store.setScale(1);
         break;
       case "1":
         store.native = !store.native;
@@ -61,9 +71,11 @@
       // the current status, banner, lists and frame so the UI starts in sync.
       await api.refresh().catch(() => {});
     })();
+    window.addEventListener("wheel", onWheel, { passive: false });
     return () => {
       disposed = true;
       unlisten?.();
+      window.removeEventListener("wheel", onWheel);
     };
   });
 </script>

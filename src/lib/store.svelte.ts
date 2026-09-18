@@ -31,8 +31,8 @@ export interface LocalChatLine extends ChatLine {
   pending?: boolean;
 }
 
-const MIN_ZOOM = 0.5;
-const MAX_ZOOM = 3;
+const MIN_SCALE = 0.5;
+const MAX_SCALE = 3;
 const CHAT_LIMIT = 500;
 
 class PalaceStore {
@@ -56,7 +56,7 @@ class PalaceStore {
   });
   roomFilter = $state("");
 
-  zoom = $state(1);
+  scale = $state(1);
   native = $state(false);
   showNames = $state(true);
   showAvatars = $state(true);
@@ -91,13 +91,15 @@ class PalaceStore {
     void api.setProps(props).catch(() => {});
   }
 
-  setZoom(value: number): void {
-    const clamped = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, value));
-    this.zoom = Math.round(clamped * 100) / 100;
-  }
-
-  nudgeZoom(delta: number): void {
-    this.setZoom(this.zoom + delta);
+  setScale(value: number): void {
+    const clamped = Math.min(MAX_SCALE, Math.max(MIN_SCALE, value));
+    this.scale = Math.round(clamped * 100) / 100;
+    void api
+      .setUiScale(this.scale)
+      .then((applied) => {
+        this.scale = applied;
+      })
+      .catch(() => {});
   }
 
   async loadAudio(): Promise<void> {
@@ -144,9 +146,6 @@ class PalaceStore {
       case "screen":
         this.screen = event.screen;
         this.notes = event.screen.notes;
-        if (!event.screen.geometry.native) {
-          this.zoom = event.screen.geometry.zoom;
-        }
         break;
       case "tooltip":
         this.tooltip = event.text;

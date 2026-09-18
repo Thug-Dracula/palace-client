@@ -3,13 +3,23 @@
 //! or compositing work.
 
 use palace_client::ClientHandle;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, LogicalSize, Manager, State};
 
 use crate::settings;
 use crate::{start_client, AppState, Settings};
 
 /// The event name runtime events are emitted under.
 pub const EVENT_NAME: &str = "palace://event";
+
+/// The logical window size the interface is laid out at 100% scale.
+pub const BASE_WINDOW: (f64, f64) = (1200.0, 820.0);
+
+/// The window title before any scale suffix.
+const WINDOW_TITLE: &str = "Palace";
+
+/// The range the interface scale accepts.
+const MIN_UI_SCALE: f64 = 0.5;
+const MAX_UI_SCALE: f64 = 3.0;
 
 /// The settings the app started with.
 #[tauri::command]
@@ -250,6 +260,44 @@ fn clamp_volume(volume: f32) -> f32 {
     }
 }
 
+fn clamp_ui_scale(scale: f64) -> f64 {
+    if scale.is_finite() {
+        scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)
+    } else {
+        1.0
+    }
+}
+
+/// Scale the whole interface: the window grows and the webview zooms together.
+///
+/// The window is resized by the same factor as the page zoom, so the layout
+/// keeps its proportions and the chrome, the room and the text all simply get
+/// bigger instead of the room being magnified inside a fixed window. Returns
+/// the scale actually applied.
+#[tauri::command]
+pub fn set_ui_scale(app: AppHandle, scale: f64) -> Result<f64, String> {
+    let scale = clamp_ui_scale(scale);
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "no main window".to_string())?;
+    window
+        .set_size(LogicalSize::new(
+            BASE_WINDOW.0 * scale,
+            BASE_WINDOW.1 * scale,
+        ))
+        .map_err(|error| error.to_string())?;
+    window.set_zoom(scale).map_err(|error| error.to_string())?;
+    let title = if scale == 1.0 {
+        WINDOW_TITLE.to_string()
+    } else {
+        format!("{WINDOW_TITLE} ({:.0}%)", scale * 100.0)
+    };
+    window
+        .set_title(&title)
+        .map_err(|error| error.to_string())?;
+    Ok(scale)
+}
+
 /// Apply a settings change, persisting it before the caller touches the engine.
 fn update_settings(
     app: &AppHandle,
@@ -278,5 +326,19 @@ fn persist_best_effort(app: &AppHandle, settings: &Settings) {
     };
     if let Err(error) = settings::save(&path, settings) {
         eprintln!("palace: could not save settings: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ui_scale_is_clamped_and_nonsense_falls_back_to_one() {
+        assert_eq!(clamp_ui_scale(1.5), 1.5);
+        assert_eq!(clamp_ui_scale(0.1), MIN_UI_SCALE);
+        assert_eq!(clamp_ui_scale(9.0), MAX_UI_SCALE);
+        assert_eq!(clamp_ui_scale(f64::NAN), 1.0);
+        assert_eq!(clamp_ui_scale(f64::INFINITY), 1.0);
     }
 }

@@ -6,7 +6,7 @@
   import AvatarDialog from "./AvatarDialog.svelte";
 
   let element: HTMLDivElement | undefined = $state();
-  const last = { width: 0, height: 0, dpr: 0, zoom: -1, native: false };
+  const last = { width: 0, height: 0, dpr: 0, native: false };
 
   let menu = $state<{ x: number; y: number } | null>(null);
   let avatarOpen = $state(false);
@@ -36,14 +36,13 @@
       last.width === width &&
       last.height === height &&
       last.dpr === dpr &&
-      last.zoom === store.zoom &&
       last.native === store.native
     ) {
       return;
     }
-    Object.assign(last, { width, height, dpr, zoom: store.zoom, native: store.native });
+    Object.assign(last, { width, height, dpr, native: store.native });
     store.viewport = { width, height, dpr };
-    void api.setViewport(width, height, dpr, store.zoom, store.native).catch(() => {});
+    void api.setViewport(width, height, dpr, 1, store.native).catch(() => {});
   }
 
   onMount(() => {
@@ -62,7 +61,6 @@
   });
 
   $effect(() => {
-    void store.zoom;
     void store.native;
     push();
   });
@@ -151,23 +149,6 @@
 
 <div class="viewport-wrap">
   <div class="toolbar">
-    <span>zoom</span>
-    <div class="seg">
-      <button class="btn" type="button" onclick={() => store.nudgeZoom(-0.25)} title="Zoom out">−</button>
-      <button class="btn" type="button" onclick={() => store.setZoom(1)} title="Reset to 100%">1×</button>
-      <button class="btn" type="button" onclick={() => store.nudgeZoom(0.25)} title="Zoom in">+</button>
-    </div>
-    <input
-      type="range"
-      min="0.5"
-      max="3"
-      step="0.05"
-      value={store.zoom}
-      oninput={(event) => store.setZoom(Number(event.currentTarget.value))}
-      aria-label="Zoom"
-    />
-    <span class="readout">×{store.zoom.toFixed(2)}</span>
-
     <div class="seg">
       <button class="btn" class:on={!store.native} type="button" onclick={() => (store.native = false)}>Fit</button>
       <button class="btn" class:on={store.native} type="button" onclick={() => (store.native = true)} title="1 room pixel = 1 CSS pixel">
