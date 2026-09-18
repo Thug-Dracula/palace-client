@@ -719,7 +719,10 @@ Four distinct kinds of incompleteness, in descending order of how badly they hid
 
 3. **Genuinely absent from the table** though dispatched in `host.rs` (also dead arms):
    `PALACECHAT`, `ISRIGHTCLICK`, `MOUSEX`/`MOUSEY`, `LASTNAME`, `HTTPRECEIVED`, `STR`, `SETPICDIM`.
-   Separately, `SHELLCMD` is **documented but never dispatched** — the only reverse mismatch found.
+   Separately, `SHELLCMD` was **documented but never dispatched** — the only reverse
+   mismatch found. **That is now resolved:** registering the dead-arm names (`af6035f`)
+   put `SHELLCMD` in the table with arity 1, so it dispatches and reaches the
+   unimplemented arm, which reports. It does not run shell commands, deliberately.
 
 4. **Dead effects**: `Effect::Beep` can never be pushed (`BEEP` is a core builtin, so `host.rs`'s
    `BEEP` arm is unreachable), and `Effect::SetSpotAlarm` is never constructed (`SETALARM` schedules
@@ -748,7 +751,15 @@ Work order for "fully implemented":
   exist - a guessed size would be worse than a known stub, because rooms branch on it.
   `PROPDIMENSIONS`/`PROPOFFSETS` and `has_prop_by_name` will need the equivalent for props.
   `has_prop_by_name`, `LOADPROPS`, `PAINTUNDO`.
-- [ ] Fix the `SHELLCMD` doc/dispatch mismatch and the `ClearLooseProps` wire classification.
+- [x] Fix the `SHELLCMD` doc/dispatch mismatch and the `ClearLooseProps` wire classification.
+
+  `ClearLooseProps` is no longer claimed as a wire effect: it was the only effect claiming
+  wire-backing with no encoder in `wire.rs` — every sibling has one — and the protocol has
+  no such message, only a client-side room event (`PalaceRoomEvent.LOOSE_PROPS_CLEARED`).
+  The test that should have caught it asserted *exactly twenty* wire effects and included
+  `CLEARLOOSEPROPS` in its required list, so it counted the bad flag and locked the error
+  in; it now expects nineteen. Worth remembering: a test that derives its expectation
+  from the same table it is checking cannot catch an error in that table.
 
 ### 2.21 Live diagnosis: the trace log
 
