@@ -73,7 +73,9 @@ python3 -c "$GEN_PY" "$MAP" message > "$MSG_FILE"
 python3 -c "$GEN_PY" "$MAP" excludes > "$WORK/excludes.txt"
 
 FILTER_ARGS=()
-while IFS= read -r pattern; do
+# `read` returns non-zero at EOF without a trailing newline, which would
+# silently drop the final exclude; keep the last line when it is non-empty.
+while IFS= read -r pattern || [ -n "$pattern" ]; do
   [ -n "$pattern" ] && FILTER_ARGS+=(--path-glob "$pattern")
 done < "$WORK/excludes.txt"
 INVERT=()
