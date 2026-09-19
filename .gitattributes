@@ -1,0 +1,26 @@
+# Line-ending policy.
+#
+# Git for Windows defaults to core.autocrlf=true, which silently rewrites line
+# endings on checkout. These rules pin the endings explicitly so that the same
+# commit produces the same working tree on every platform, whatever the local
+# Git settings say.
+
+# Text files: normalised to LF in the repository and checked out as LF.
+* text=auto eol=lf
+
+# Shell scripts must run on Unix, where a CRLF shebang line is a syntax error.
+# Repeated explicitly so detection can never misclassify one.
+*.sh text eol=lf
+
+# Binary fixtures and assets: excluded from all text handling, so no checkout
+# or add ever converts them. These are raw bytes — protocol capture frames,
+# prop blobs, images, the name-tag font, the app icons and the SoundFont — and
+# a line-ending rewrite would corrupt them.
+*.bin binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ttf binary
+*.sf2 binary
+*.ico binary
+*.icns binary
