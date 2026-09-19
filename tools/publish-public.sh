@@ -98,7 +98,7 @@ if [ "$ORIG_TIP" = "$NEW_TIP" ]; then
 fi
 
 echo "==> verifying (the canonical repository URL is the one permitted exception)"
-PATTERNS='example-user|example-user|example-user|library\.lan|192\.168\.|$HOME|input-tool|input-tool|input-tool|input-tool|agent-runner|Note:|/tmp/work|\$CORPUS|$CORPUS|$MEDIA/|$MEDIA/|$HOME/ProgramFiles/|colosseum\.thug'
+PATTERNS='example-user|example-user|example-user|library\.lan|192\.168\.|$HOME|input-tool|input-tool|input-tool|input-tool|agent-runner|Note:|/tmp/work|\$CORPUS|$CORPUS|$MEDIA/|$MEDIA/|$HOME/ProgramFiles/|colosseum\.thug|PC[0-9]{4}'
 ALLOWED='repository = "https://github.com/Thug-Dracula/palace-client"'
 
 leaks=$(git grep -nE "$PATTERNS" HEAD -- . 2>/dev/null | grep -vF "$ALLOWED" || true)
