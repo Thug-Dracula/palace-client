@@ -221,6 +221,50 @@ match a reference client's stricter rules. **Verify with a one-line target:
 `cIhplay GLOBAL 2 cIhplay =` must leave `cIhplay` at 2.** That is the whole of the
 next step — reproducible, and the instrument already exists.
 
+### MEASURED LIVE — the arena ejection is GONE (2026-09-18, later still)
+
+Run headlessly against the real server as a **plain guest** (`aquaprobe`, a
+separate identity, so no live session was disturbed). Route replayed with
+`PALACE_SMOKE_STEPS='room:31743;wait:15;room:31747;wait:30'` and
+`PALACE_DUMP_VARS=1`.
+
+**The globals now stick, and the ejection does not fire.**
+```
+LEAVE of #31743 : after=[CIHPLAY=0, CNAME="aquaprobe", CSTAR=0]   ← enrollment sets cname
+ENTER of #31747 : after=[BELOW=0, BETENTER=0, BOUBOU=0, CBAR=0, CBELOW=0, CBOUNCE=0,
+                         CCR=0, CDEAD=.., CDONE=0, CIHPLAY=0, CNAME="aquaprobe",
+                         CNOAV=0, COOR=0, CPLACE=0, CR=0, CRESET=.., CSTAR=0,
+                         CTRN=0, ELXO=.., GOWY=0, UFPOO=..]
+```
+- `CNAME` is set by the menu room's `ON LEAVE` and **survives into #31747**.
+- `BOUBOU` **materialises** — previously it "never appears in the store at all".
+- The arena's own `ON ENTER` variables are all present (`CIHPLAY`, `CSTAR`,
+  `CBAR`, `CDONE`, `CRESET`, `ELXO`, `GOWY`, `UFPOO`, …).
+
+**Observed chat in #31747 — no ejection:**
+```
+[chat:System] client: @512 0You are in the Audience.  Please keep avs off. ...
+```
+Only the expected audience notice. The earlier failure's
+"You are being sent out for wearing avs." and "Please don't wear avs; it lags
+the players!" **did not appear**, and the run ended still inside `#31747`.
+
+Locked by `the_arenas_on_enter_globalises_the_flags_it_later_reads`
+(`crates/palace-host/tests/select_regions.rs`).
+
+**The test room `#32000 "TEST - client compare"` also passed live.** Its
+self-reporting script ran and broadcast to the room:
+```
+[chat:Talk] aquaprobe: TESTCFG global set=424242 read=424242
+[chat:Talk] aquaprobe: TESTCFG prop before count=0 has=0
+[chat:Talk] aquaprobe: TESTCFG prop after count=1 has=1
+[chat:Talk] aquaprobe: TESTCFG pos SETPOS=200,150 done
+```
+with `before=[] after=[CFGT=424242]` in the store and **zero problems**. So a
+`SETPROPS` applies and is readable **inside the same handler**, which is the
+behaviour `fix(iptscrae): make worn-prop changes visible within a handler`
+implements. This closes the "PENDING measurement" from the save point.
+
 Also: identity was restored to the captured values to recover privileges
 ("Sorry, Members Only" went from repeated to 0). The cost is that our client and
 PalaceChat now share an identity, so running both may cause one to be booted —
@@ -228,10 +272,11 @@ the original symptom. Escape requires a second account on the server.
 
 ### Still open
 
-- The arena-ejection question above (needs the user's PalaceChat behaviour).
 - Confirm the movement *feel* — the ordering and redraw are proven by tests, but
   only the user can say whether it feels right.
+- Human-only checks: tooltip placement, click-through, and the avatar picker's
+  appearance (the numeric core is verified).
 - Two decisions for the user: the KWin `input-tool` allowlist, and whether to make a
-  save point on ~44 uncommitted files.
+  save point on the remaining uncommitted files.
 
 

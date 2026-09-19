@@ -256,3 +256,67 @@ fn effects_after(engine: &mut ScriptEngine, event: ScriptEvent) -> Vec<String> {
         .map(|effect| effect.to_string())
         .collect()
 }
+
+/// The arena's `ON ENTER` globalizes a set of flags and the audience ejection
+/// depends on reading them back.
+///
+/// Room 31747's own `ON ENTER` does `cIhplay GLOBAL 2 cIhplay =` and globalizes
+/// `boubou`, then re-dresses the player from `homeav GLOBAL` when `boubou` is 1.
+/// Wearing an avatar is what the audience ejects for, so a `GLOBAL` that does not
+/// stick is not cosmetic: the room reads a `boubou` it cannot see, dresses the
+/// player, and then punishes them for it.
+///
+/// Measured against the live server (room 31747, as a plain guest): the player
+/// now sees only "You are in the Audience" and stays in the room, where the
+/// earlier failure produced "You are being sent out for wearing avs".
+#[test]
+fn the_arenas_on_enter_globalises_the_flags_it_later_reads() {
+    let mut engine = ScriptEngine::with_palace_limits();
+    engine.set_view(view_for(31743, (0, 0)));
+    engine.load_room(&enrollment_room());
+    let leave = engine.fire(ScriptEvent::Leave);
+    assert!(
+        leave.runs.iter().all(|run| run.error.is_none()),
+        "room 31743's LEAVE enrolls cleanly: {:?}",
+        leave.runs
+    );
+    assert_eq!(
+        global(&engine, "CNAME"),
+        Some("\"ArenaTester\"".to_string()),
+        "enrollment sets cname"
+    );
+
+    engine.set_view(view_for(31747, (0, 0)));
+    engine.load_room(&room_with(
+        r#"ON ENTER { cIhplay GLOBAL 2 cIhplay = boubou GLOBAL }"#,
+    ));
+    let enter = engine.fire(ScriptEvent::Enter);
+    assert!(
+        enter.runs.iter().all(|run| run.error.is_none()),
+        "the arena's ON ENTER runs cleanly: {:?}",
+        enter.runs
+    );
+
+    assert_eq!(
+        global(&engine, "CIHPLAY"),
+        Some("2".to_string()),
+        "the value the room assigns to the global is the one it reads back"
+    );
+    assert!(
+        global(&engine, "BOUBOU").is_some(),
+        "boubou materialises, so the room does not re-dress a player it cannot see"
+    );
+    assert_eq!(
+        global(&engine, "CNAME"),
+        Some("\"ArenaTester\"".to_string()),
+        "the enrollment from the previous room survives the arena's ON ENTER"
+    );
+}
+
+fn global(engine: &ScriptEngine, name: &str) -> Option<String> {
+    engine
+        .globals_snapshot()
+        .into_iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+}

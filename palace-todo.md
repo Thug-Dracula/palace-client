@@ -127,8 +127,14 @@ The fetched arena interface script runs end to end: `LOADSCRIPT`/`HTTPGET`,
 implemented, and the `comma_separator` lexer extension handles the served
 dialect. What remains:
 
-- [ ] **No live run.** The script-level chain is proven; nobody has watched the
-  arena accept a player. That needs a human at the app.
+- [x] **The arena accepts a player (measured live).** Replayed headlessly against
+  the real server as a plain guest: `#31743` enrolls on `ON LEAVE` (`CNAME` set
+  and survives), `#31747`'s `ON ENTER` globalises all its flags (`BOUBOU` now
+  materialises), and the run ends still in `#31747` with only the expected
+  "You are in the Audience" notice — the "sent out for wearing avs" ejection no
+  longer fires. Locked by
+  `the_arenas_on_enter_globalises_the_flags_it_later_reads`. A human should still
+  watch it happen in the GUI once.
 - [x] **Quoted numeric strings are accepted.** `ADDSPOT`'s polygon operand is read
   by `point_list_arg`, which parses a `Value::Str` as a base-10 integer, so the
   quoted forms the extended dialect accepts (`"10"`) work; a non-numeric string
