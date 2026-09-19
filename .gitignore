@@ -31,3 +31,17 @@ __pycache__/
 
 # Local, non-committed project notes
 NOTES.local.md
+
+# --- PalaceChat prop bag and any local prop data -------------------------
+# The user's prop bag is PERSONAL DATA that lives outside this repo
+# (~/.local/share/PalaceChat/PropBag.bundle). It is read at runtime and
+# must NEVER be committed, bundled into a build, or attached to a release.
+# These patterns are a guard rail: do not remove them.
+PropBag.bundle/
+PalaceChat.pids
+PalaceChat.props
+PalaceChat.favs
+Trash.favs
+*.pids
+*.favs
+*.props
