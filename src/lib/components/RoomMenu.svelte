@@ -119,4 +119,18 @@
     <span class="ctx-check" aria-hidden="true"></span>
     <span>Choose an Avatar…</span>
   </button>
+
+  <button
+    class="ctx-item"
+    type="button"
+    role="menuitem"
+    disabled={!store.self?.props.length}
+    onclick={() => {
+      store.takeOffAvatar();
+      onclose();
+    }}
+  >
+    <span class="ctx-check" aria-hidden="true"></span>
+    <span>Take off avatar</span>
+  </button>
 </div>

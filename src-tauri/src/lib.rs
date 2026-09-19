@@ -5,17 +5,21 @@
 //! asset and compositing work lives in `palace-client` on worker threads.
 
 pub mod commands;
+pub mod logging;
 pub mod protocol;
 pub mod settings;
 
 pub use settings::Settings;
 
+use logging::Level;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use palace_audio::{AudioConfig, AudioEngine, AudioHandle};
-use palace_client::{ClientConfig, ClientEvent, ClientEventStream, ClientHandle, ClientRuntime};
+use palace_client::{
+    ClientConfig, ClientEvent, ClientEventStream, ClientHandle, ClientIdentity, ClientRuntime,
+};
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, Manager};
 
@@ -73,6 +77,10 @@ pub fn config_for(settings: &Settings) -> ClientConfig {
         port: settings.port,
         username: settings.username.clone(),
         password: settings.password.clone(),
+        identity: settings
+            .identity
+            .map(ClientIdentity::from)
+            .unwrap_or_default(),
         seed_media: seed_media(),
         seed_props: seed_props(),
         ..ClientConfig::default()
@@ -114,11 +122,26 @@ pub fn audio_config_for(settings: &Settings, default_soundfont: Option<&Path>) -
     }
 }
 
+/// Mirror one runtime event into the diagnostic log.
+///
+/// Every diagnostic the log panel shows is a [`ClientEvent`], so logging at the
+/// pump catches the script notes, connection changes, protocol errors and room
+/// traffic in one place without touching the runtime. Frames and tooltips fire
+/// far too often to keep at the default level; they are `debug`.
+fn log_event(event: &ClientEvent) {
+    let level = match event {
+        ClientEvent::Screen { .. } | ClientEvent::Tooltip { .. } => Level::Debug,
+        _ => Level::Info,
+    };
+    logging::log(level, palace_client::trace::describe_client_event(event));
+}
+
 /// Forward runtime events to the webview, routing sound effects to the engine.
 pub fn spawn_pump(app: tauri::AppHandle, mut stream: ClientEventStream, audio: AudioHandle) {
     tauri::async_runtime::spawn(async move {
         let mut media_base: Option<String> = None;
         while let Some(event) = stream.recv().await {
+            log_event(&event);
             match &event {
                 ClientEvent::Banner { banner } => {
                     if let Some(base) = &banner.media_base {
@@ -158,6 +181,9 @@ pub fn start_client(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Err(error) = logging::init() {
+        eprintln!("palace: could not open the diagnostic log: {error}");
+    }
     let slot = protocol::FrameSlot::default();
     let handler_slot = slot.clone();
     let defaults = Settings::from_env();
@@ -191,8 +217,27 @@ pub fn run() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            logging::log(Level::Info, "palace-app starting");
             let saved = settings::config_path(&handle).and_then(|path| settings::load(&path));
-            let settings = Settings::resolve(defaults, saved, args.into_iter());
+            let mut settings = Settings::resolve(defaults, saved, args.into_iter());
+            if settings.ensure_identity() {
+                if let Some(path) = settings::config_path(&handle) {
+                    if let Err(error) = settings::save(&path, &settings) {
+                        logging::log(
+                            Level::Warn,
+                            format!("could not persist the generated identity: {error}"),
+                        );
+                        eprintln!("palace: could not persist the generated identity: {error}");
+                    }
+                }
+            }
+            logging::log(
+                Level::Info,
+                format!(
+                    "connecting to {}:{} as {}",
+                    settings.host, settings.port, settings.username
+                ),
+            );
             let bundled = bundled_soundfont(&handle);
             let audio = AudioEngine::spawn(audio_config_for(&settings, bundled.as_deref()));
             let audio_handle = audio.handle();
@@ -209,13 +254,18 @@ pub fn run() {
                             *guard = Some(client);
                         }
                     }
+                    logging::log(Level::Info, "client runtime started");
                 }
-                Err(error) => eprintln!("palace: could not start client: {error}"),
+                Err(error) => {
+                    logging::log(Level::Error, format!("could not start client: {error}"));
+                    eprintln!("palace: could not start client: {error}");
+                }
             }
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
+                logging::log(Level::Info, "window close requested; disconnecting");
                 if let Some(state) = window.try_state::<AppState>() {
                     if let Ok(guard) = state.client.lock() {
                         if let Some(client) = guard.as_ref() {
@@ -227,7 +277,10 @@ pub fn run() {
             }
         })
         .run(tauri::generate_context!())
-        .unwrap_or_else(|error| eprintln!("palace: fatal: {error}"));
+        .unwrap_or_else(|error| {
+            logging::log(Level::Error, format!("fatal: {error}"));
+            eprintln!("palace: fatal: {error}");
+        });
 }
 
 #[cfg(test)]
@@ -242,6 +295,8 @@ mod tests {
             soundfont: None,
             audio_enabled: true,
             audio_volume: 1.0,
+            identity: None,
+            puid: None,
             password: None,
         }
     }
@@ -292,6 +347,28 @@ mod tests {
         assert_eq!(cfg.port, 4444);
         assert_eq!(cfg.username, "Someone");
         assert_eq!(cfg.password, None);
+    }
+
+    #[test]
+    fn config_carries_the_persisted_identity() {
+        let settings = Settings {
+            identity: Some(settings::StoredIdentity {
+                registration: settings::StoredRegistration {
+                    crc: 0x0506_0708,
+                    counter: 0x090a_0b0c,
+                },
+                puid: settings::StoredPuid {
+                    ctr: 0x0a0b_0c0d,
+                    crc: 0x0102_0304,
+                },
+            }),
+            ..sample()
+        };
+        let identity = config_for(&settings).identity;
+        assert_eq!(identity.registration.crc, 0x0506_0708);
+        assert_eq!(identity.registration.counter, 0x090a_0b0c);
+        assert_eq!(identity.puid.ctr, 0x0a0b_0c0d);
+        assert_eq!(identity.puid.crc, 0x0102_0304);
     }
 
     #[test]

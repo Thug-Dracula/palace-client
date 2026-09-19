@@ -257,11 +257,20 @@ fn register_palace_commands_installs_every_name_and_is_idempotent() {
     assert!(!set.contains("SGLOBAL"), "SGLOBAL is a Palace addition");
 
     let added = register_palace_commands(&mut set);
-    assert_eq!(PALACE_COMMANDS.len(), 121 + 17, "17 sourced additions");
+    let mut spellings: Vec<&str> = PALACE_COMMANDS.iter().map(|spec| spec.name).collect();
+    spellings.sort_unstable();
+    let distinct = spellings.len();
+    spellings.dedup();
     assert_eq!(
-        added,
-        120 + 17,
-        "ALARMEXEC/IPTVERSION overlap core; SGLOBAL adds one"
+        distinct,
+        spellings.len(),
+        "every command spelling must be registered exactly once"
+    );
+    assert!(
+        PALACE_COMMANDS.len() >= 118 + 17 + 32 + 97,
+        "the table must keep the Palace core, the sourced additions and the 97 \
+         Sparky GS words, got {}",
+        PALACE_COMMANDS.len()
     );
     assert_eq!(
         set.get("SGLOBAL"),
@@ -399,5 +408,132 @@ fn registry_specs_are_self_consistent_about_pushes() {
                 spec.pushes
             );
         }
+    }
+}
+
+/// The PalaceChat (Sparky) surface the gap inventory lists as absent.
+const SPARKY_GS_SURFACE: &[&str] = &[
+    "ADDHEADER",
+    "ADDPICNAME",
+    "ALERTBOX",
+    "CACHESCRIPT",
+    "CLEARHELPTAG",
+    "CLIENTID",
+    "DRAWTEXT",
+    "FILEDATE",
+    "FILEDELETE",
+    "FILEEXISTS",
+    "GETPICANGLE",
+    "GETPICBRIGHTNESS",
+    "GETPICNAME",
+    "GETPICOPACITY",
+    "GETPICPIXEL",
+    "GETPICSATURATION",
+    "GETROOMOPTIONS",
+    "GETSPOTOPTIONS",
+    "GETSPOTPOINTS",
+    "GETSPOTTEXTSIZE",
+    "GETSPOTTYPE",
+    "GETTIMEZONE",
+    "HTTPCANCEL",
+    "HTTPPOST",
+    "IMAGETOPROP",
+    "INSERTPIC",
+    "ISFUNCTION",
+    "ISKEYDOWN",
+    "ISRIGHTCLICK",
+    "ISSOUNDPLAYING",
+    "LOADWEBSITE",
+    "LOCINSPOT",
+    "MEDIAADDRESS",
+    "MUTE",
+    "NBRPICFRAMES",
+    "NBRROOMPICS",
+    "NBRSERVERUSERS",
+    "OVAL",
+    "PAUSEPIC",
+    "PENBOLD",
+    "PENFILLCOLOR",
+    "PENFILLOPACITY",
+    "PENFONT",
+    "PENITALIC",
+    "PENOPACITY",
+    "PENSHADOW",
+    "PENUNDERLINE",
+    "POLYGON",
+    "PROMPT",
+    "REMOVEHEADER",
+    "REMOVESPOT",
+    "RESETHEADERS",
+    "RESUMEPIC",
+    "ROOMPICNAME",
+    "SELECTFILE",
+    "SETCURSOR",
+    "SETCURSORPIC",
+    "SETHELPTAG",
+    "SETPICANGLE",
+    "SETPICBLUR",
+    "SETPICCONTRAST",
+    "SETPICFRAME",
+    "SETPICHUE",
+    "SETSPOTCLIP",
+    "SETSPOTCURVE",
+    "SETSPOTDEST",
+    "SETSPOTFONT",
+    "SETSPOTGRADIENT",
+    "SETSPOTLOC",
+    "SETSPOTPATHGRADIENT",
+    "SETSPOTPICMODE",
+    "SETSPOTPOINTS",
+    "SETSPOTSTYLE",
+    "SOUNDGETPOSITION",
+    "SOUNDISPLAYING",
+    "SOUNDLENGTH",
+    "SOUNDLOOP",
+    "SOUNDOPEN",
+    "SOUNDPAUSE",
+    "SOUNDPLAY",
+    "SOUNDPLAYFROM",
+    "SOUNDSEEK",
+    "SOUNDSTOP",
+    "STOPALARM",
+    "STOPALARMS",
+    "TEXTSPEECH",
+    "TIMEREXEC",
+    "UNMUTE",
+    "UPDATELATER",
+    "UPDATENOW",
+    "WEBCLICKTHRU",
+    "WEBEMBED",
+    "WEBLOCATION",
+    "WEBSCRIPT",
+    "WEBTITLE",
+    "WHEREPROP",
+    "WHOCOLOR",
+    "WHOFACE",
+];
+
+#[test]
+fn every_sparky_gs_word_dispatches_as_a_command_not_a_variable() {
+    assert_eq!(
+        SPARKY_GS_SURFACE.len(),
+        98,
+        "the gap inventory lists 98 names"
+    );
+    for name in SPARKY_GS_SURFACE {
+        let spec = command_spec(name).unwrap_or_else(|| panic!("{name} must be registered"));
+        let mut source = String::new();
+        for _ in 0..spec.pops {
+            source.push_str("0 ");
+        }
+        source.push_str(name);
+        let mut engine = SkeletonHost::engine();
+        let result = engine.run_source_resolved(&source);
+        assert!(result.is_ok(), "{name} faulted: {result:?}");
+        assert_eq!(
+            engine.host.invocations.get(*name),
+            Some(&1),
+            "{name} must dispatch; an unregistered name would lex as a variable"
+        );
     }
 }

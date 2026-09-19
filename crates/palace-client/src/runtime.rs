@@ -5,7 +5,9 @@
 //! arrive over a channel, results leave as [`ClientEvent`]s, and the current
 //! frame lands in a shared [`FrameStore`] that the presentation layer reads.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -22,16 +24,16 @@ use palace_host::{
     ScriptEvent, UserView, WireContext,
 };
 use palace_render::{
-    clamp_avatar_position, clamp_dpr, render, AnimationClock, AvatarSpec, ChatStyle, ChatText,
-    MediaStore, PointF, PropStore, RenderOptions, SceneBuilder, SizeF, ViewTransform,
-    COLOR_VARIANTS, FACE_VARIANTS, FLAG_PICTURES_ABOVE_ALL,
+    clamp_avatar_position, clamp_dpr, draw_above_into, render_base, AnimationClock, AvatarSpec,
+    Canvas, ChatStyle, ChatText, MediaStore, PointF, PropStore, RenderOptions, Scene, SceneBuilder,
+    SizeF, ViewTransform, COLOR_VARIANTS, FACE_VARIANTS, FLAG_PICTURES_ABOVE_ALL,
 };
 use palace_wire::byteorder::Writer;
 use palace_wire::error::WireError;
 use palace_wire::frame::{user_color_frame, user_face_frame, user_move_frame, Frame};
 use palace_wire::messages::{
-    authenticating_logon_record, client_logon_record, AssetSpec, AuxRegistrationRec, Point, Talk,
-    UserProp,
+    authenticating_logon_record_with_identity, client_logon_record_with_identity, AssetSpec,
+    AuxRegistrationRec, ClientIdentity, Point, Talk, UserProp,
 };
 use palace_wire::opcode;
 use serde::Serialize;
@@ -78,6 +80,10 @@ pub struct ClientConfig {
     /// The credential to answer an `auth` challenge with. `None` leaves the
     /// client unable to authenticate, exactly as before.
     pub password: Option<Secret>,
+    /// The per-install identity to advertise: both the registration pair and
+    /// the PUID. A server treats two sessions with the same identity as one
+    /// user and drops one of them.
+    pub identity: ClientIdentity,
 }
 
 impl Default for ClientConfig {
@@ -91,6 +97,7 @@ impl Default for ClientConfig {
             seed_media: Vec::new(),
             seed_props: Vec::new(),
             password: None,
+            identity: ClientIdentity::default(),
         }
     }
 }
@@ -142,12 +149,14 @@ fn session_cache_dir(cfg: &ClientConfig) -> PathBuf {
 }
 
 /// The logon record for `cfg`: the authenticating profile when a credential is
-/// configured, the plain one otherwise.
+/// configured, the plain one otherwise. Both carry `cfg.identity`, so a server
+/// sees this install's own registration pair and PUID rather than ones copied
+/// from a capture.
 fn logon_record(cfg: &ClientConfig) -> AuxRegistrationRec {
     if cfg.password.is_some() {
-        authenticating_logon_record(&cfg.username, cfg.desired_room)
+        authenticating_logon_record_with_identity(&cfg.username, cfg.desired_room, cfg.identity)
     } else {
-        client_logon_record(&cfg.username, cfg.desired_room)
+        client_logon_record_with_identity(&cfg.username, cfg.desired_room, cfg.identity)
     }
 }
 
@@ -285,8 +294,19 @@ struct Shared {
     chat_seq: AtomicU64,
     debug_frames: bool,
     last_room: Mutex<Option<i32>>,
+    /// A scripted `GOTOROOM`, parked for the session loop.
+    ///
+    /// The reference runs the room's `ON LEAVE` handlers inside `gotoRoom`
+    /// before it sends the change, for *every* navigation. A script effect is
+    /// applied where the scripts are not reachable, so the request is parked
+    /// here and the loop performs it with [`request_room`], the same path a
+    /// door and the `/goto` command take.
+    pending_goto: Mutex<Option<i32>>,
     transform: Mutex<Option<ViewTransform>>,
     assets: Mutex<Arc<AssetFacts>>,
+    /// Bumped whenever resolved asset facts change, so a cached static base is
+    /// invalidated when late prop or media art arrives.
+    asset_revision: AtomicU64,
     mouse: Mutex<(i32, i32)>,
     room_size: Mutex<(f64, f64)>,
 }
@@ -336,6 +356,7 @@ impl Shared {
     }
 
     fn set_assets(&self, assets: Arc<AssetFacts>) {
+        self.asset_revision.fetch_add(1, Ordering::Relaxed);
         match self.assets.lock() {
             Ok(mut guard) => *guard = assets,
             Err(poisoned) => *poisoned.into_inner() = assets,
@@ -346,6 +367,24 @@ impl Shared {
         match self.assets.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn asset_revision(&self) -> u64 {
+        self.asset_revision.load(Ordering::Relaxed)
+    }
+
+    fn set_pending_goto(&self, room: i32) {
+        match self.pending_goto.lock() {
+            Ok(mut guard) => *guard = Some(room),
+            Err(poisoned) => *poisoned.into_inner() = Some(room),
+        }
+    }
+
+    fn take_pending_goto(&self) -> Option<i32> {
+        match self.pending_goto.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
         }
     }
 
@@ -532,8 +571,10 @@ impl ClientRuntime {
             chat_seq: AtomicU64::new(0),
             debug_frames: std::env::var_os("PALACE_DEBUG_FRAMES").is_some(),
             last_room: Mutex::new(None),
+            pending_goto: Mutex::new(None),
             transform: Mutex::new(None),
             assets: Mutex::new(Arc::new(AssetFacts::default())),
+            asset_revision: AtomicU64::new(0),
             mouse: Mutex::new((0, 0)),
             room_size: Mutex::new((512.0, 384.0)),
         });
@@ -762,6 +803,7 @@ fn run_session(
     let mut media_base: Option<String> = None;
     let mut last_room_size: Option<(f64, f64)> = None;
     let mut last_screen: Option<ScreenState> = None;
+    let mut render_cache = RenderCache::default();
     let mut last_dpr = shared.viewport().dpr;
     let mut last_asset_request = Instant::now() - MEDIA_REQUEST_INTERVAL;
     let mut props_received = 0usize;
@@ -986,6 +1028,17 @@ fn run_session(
                                     "script: hotspot {id} is a locked door, click refused"
                                 ));
                             } else {
+                                for event in run_dispatch(
+                                    &mut scripts,
+                                    ScriptEvent::MouseDown,
+                                    &mut state,
+                                    shared,
+                                    &mut conn,
+                                    &mut dirty_render,
+                                    Some(id),
+                                ) {
+                                    shared.emit(event);
+                                }
                                 let (events, fired) = run_dispatch_report(
                                     &mut scripts,
                                     ScriptEvent::Select,
@@ -1022,14 +1075,44 @@ fn run_session(
                             let (room_w, room_h) = shared.room_size();
                             match walk_target(&state, room_w, room_h, rx, ry) {
                                 Some((mx, my)) => {
+                                    // Prediction first: the client is
+                                    // authoritative for where its own avatar is
+                                    // drawn, and the server is notified
+                                    // alongside rather than being on the
+                                    // critical path for what the user sees.
+                                    let moved = apply_self_move(&mut state, mx, my);
+                                    crate::trace::self_move_applied(
+                                        state.banner.user_id,
+                                        mx,
+                                        my,
+                                        moved,
+                                    );
+                                    shared.note(format!(
+                                        "walk: local apply id={} to=({mx},{my}) changed={moved}",
+                                        state.banner.user_id
+                                    ));
+                                    if moved {
+                                        dirty_render = true;
+                                        crate::trace::redraw_requested(
+                                            state.banner.user_id,
+                                            mx,
+                                            my,
+                                        );
+                                        shared.note(format!(
+                                            "walk: redraw requested id={} to=({mx},{my})",
+                                            state.banner.user_id
+                                        ));
+                                    }
                                     conn.send(&user_move_frame(
                                         Point::new(my as i16, mx as i16),
                                         state.banner.user_id,
                                         state.byte_order(),
                                     ))?;
-                                    if apply_self_move(&mut state, mx, my) {
-                                        dirty_render = true;
-                                    }
+                                    crate::trace::move_sent(state.banner.user_id, mx, my);
+                                    shared.note(format!(
+                                        "walk: sent id={} to=({mx},{my})",
+                                        state.banner.user_id
+                                    ));
                                     shared.note(format!("script: walking to room ({mx},{my})"));
                                 }
                                 None => shared.note(
@@ -1041,6 +1124,21 @@ fn run_session(
                 }
                 None => shared.note("script: click ignored, the room view is not ready"),
             }
+        }
+        // A click is an interaction: draw its result before the loop blocks on
+        // the socket, so movement never appears to wait for the server.
+        if dirty_render {
+            compose_now(
+                &state,
+                &mut builder,
+                shared,
+                start,
+                &mut render_cache,
+                &mut last_room_size,
+                &mut last_screen,
+            );
+            dirty_render = false;
+            dirty_geom = false;
         }
         if let Some(source) = run_source_pending.take() {
             // The input box runs against the *current* session: without this a
@@ -1074,6 +1172,21 @@ fn run_session(
             }
         }
 
+        // A scripted `GOTOROOM` is performed here, before the next server frame
+        // is read, so its `ON LEAVE` handlers see the same session state the
+        // script did — the reference runs them inside `gotoRoom` itself.
+        if let Some(room_id) = shared.take_pending_goto() {
+            request_room(
+                room_id,
+                &mut scripts,
+                &mut state,
+                shared,
+                &mut conn,
+                &mut dirty_render,
+                &mut occupied_room,
+            )?;
+        }
+
         let now = start.elapsed().as_millis() as u64;
         let mut pipeline_events: Vec<PipelineEvent> = Vec::new();
 
@@ -1096,7 +1209,9 @@ fn run_session(
                 if palace_asset::owns(frame.opcode) {
                     pipeline_events.extend(pipeline.on_frame(&frame, order, now));
                 }
+                let before_positions = state.user_positions();
                 let applied = state.apply(&frame, order);
+                state.begin_motions(&before_positions, now);
                 for outbound in &applied.outbound {
                     let _ = conn.send(outbound);
                 }
@@ -1312,6 +1427,7 @@ fn run_session(
         }
 
         let ticks = (now * 60 / 1000) as i64;
+        scripts.set_view(host_view(&state, shared));
         let alarm_effects = scripts.advance(ticks);
         if !alarm_effects.is_empty() {
             crate::trace::script_effects("ALARM", &alarm_effects);
@@ -1395,14 +1511,21 @@ fn run_session(
             );
         }
 
+        // Keep any remote-avatar glide moving even while the server is quiet.
+        if state.advance_motion(start.elapsed().as_millis() as u64) {
+            dirty_render = true;
+        }
+
         if dirty_render {
-            if let Some(screen) = compose(&state, &mut builder, shared, start) {
-                last_room_size = Some((screen.geometry.room_w, screen.geometry.room_h));
-                shared.emit(ClientEvent::Screen {
-                    screen: screen.clone(),
-                });
-                last_screen = Some(screen);
-            }
+            compose_now(
+                &state,
+                &mut builder,
+                shared,
+                start,
+                &mut render_cache,
+                &mut last_room_size,
+                &mut last_screen,
+            );
             dirty_render = false;
             dirty_geom = false;
         } else if dirty_geom {
@@ -1589,6 +1712,7 @@ fn request_assets(
         return;
     };
     let mut prop_ids: Vec<u32> = room.loose_props.iter().map(|p| p.spec.id).collect();
+    prop_ids.extend(state.pending_prop_loads.iter().copied());
     for user in state.users_in_room() {
         prop_ids.extend(user.props.iter().copied());
     }
@@ -1620,11 +1744,77 @@ fn request_assets(
     }
 }
 
+/// The layers below the avatars, rasterized once and reused until a static
+/// input changes.
+struct CachedBase {
+    signature: u64,
+    canvas: Canvas,
+}
+
+/// Keeps the static room layers rasterized between frames.
+///
+/// A click only moves an avatar, but without this every click re-blits the
+/// whole background and overlays at device resolution. The base is rebuilt only
+/// when [`static_signature`] changes.
+#[derive(Default)]
+struct RenderCache {
+    base: Option<CachedBase>,
+}
+
+/// A cheap fingerprint of everything drawn below the avatars.
+///
+/// Covers the room, its hotspot states and pictures, the loose props, the
+/// local picture opacity, the paint revision, the dim level and the DPR.
+fn static_signature(state: &SessionState, dpr: f64, scene: &Scene, asset_revision: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    asset_revision.hash(&mut hasher);
+    dpr.to_bits().hash(&mut hasher);
+    scene.size.hash(&mut hasher);
+    scene.backdrop.hash(&mut hasher);
+    scene.dim_level.to_bits().hash(&mut hasher);
+    state.draw.revision().hash(&mut hasher);
+    scene
+        .background
+        .as_ref()
+        .map(|image| (image.width(), image.height()))
+        .hash(&mut hasher);
+    if let Some(room) = &state.room_desc {
+        room.header.room_id.hash(&mut hasher);
+        room.picture.hash(&mut hasher);
+        for spot in &room.hotspots {
+            spot.id.hash(&mut hasher);
+            spot.state.hash(&mut hasher);
+        }
+        for picture in &room.pictures {
+            picture.pic_id.hash(&mut hasher);
+            picture.name.hash(&mut hasher);
+        }
+        for prop in &room.loose_props {
+            prop.spec.id.hash(&mut hasher);
+            prop.loc.h.hash(&mut hasher);
+            prop.loc.v.hash(&mut hasher);
+        }
+    }
+    for ((spot, index), alpha) in &state.pic_opacity {
+        spot.hash(&mut hasher);
+        index.hash(&mut hasher);
+        alpha.to_bits().hash(&mut hasher);
+    }
+    for sprite in &scene.overlays_above_nothing {
+        (sprite.x, sprite.y, sprite.z).hash(&mut hasher);
+    }
+    for sprite in &scene.loose_props {
+        (sprite.x, sprite.y, sprite.z).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn compose(
     state: &SessionState,
     builder: &mut SceneBuilder,
     shared: &Arc<Shared>,
     start: Instant,
+    cache: &mut RenderCache,
 ) -> Option<ScreenState> {
     let live = state.room_desc.as_ref()?;
     let mut room = live.clone();
@@ -1634,14 +1824,17 @@ fn compose(
     room.loose_props
         .retain(|prop| builder.props().contains(prop.spec.id));
 
-    let (avatars, hidden_avatars) = visible_avatars(state, builder.props());
+    let now_ms = start.elapsed().as_millis() as u64;
+    let (avatars, hidden_avatars) = visible_avatars(state, builder.props(), now_ms);
 
     builder.clear_pic_opacity();
     for ((spot, index), alpha) in &state.pic_opacity {
         builder.set_pic_opacity(*spot, *index, *alpha);
     }
 
+    let build_started = Instant::now();
     let mut scene = builder.build_with(&room, &avatars, &[]);
+    let build_done = Instant::now();
     scene.dim_level = state.room_dim;
     // The builder seeds `scene.draw` from the room descriptor alone; the session
     // list is the room's own commands plus every `DRAW` received since, so it is
@@ -1655,8 +1848,30 @@ fn compose(
         dpr,
         clock: AnimationClock::at(start.elapsed().as_millis() as u64),
     };
-    let canvas = render(&scene, options);
+    let signature = static_signature(state, dpr, &scene, shared.asset_revision());
+    let mut canvas = match &cache.base {
+        Some(base) if base.signature == signature => base.canvas.clone(),
+        _ => {
+            let base = render_base(&scene, options);
+            cache.base = Some(CachedBase {
+                signature,
+                canvas: base.clone(),
+            });
+            base
+        }
+    };
+    draw_above_into(&mut canvas, &scene, options.clock);
+    let render_done = Instant::now();
     let png = canvas.to_png_bytes().ok()?;
+    if crate::trace::enabled() {
+        crate::trace::state(&format!(
+            "compose build={}ms render={}ms png={}ms bytes={}",
+            (build_done - build_started).as_millis(),
+            (render_done - build_done).as_millis(),
+            (Instant::now() - render_done).as_millis(),
+            png.len()
+        ));
+    }
     let version = shared.frames.put(png);
 
     let mut notes: Vec<String> = scene.notes.iter().map(|n| n.to_string()).collect();
@@ -1691,6 +1906,30 @@ fn compose(
     })
 }
 
+/// Compose the current room and, on success, publish the new frame.
+///
+/// Shared by the normal end-of-loop render and the immediate render a click
+/// performs so its result is on screen before the next socket wait.
+fn compose_now(
+    state: &SessionState,
+    builder: &mut SceneBuilder,
+    shared: &Arc<Shared>,
+    start: Instant,
+    cache: &mut RenderCache,
+    last_room_size: &mut Option<(f64, f64)>,
+    last_screen: &mut Option<ScreenState>,
+) -> bool {
+    let Some(screen) = compose(state, builder, shared, start, cache) else {
+        return false;
+    };
+    *last_room_size = Some((screen.geometry.room_w, screen.geometry.room_h));
+    shared.emit(ClientEvent::Screen {
+        screen: screen.clone(),
+    });
+    *last_screen = Some(screen);
+    true
+}
+
 /// The avatar specs to draw for the users in a room, plus how many were hidden.
 ///
 /// A user with no worn props still becomes an avatar — their built-in face is
@@ -1716,11 +1955,21 @@ fn avatar_specs(users: &[UserInfo], props: &PropStore) -> (Vec<AvatarSpec>, usiz
     (avatars, hidden)
 }
 
-fn visible_avatars(state: &SessionState, props: &PropStore) -> (Vec<AvatarSpec>, usize) {
+fn visible_avatars(
+    state: &SessionState,
+    props: &PropStore,
+    now_ms: u64,
+) -> (Vec<AvatarSpec>, usize) {
     if state.avatars_hidden {
         (Vec::new(), 0)
     } else {
-        avatar_specs(&state.users_in_room(), props)
+        let mut users = state.users_in_room();
+        for user in &mut users {
+            let (x, y) = state.position_at(user.id, now_ms);
+            user.x = x;
+            user.y = y;
+        }
+        avatar_specs(&users, props)
     }
 }
 
@@ -1935,13 +2184,7 @@ fn walk_target(
 /// the room (protocol reference :2126), so it never echoes it back; without this
 /// the avatar would not move until the client reconnected.
 fn apply_self_move(state: &mut SessionState, x: i32, y: i32) -> bool {
-    let Some(user) = state.users.get_mut(&state.banner.user_id) else {
-        return false;
-    };
-    let changed = user.x != x as i16 || user.y != y as i16;
-    user.x = x as i16;
-    user.y = y as i16;
-    changed
+    state.predict_self_move(x, y)
 }
 
 fn report_event(report: &palace_host::DispatchReport) -> ClientEvent {
@@ -2070,12 +2313,24 @@ fn run_event(
     only: Option<i32>,
     depth: u32,
 ) -> (Vec<ClientEvent>, bool) {
-    scripts.set_view(host_view(state, shared));
+    let view = host_view(state, shared);
+    let username = view.self_name.clone();
+    scripts.set_view(view);
+    let vars_before = crate::trace::dump_vars_enabled().then(|| scripts.globals_snapshot());
     let report = match only {
         Some(spot) => scripts.fire_spot(event, spot),
         None => scripts.fire(event),
     };
     crate::trace::dispatch(&report, only);
+    if let Some(before) = vars_before {
+        crate::trace::dump_vars(
+            &report.handler,
+            only,
+            &username,
+            &before,
+            &scripts.globals_snapshot(),
+        );
+    }
     let fired = report.fired();
     let mut out = Vec::new();
     for run in &report.runs {
@@ -2276,7 +2531,7 @@ fn apply_effect(
     // The frame is kept, not just sent: a stroke is applied locally by decoding
     // the *same bytes* that go on the wire, so our own view cannot drift from
     // what the other clients are told.
-    let outbound = if !matches!(effect, Effect::SetProps { .. }) {
+    let outbound = if !matches!(effect, Effect::SetProps { .. } | Effect::GotoRoom { .. }) {
         effect_frame(effect, context)
     } else {
         None
@@ -2315,8 +2570,32 @@ fn apply_effect(
         Effect::GotoUrl { url } => vec![ClientEvent::Note {
             text: format!("script: GOTOURL {url} (reported, not opened)"),
         }],
+        Effect::GotoUrlFrame { url, frame } => vec![ClientEvent::Note {
+            text: format!("script: GOTOURLFRAME {url} frame={frame} (reported, not opened)"),
+        }],
         Effect::LaunchApp { app } => vec![ClientEvent::Note {
             text: format!("script: LAUNCHAPP {app} (reported, not launched)"),
+        }],
+        Effect::LaunchEvent { event } => vec![ClientEvent::Note {
+            text: format!("script: LAUNCHEVENT {event} (reported, not fired)"),
+        }],
+        Effect::LaunchPpa { ppa } => {
+            follow.push((ScriptEvent::PpaMacro, None));
+            vec![ClientEvent::Note {
+                text: format!("script: LAUNCHPPA {ppa} (reported, not launched)"),
+            }]
+        }
+        Effect::LoadJava { url } => vec![ClientEvent::Note {
+            text: format!("script: LOADJAVA {url} (reported, not loaded)"),
+        }],
+        Effect::TalkPpa { text } => {
+            follow.push((ScriptEvent::PpaMessage, None));
+            vec![ClientEvent::Note {
+                text: format!("script: TALKPPA {text} (reported, not sent)"),
+            }]
+        }
+        Effect::ShellCommand { command } => vec![ClientEvent::Note {
+            text: format!("script: SHELLCMD {command:?} refused (never executed)"),
         }],
         Effect::PlaySound { name } => vec![ClientEvent::Sound { name: name.clone() }],
         Effect::MidiPlay { name } => vec![ClientEvent::MidiPlay { name: name.clone() }],
@@ -2349,6 +2628,16 @@ fn apply_effect(
                     } else {
                         " (spot not in this room)"
                     }
+                ),
+            }]
+        }
+        Effect::SetSpotNameLocal { spot, name } => {
+            let changed = set_spot_name_local(state, *spot, name);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: SETSPOTNAMELOCAL spot={spot} {name:?}{}",
+                    no_change_suffix(changed)
                 ),
             }]
         }
@@ -2397,6 +2686,44 @@ fn apply_effect(
             vec![ClientEvent::Note {
                 text: format!(
                     "script: spot {spot} state {index} opacity {opacity:.2}{}",
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
+        Effect::SetPicBrightness {
+            spot,
+            state: index,
+            value,
+        } => {
+            let changed = set_pic_brightness(state, *spot, *index, *value);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: spot {spot} state {index} brightness {value}{}",
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
+        Effect::SetPicSaturation {
+            spot,
+            state: index,
+            value,
+        } => {
+            let changed = set_pic_saturation(state, *spot, *index, *value);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: spot {spot} state {index} saturation {value}{}",
+                    no_change_suffix(changed)
+                ),
+            }]
+        }
+        Effect::RemovePic { spot, picture } => {
+            let changed = remove_pic(state, *spot, *picture);
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: format!(
+                    "script: REMOVEPIC spot={spot} picture={picture}{}",
                     no_change_suffix(changed)
                 ),
             }]
@@ -2468,6 +2795,28 @@ fn apply_effect(
                 Vec::new()
             }
         }
+        Effect::HideSmileys => {
+            let changed = !state.hide_smileys;
+            state.hide_smileys = true;
+            *dirty_render |= changed;
+            vec![ClientEvent::Note {
+                text: "script: HIDESMILEYS".to_string(),
+            }]
+        }
+        Effect::LockUserProps => {
+            let changed = !state.lock_user_props;
+            state.lock_user_props = true;
+            vec![ClientEvent::Note {
+                text: format!("script: LOCKUSERPROPS{}", no_change_suffix(changed)),
+            }]
+        }
+        Effect::AutoUserLayer { on } => {
+            let changed = state.auto_user_layer != *on;
+            state.auto_user_layer = *on;
+            vec![ClientEvent::Note {
+                text: format!("script: AUTOUSERLAYER {on}{}", no_change_suffix(changed)),
+            }]
+        }
         // The frame was already sent above by `effect_frame`, which computes the
         // target with the same `move_target` used here, so the position applied
         // locally is the position on the wire. The server relays our own `uLoc`
@@ -2501,9 +2850,7 @@ fn apply_effect(
             }
         }
         Effect::GotoRoom { room } => {
-            if let Ok(mut guard) = shared.last_room.lock() {
-                *guard = Some(*room);
-            }
+            shared.set_pending_goto(*room);
             *dirty_render = true;
             vec![ClientEvent::Note {
                 text: format!("script: GOTOROOM {room}"),
@@ -2594,6 +2941,16 @@ fn apply_effect(
                 Vec::new()
             }
         }
+        Effect::LoadProps { props } => {
+            state
+                .pending_prop_loads
+                .extend(props.iter().filter_map(|p| u32::try_from(*p).ok()));
+            state.pending_prop_loads.sort_unstable();
+            state.pending_prop_loads.dedup();
+            vec![ClientEvent::Note {
+                text: format!("script: LOADPROPS preloading {} prop(s)", props.len()),
+            }]
+        }
         Effect::Naked => {
             let outcome = set_self_props(state, conn, &[]).unwrap_or(PropOutcome::NONE);
             *dirty_render |= outcome.changed;
@@ -2607,6 +2964,9 @@ fn apply_effect(
             }]
         }
         Effect::SetChatString { .. } => Vec::new(),
+        Effect::Confirm { text } => vec![ClientEvent::Note {
+            text: format!("script: CONFIRMBOX {text:?} (answer defaults to 0)"),
+        }],
         Effect::Unsupported { command } => vec![ClientEvent::Note {
             text: format!("script: {command} is not implemented"),
         }],
@@ -2762,6 +3122,92 @@ fn apply_effect(
                 text: format!("script: fetching {url} (hotspot {spot})"),
             }]
         }
+        Effect::DrawText { text, x, y } => vec![ClientEvent::Note {
+            text: format!("script: DRAWTEXT ({x},{y}) {text:?} (reported, not drawn)"),
+        }],
+        Effect::DrawOval { x, y, w, h } => vec![ClientEvent::Note {
+            text: format!("script: OVAL ({x},{y}) {w}x{h} (reported, not drawn)"),
+        }],
+        Effect::DrawPolygon { points } => vec![ClientEvent::Note {
+            text: format!(
+                "script: POLYGON [{} points] (reported, not drawn)",
+                points.len()
+            ),
+        }],
+        Effect::SetPenFont { name } => vec![ClientEvent::Note {
+            text: format!("script: PENFONT {name:?}"),
+        }],
+        Effect::SetPenBold { on } => vec![ClientEvent::Note {
+            text: format!("script: PENBOLD {on}"),
+        }],
+        Effect::SetPenItalic { on } => vec![ClientEvent::Note {
+            text: format!("script: PENITALIC {on}"),
+        }],
+        Effect::SetPenUnderline { on } => vec![ClientEvent::Note {
+            text: format!("script: PENUNDERLINE {on}"),
+        }],
+        Effect::SetPenShadow { on } => vec![ClientEvent::Note {
+            text: format!("script: PENSHADOW {on}"),
+        }],
+        Effect::SetPenOpacity { value } => vec![ClientEvent::Note {
+            text: format!("script: PENOPACITY {value}"),
+        }],
+        Effect::SetPenFillColor { r, g, b } => vec![ClientEvent::Note {
+            text: format!("script: PENFILLCOLOR ({r},{g},{b})"),
+        }],
+        Effect::SetPenFillOpacity { value } => vec![ClientEvent::Note {
+            text: format!("script: PENFILLOPACITY {value}"),
+        }],
+        Effect::RemoveSpot { spot } => vec![ClientEvent::Note {
+            text: format!("script: REMOVESPOT {spot} (reported, not removed)"),
+        }],
+        Effect::SetSpotLoc { spot, x, y } => vec![ClientEvent::Note {
+            text: format!("script: SETSPOTLOC {spot} ({x},{y})"),
+        }],
+        Effect::SetSpotDest { spot, dest } => vec![ClientEvent::Note {
+            text: format!("script: SETSPOTDEST {spot} -> {dest}"),
+        }],
+        Effect::SetSpotPoints { spot, x, y, points } => vec![ClientEvent::Note {
+            text: format!(
+                "script: SETSPOTPOINTS {spot} ({x},{y}) [{} points]",
+                points.len()
+            ),
+        }],
+        Effect::SetSpotPicMode { spot, mode } => vec![ClientEvent::Note {
+            text: format!("script: SETSPOTPICMODE {spot} mode={mode}"),
+        }],
+        Effect::SetSpotStyle {
+            spot,
+            color,
+            border,
+            size,
+        } => vec![ClientEvent::Note {
+            text: format!("script: SETSPOTSTYLE {spot} {color:?} border={border} size={size}"),
+        }],
+        Effect::Alert { text } => vec![ClientEvent::Note {
+            text: format!("script: ALERTBOX {text}"),
+        }],
+        Effect::Prompt { label, default } => vec![ClientEvent::Note {
+            text: format!("script: PROMPT {label:?} answered {default:?}"),
+        }],
+        Effect::SetCursor { index } => vec![ClientEvent::Note {
+            text: format!("script: SETCURSOR {index}"),
+        }],
+        Effect::SetCursorPic { name, x, y } => vec![ClientEvent::Note {
+            text: format!("script: SETCURSORPIC {name:?} ({x},{y})"),
+        }],
+        Effect::WebEmbed { spot, url } => vec![ClientEvent::Note {
+            text: format!("script: WEBEMBED {spot} {url:?} (reported, not embedded)"),
+        }],
+        Effect::WebScript { spot, script } => vec![ClientEvent::Note {
+            text: format!("script: WEBSCRIPT {spot} {script:?} (reported, not run)"),
+        }],
+        Effect::HttpCancel => vec![ClientEvent::Note {
+            text: "script: HTTPCANCEL".to_owned(),
+        }],
+        Effect::Refused { command, reason } => vec![ClientEvent::Note {
+            text: format!("script: {command} refused: {reason}"),
+        }],
     }
 }
 
@@ -3146,6 +3592,18 @@ fn move_spot_to(state: &mut SessionState, spot: i32, x: i32, y: i32) -> bool {
     move_spot_in_room(state, room_id, spot, x, y)
 }
 
+/// `SETSPOTNAMELOCAL`: rename a hotspot in this client's copy of the room.
+fn set_spot_name_local(state: &mut SessionState, spot: i32, name: &str) -> bool {
+    let Some(room_id) = current_room_id(state) else {
+        return false;
+    };
+    let Some(hotspot) = hotspot_mut(state, room_id, spot) else {
+        return false;
+    };
+    hotspot.name = Some(name.to_owned());
+    true
+}
+
 /// The same move for a room named by the wire: `MSG_SPOTMOVE` carries a
 /// `RoomID`, and a move aimed at another room must not touch this one.
 pub(crate) fn move_spot_in_room(
@@ -3508,6 +3966,41 @@ fn set_pic_opacity(state: &mut SessionState, spot: i32, index: i32, opacity: f64
     true
 }
 
+fn set_pic_brightness(state: &mut SessionState, spot: i32, index: i32, value: i32) -> bool {
+    let (Ok(spot), Ok(index)) = (i16::try_from(spot), i16::try_from(index)) else {
+        return false;
+    };
+    state.pic_brightness.insert((spot, index), value);
+    true
+}
+
+fn set_pic_saturation(state: &mut SessionState, spot: i32, index: i32, value: i32) -> bool {
+    let (Ok(spot), Ok(index)) = (i16::try_from(spot), i16::try_from(index)) else {
+        return false;
+    };
+    state.pic_saturation.insert((spot, index), value);
+    true
+}
+
+/// `REMOVEPIC`: drop the hotspot state at `picture` and renumber the rest.
+fn remove_pic(state: &mut SessionState, spot: i32, picture: i32) -> bool {
+    let Some(room_id) = current_room_id(state) else {
+        return false;
+    };
+    let Some(hotspot) = hotspot_mut(state, room_id, spot) else {
+        return false;
+    };
+    let Ok(index) = usize::try_from(picture) else {
+        return false;
+    };
+    if index >= hotspot.states.len() {
+        return false;
+    }
+    hotspot.states.remove(index);
+    hotspot.nbr_states = hotspot.states.len() as i16;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3599,6 +4092,66 @@ mod tests {
             logon_record(&armed).aux_flags & aux_flags::AUTHENTICATE,
             aux_flags::AUTHENTICATE
         );
+    }
+
+    #[test]
+    fn the_logon_carries_the_configured_identity_and_not_the_captured_one() {
+        use palace_wire::messages::{aux_flags, Puid, ReferenceProfile};
+        use palace_wire::registration::RegistrationCode;
+
+        let identity = ClientIdentity {
+            registration: RegistrationCode {
+                crc: 0x1357_2468,
+                counter: 0x90ab_cdef,
+            },
+            puid: Puid {
+                ctr: 0x1122_3344,
+                crc: 0x5566_7788,
+            },
+        };
+        let captured = ReferenceProfile::default();
+        let plain = ClientConfig {
+            identity,
+            ..ClientConfig::default()
+        };
+        let record = logon_record(&plain);
+        assert_eq!(record.crc, identity.registration.crc);
+        assert_eq!(record.counter, identity.registration.counter);
+        assert_eq!(record.puid_ctr, identity.puid.ctr);
+        assert_eq!(record.puid_crc, identity.puid.crc);
+        assert_ne!(record.crc, captured.crc);
+        assert_ne!(record.counter, captured.counter);
+        assert_ne!(record.puid_ctr, captured.puid_ctr);
+        assert_ne!(record.puid_crc, captured.puid_crc);
+
+        let armed = ClientConfig {
+            password: Some(Secret::new("hunter2")),
+            ..plain
+        };
+        let record = logon_record(&armed);
+        assert_eq!(record.crc, identity.registration.crc);
+        assert_eq!(record.counter, identity.registration.counter);
+        assert_eq!(record.puid_ctr, identity.puid.ctr);
+        assert_eq!(record.puid_crc, identity.puid.crc);
+        assert_eq!(
+            record.aux_flags & aux_flags::AUTHENTICATE,
+            aux_flags::AUTHENTICATE,
+            "the authenticating profile still answers a challenge"
+        );
+    }
+
+    #[test]
+    fn the_default_config_identity_is_the_generated_guest_not_the_capture() {
+        use palace_wire::messages::ReferenceProfile;
+        use palace_wire::registration::RegistrationCode;
+
+        let identity = ClientConfig::default().identity;
+        let captured = ReferenceProfile::default();
+        assert_eq!(identity.registration, RegistrationCode::generate(0));
+        assert_ne!(identity.registration.crc, captured.crc);
+        assert_ne!(identity.registration.counter, captured.counter);
+        assert_ne!(identity.puid.ctr, captured.puid_ctr);
+        assert_ne!(identity.puid.crc, captured.puid_crc);
     }
 
     #[test]
@@ -3949,6 +4502,233 @@ mod tests {
         assert_eq!(state.users[&SELF_ID].props, (1..=9).collect::<Vec<u32>>());
     }
 
+    #[test]
+    fn taking_the_avatar_off_clears_our_props_and_sends_an_empty_userprop() {
+        let mut state = state_in(&scripted_room(&[]));
+        state.users.get_mut(&HARNESS_SELF).expect("self").props = vec![10, 20];
+        add_other_user(&mut state, 99);
+        state.users.get_mut(&99).expect("other").props = vec![30, 40];
+
+        let (mut harness, sink) = harness_capturing();
+        let outcome = set_self_props(&mut state, &mut harness.conn, &[]).expect("the frame sends");
+
+        assert!(outcome.changed, "taking the avatar off is a change");
+        assert_eq!(outcome.dropped, 0);
+        assert!(
+            state.users[&HARNESS_SELF].props.is_empty(),
+            "our worn list is cleared"
+        );
+        assert_eq!(
+            state.users[&99].props,
+            vec![30, 40],
+            "another user's props are untouched"
+        );
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&opcode::USERPROP.value().to_le_bytes());
+        expected.extend_from_slice(&4i32.to_le_bytes());
+        expected.extend_from_slice(&HARNESS_SELF.to_le_bytes());
+        expected.extend_from_slice(&0i32.to_le_bytes());
+        assert!(
+            captured_contains(&sink, &expected),
+            "the server must receive one USERPROP carrying our id and an empty worn list"
+        );
+    }
+
+    #[test]
+    fn taking_the_avatar_off_when_already_bare_sends_nothing() {
+        let mut state = state_in(&scripted_room(&[]));
+        let (mut harness, sink) = harness_capturing();
+        let outcome = set_self_props(&mut state, &mut harness.conn, &[]).expect("no frame is sent");
+
+        assert!(!outcome.changed, "an already-empty list is no change");
+        assert!(
+            !captured_contains(&sink, &opcode::USERPROP.value().to_le_bytes()),
+            "an unchanged list must not put a USERPROP on the wire"
+        );
+    }
+
+    #[test]
+    fn a_room_setprops_is_not_wiped_by_the_servers_own_user_record() {
+        use palace_wire::messages::UserRec;
+
+        let room = scripted_room(&[(
+            16,
+            "ON ENTER { [ 976933367 ] SETPROPS CLEARLOOSEPROPS }",
+        )]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        let mut state = state_in(&room);
+        let mut harness = harness();
+        let mut dirty = false;
+
+        scripts.load_room(&room);
+        run_dispatch(
+            &mut scripts,
+            ScriptEvent::Enter,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            None,
+        );
+        assert_eq!(
+            state.users[&HARNESS_SELF].props,
+            vec![976933367],
+            "the room's SETPROPS dressed us and CLEARLOOSEPROPS left the worn prop alone"
+        );
+
+        let mut w = Writer::new(ByteOrder::Little);
+        UserRec {
+            user_id: HARNESS_SELF,
+            room_pos: Point::default(),
+            prop_spec: [AssetSpec::default(); AssetSpec::USER_PROP_SLOTS],
+            room_id: HARNESS_ROOM,
+            face_nbr: 0,
+            color_nbr: 0,
+            away_flag: 0,
+            open_to_msgs: 0,
+            nbr_props: 0,
+            name: "Self".to_owned(),
+        }
+        .encode(&mut w);
+        let _ = state.apply(
+            &Frame::new(opcode::USERNEW, HARNESS_SELF, w.into_vec()),
+            ByteOrder::Little,
+        );
+
+        assert_eq!(
+            state.users[&HARNESS_SELF].props,
+            vec![976933367],
+            "the server's own record of us must not wipe the prop the room dressed us in"
+        );
+    }
+
+    /// The exact question, driven through the real script -> effect path: a
+    /// room script's `SETPROPS` must leave the prop on our worn list even after
+    /// the room's own user records (`nprs` / `rprs`) arrive.
+    ///
+    /// Mirrors the live arena shape: `ON ENTER` runs `SETPROPS [ id ]` twice
+    /// (the second is a no-op) and then `CLEARLOOSEPROPS`. The clear must empty
+    /// the floor and leave the worn prop alone.
+    #[test]
+    fn a_room_scripts_setprops_wears_the_prop_through_the_real_dispatch_path() {
+        use palace_wire::messages::UserRec;
+
+        let room = scripted_room(&[(
+            16,
+            "ON ENTER { [ 976933367 ] SETPROPS [ 976933367 ] SETPROPS CLEARLOOSEPROPS }",
+        )]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        let mut state = state_in(&room);
+        // A floor prop for CLEARLOOSEPROPS to remove, proving it targets loose
+        // props only.
+        assert!(add_loose_prop(&mut state, 424_242, 10, 20));
+        let mut harness = harness();
+        let mut dirty = false;
+
+        scripts.load_room(&room);
+        run_dispatch(
+            &mut scripts,
+            ScriptEvent::Enter,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            None,
+        );
+
+        assert_eq!(
+            state.users[&HARNESS_SELF].props,
+            vec![976933367],
+            "the room's ON ENTER SETPROPS must put the prop on our worn list"
+        );
+        assert!(
+            loose_ids(&state).is_empty(),
+            "CLEARLOOSEPROPS must remove the floor prop and not the worn one: {:?}",
+            loose_ids(&state)
+        );
+
+        let record = UserRec {
+            user_id: HARNESS_SELF,
+            room_pos: Point::default(),
+            prop_spec: [AssetSpec::default(); AssetSpec::USER_PROP_SLOTS],
+            room_id: HARNESS_ROOM,
+            face_nbr: 0,
+            color_nbr: 0,
+            away_flag: 0,
+            open_to_msgs: 0,
+            nbr_props: 0,
+            name: "Self".to_owned(),
+        };
+
+        // `nprs`: the server's own single-user record for us, props = 0.
+        let mut w = Writer::new(ByteOrder::Little);
+        record.encode(&mut w);
+        let _ = state.apply(
+            &Frame::new(opcode::USERNEW, HARNESS_SELF, w.into_vec()),
+            ByteOrder::Little,
+        );
+        assert_eq!(
+            state.users[&HARNESS_SELF].props,
+            vec![976933367],
+            "an inbound USERNEW for us must not undress the prop the room gave us"
+        );
+
+        // `rprs`: the room's whole user list, our record again with props = 0.
+        let mut w = Writer::new(ByteOrder::Little);
+        record.encode(&mut w);
+        let _ = state.apply(
+            &Frame::new(opcode::USERLIST, 1, w.into_vec()),
+            ByteOrder::Little,
+        );
+        assert_eq!(
+            state.users[&HARNESS_SELF].props,
+            vec![976933367],
+            "an inbound USERLIST for us must not undress the prop the room gave us"
+        );
+    }
+
+    /// Isolates the other half of the hypothesis: the `usrP` / `usrD` arms go
+    /// through `set_user_props`, which the user-record preservation does not
+    /// cover and which assigns the worn list wholesale. If this fails, the
+    /// fault is `state.rs::set_user_props` overwriting a list the script
+    /// authored.
+    #[test]
+    fn an_inbound_userprop_or_userdesc_for_us_leaves_the_room_script_prop_worn() {
+        let room = scripted_room(&[]);
+        let mut state = state_in(&room);
+        let (mut harness, _sink) = harness_capturing();
+        let _ = set_self_props(&mut state, &mut harness.conn, &[976_933_367])
+            .expect("the worn list is applied");
+
+        // `usrP` for us carrying an empty list, as a server echo would.
+        let body = 0i32.to_le_bytes().to_vec();
+        let _ = state.apply(
+            &Frame::new(opcode::USERPROP, HARNESS_SELF, body),
+            ByteOrder::Little,
+        );
+        assert_eq!(
+            state.users[&HARNESS_SELF].props,
+            vec![976_933_367],
+            "an inbound USERPROP for us carrying no props must not undress the room's prop"
+        );
+
+        // `usrD` for us with no props, as a description broadcast would.
+        let mut w = Writer::new(ByteOrder::Little);
+        w.write_i16(0);
+        w.write_i16(0);
+        w.write_i32(0);
+        let _ = state.apply(
+            &Frame::new(opcode::USERDESC, HARNESS_SELF, w.into_vec()),
+            ByteOrder::Little,
+        );
+        assert_eq!(
+            state.users[&HARNESS_SELF].props,
+            vec![976_933_367],
+            "an inbound USERDESC for us carrying no props must not undress the room's prop"
+        );
+    }
+
     fn find_hotspot(state: &SessionState, id: i32) -> &palace_room::Hotspot {
         state
             .room_desc
@@ -4048,17 +4828,21 @@ mod tests {
         let mut state = session_in_room();
         let props = PropStore::new();
         assert_eq!(
-            visible_avatars(&state, &props).0.len(),
+            visible_avatars(&state, &props, 0).0.len(),
             1,
             "the user is drawn"
         );
         state.avatars_hidden = true;
         assert!(
-            visible_avatars(&state, &props).0.is_empty(),
+            visible_avatars(&state, &props, 0).0.is_empty(),
             "and now is not"
         );
         state.avatars_hidden = false;
-        assert_eq!(visible_avatars(&state, &props).0.len(), 1, "and back again");
+        assert_eq!(
+            visible_avatars(&state, &props, 0).0.len(),
+            1,
+            "and back again"
+        );
     }
 
     #[test]
@@ -4213,7 +4997,7 @@ mod tests {
         );
         assert!(state.avatars_hidden, "avatars off must reach the model");
         assert!(
-            visible_avatars(&state, builder.props()).0.is_empty(),
+            visible_avatars(&state, builder.props(), 0).0.is_empty(),
             "hidden avatars must leave the scene"
         );
         assert!(
@@ -4225,7 +5009,7 @@ mod tests {
         assert!(builder.name_tags_visible());
         assert!(!state.avatars_hidden);
         assert_eq!(
-            visible_avatars(&state, builder.props()).0.len(),
+            visible_avatars(&state, builder.props(), 0).0.len(),
             1,
             "showing again restores the avatar"
         );
@@ -4375,8 +5159,10 @@ mod tests {
             chat_seq: AtomicU64::new(0),
             debug_frames: false,
             last_room: Mutex::new(None),
+            pending_goto: Mutex::new(None),
             transform: Mutex::new(None),
             assets: Mutex::new(Arc::new(AssetFacts::default())),
+            asset_revision: AtomicU64::new(0),
             mouse: Mutex::new((0, 0)),
             room_size: Mutex::new((512.0, 384.0)),
         })
@@ -4496,8 +5282,9 @@ mod tests {
     /// Compose the session's frame into raw RGBA plus its bitmap width.
     fn composed_rgba(state: &SessionState, shared: &Arc<Shared>) -> (Vec<u8>, u32) {
         let mut builder = SceneBuilder::new(MediaStore::new(&[]), PropStore::new());
-        let screen =
-            compose(state, &mut builder, shared, Instant::now()).expect("a frame composes");
+        let mut cache = RenderCache::default();
+        let screen = compose(state, &mut builder, shared, Instant::now(), &mut cache)
+            .expect("a frame composes");
         let png = shared.frames.png().expect("the frame store holds a PNG");
         let decoder = png::Decoder::new(std::io::Cursor::new(png));
         let mut reader = decoder.read_info().expect("png info");
@@ -4572,6 +5359,161 @@ mod tests {
         });
         room.header.nbr_hotspots = room.hotspots.len() as i16;
         room
+    }
+
+    #[test]
+    fn removepic_through_the_apply_arm_drops_a_state() {
+        let mut state = state_in(&room_with_two_states(7));
+        let mut harness = harness();
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        let events = apply_effect(
+            &Effect::RemovePic {
+                spot: 7,
+                picture: 1,
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert!(dirty, "removing a picture dirties the frame");
+        assert_eq!(events.len(), 1, "REMOVEPIC reports one note");
+        let room = state.room_desc.as_ref().expect("a room");
+        let hotspot = room
+            .hotspots
+            .iter()
+            .find(|hotspot| i32::from(hotspot.id) == 7)
+            .expect("the hotspot");
+        assert_eq!(hotspot.states.len(), 1);
+        assert_eq!(hotspot.nbr_states, 1);
+    }
+
+    #[test]
+    fn pic_filters_are_recorded_in_state() {
+        let mut state = state_in(&room_with_two_states(7));
+        let mut harness = harness();
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        let _ = apply_effect(
+            &Effect::SetPicBrightness {
+                spot: 7,
+                state: 1,
+                value: 40,
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert_eq!(state.pic_brightness.get(&(7, 1)), Some(&40));
+        let _ = apply_effect(
+            &Effect::SetPicSaturation {
+                spot: 7,
+                state: 0,
+                value: -10,
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert_eq!(state.pic_saturation.get(&(7, 0)), Some(&-10));
+    }
+
+    #[test]
+    fn local_flags_are_recorded_in_state() {
+        let mut state = state_in(&scripted_room(&[(3, "")]));
+        let mut harness = harness();
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        for effect in [
+            Effect::HideSmileys,
+            Effect::LockUserProps,
+            Effect::AutoUserLayer { on: true },
+        ] {
+            let _ = apply_effect(
+                &effect,
+                &context,
+                &mut state,
+                &harness.shared,
+                &mut harness.conn,
+                &mut dirty,
+                &mut follow,
+            );
+        }
+        assert!(state.hide_smileys);
+        assert!(state.lock_user_props);
+        assert!(state.auto_user_layer);
+    }
+
+    #[test]
+    fn shellcmd_is_refused_and_reported() {
+        let mut state = state_in(&scripted_room(&[(3, "")]));
+        let mut harness = harness();
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        let events = apply_effect(
+            &Effect::ShellCommand {
+                command: "rm -rf /".to_owned(),
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(note_texts(&events)[0].contains("refused"));
+    }
+
+    #[test]
+    fn launchppa_and_talkppa_schedule_plugin_events() {
+        let mut state = state_in(&scripted_room(&[(3, "")]));
+        let mut harness = harness();
+        let context = pen_context();
+        let mut dirty = false;
+        let mut follow = Vec::new();
+        let _ = apply_effect(
+            &Effect::LaunchPpa {
+                ppa: "p".to_owned(),
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        let _ = apply_effect(
+            &Effect::TalkPpa {
+                text: "hi".to_owned(),
+            },
+            &context,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut follow,
+        );
+        assert_eq!(
+            follow,
+            vec![
+                (ScriptEvent::PpaMacro, None),
+                (ScriptEvent::PpaMessage, None),
+            ]
+        );
     }
 
     #[test]
@@ -5164,6 +6106,119 @@ mod tests {
     }
 
     #[test]
+    fn a_scripted_gotoroom_runs_on_leave_so_the_arena_gate_opens() {
+        // Menu shape (room 31743): the team hotspot leaves with a script
+        // `GOTOROOM`, and leaving records the chosen name.
+        let menu = scripted_room(&[
+            (17, "ON SELECT { 7790 GOTOROOM }"),
+            (16, "ON LEAVE { cname GLOBAL USERNAME cname = }"),
+        ]);
+        // Load shape (room 5009): the in-play flag is defined as a block.
+        let load = scripted_room(&[(8, "ON ENTER { in69 GLOBAL { \"\" SAY } in69 DEF }")]);
+        // Gate shape (room 7774 hotspot 102): proceed only when the name
+        // matches the recorded `cname` and the block-valued flag is not zero.
+        let arena = scripted_room(&[(
+            102,
+            "ON SELECT { cname GLOBAL in69 GLOBAL { 31747 GOTOROOM } \
+             { \"wrongo.wav\" SOUND } USERNAME cname == in69 0 == NOT AND IFELSE }",
+        )]);
+
+        let mut state = state_in(&menu);
+        state
+            .users
+            .get_mut(&HARNESS_SELF)
+            .expect("the self user is known")
+            .name = "Sprigg".to_string();
+        let mut harness = harness();
+        let mut scripts = ScriptEngine::with_palace_limits();
+        scripts.load_room(&menu);
+        let mut dirty = false;
+
+        let (events, fired) = run_event(
+            &mut scripts,
+            ScriptEvent::Select,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            Some(17),
+            0,
+        );
+        assert!(fired, "the menu hotspot's SELECT ran");
+        assert!(
+            note_texts(&events)
+                .iter()
+                .any(|text| text.contains("GOTOROOM 7790")),
+            "the team hotspot asked for the load room: {events:?}"
+        );
+
+        let room_id = harness
+            .shared
+            .take_pending_goto()
+            .expect("the scripted change is parked for the session loop");
+        let mut occupied = true;
+        request_room(
+            room_id,
+            &mut scripts,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            &mut occupied,
+        )
+        .expect("the parked change is applied");
+        assert!(
+            scripts
+                .globals_snapshot()
+                .iter()
+                .any(|(name, value)| name == "CNAME" && value.contains("Sprigg")),
+            "leaving the menu ran ON LEAVE and recorded the name: {:?}",
+            scripts.globals_snapshot()
+        );
+
+        scripts.load_room(&load);
+        state.room_desc = Some(load.clone());
+        run_event(
+            &mut scripts,
+            ScriptEvent::Enter,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            None,
+            0,
+        );
+
+        scripts.load_room(&arena);
+        state.room_desc = Some(arena.clone());
+        let (events, _) = run_event(
+            &mut scripts,
+            ScriptEvent::Select,
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty,
+            Some(102),
+            0,
+        );
+        assert!(
+            events.iter().any(|event| match event {
+                ClientEvent::Script { effects, .. } => effects
+                    .iter()
+                    .any(|effect| effect.contains("GOTOROOM 31747")),
+                _ => false,
+            }),
+            "the gate opened instead of refusing: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ClientEvent::Sound { name } if name == "wrongo.wav")),
+            "the gate did not refuse: {events:?}"
+        );
+    }
+
+    #[test]
     fn a_user_exit_runs_the_rooms_userleave_handler_but_not_for_us() {
         let room = scripted_room(&[(7, "ON USERLEAVE { \"userleave-ran\" STATUSMSG }")]);
         let mut scripts = ScriptEngine::with_palace_limits();
@@ -5498,6 +6553,120 @@ mod tests {
                 .iter()
                 .any(|text| text.contains("custo2.txt") && text.contains("404")),
             "the failure is reported with the URL and reason: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_global_enrolled_in_one_room_survives_a_fetch_in_the_next() {
+        let room_a = scripted_room(&[(
+            1,
+            "ON LEAVE { CLEARLOOSEPROPS cname GLOBAL USERNAME cname = 1 in69 GLOBAL in69 = }",
+        )]);
+        let room_b = scripted_room(&[(
+            102,
+            "ON SELECT { cname GLOBAL in69 GLOBAL { 31747 GOTOROOM } { \"wrongo.wav\" SOUND } USERNAME cname == in69 0 == NOT AND IFELSE }",
+        )]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        let mut state = state_in(&room_a);
+        let mut harness = harness();
+        let mut dirty_render = false;
+
+        scripts.load_room(&room_a);
+        dispatch_scripts(
+            &mut scripts,
+            &[ScriptStimulus {
+                event: ScriptEvent::Leave,
+                spot: None,
+            }],
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty_render,
+        );
+
+        scripts.load_room(&room_b);
+        fetch_outcome(
+            &mut scripts,
+            &mut state,
+            ScriptOutcome::Response {
+                requested: "custo2.txt".to_string(),
+                url: "http://media.example/custo2.txt".to_string(),
+                spot: 102,
+                body: b"but1 GLOBAL but2 GLOBAL".to_vec(),
+                content_type: Some("text/iptscrae".to_string()),
+            },
+        );
+
+        let report = scripts.fire_spot(ScriptEvent::Select, 102);
+        let effects: Vec<String> = report.effects.iter().map(Effect::to_string).collect();
+        assert_eq!(
+            effects,
+            vec!["GOTOROOM 31747".to_string()],
+            "room A's enrolled globals survive room B's fetched interface"
+        );
+    }
+
+    #[test]
+    fn a_self_exit_during_a_room_change_does_not_break_the_arena_enrollment() {
+        let room_a = scripted_room(&[(16, "ON LEAVE { cname GLOBAL USERNAME cname = }")]);
+        let room_b = scripted_room(&[(
+            102,
+            "ON SELECT { cname GLOBAL in69 GLOBAL { 31747 GOTOROOM } { \"wrongo.wav\" SOUND } USERNAME cname == in69 0 == NOT AND IFELSE }",
+        )]);
+
+        let mut scripts = ScriptEngine::with_palace_limits();
+        let mut state = state_in(&room_a);
+        let mut harness = harness();
+        let mut dirty_render = false;
+
+        scripts
+            .run_source("1 in69 GLOBAL in69 =")
+            .expect("the loading room enrolls the player");
+        scripts.load_room(&room_a);
+
+        dispatch_from_frame(
+            &mut scripts,
+            &mut state,
+            &mut harness,
+            &Frame::new(opcode::USEREXIT, HARNESS_SELF, Vec::new()),
+        );
+        dispatch_scripts(
+            &mut scripts,
+            &[ScriptStimulus {
+                event: ScriptEvent::Leave,
+                spot: None,
+            }],
+            &mut state,
+            &harness.shared,
+            &mut harness.conn,
+            &mut dirty_render,
+        );
+
+        state.users.insert(
+            HARNESS_SELF,
+            UserInfo {
+                id: HARNESS_SELF,
+                name: "Self".to_string(),
+                face: 0,
+                color: 0,
+                room_id: 0,
+                x: 0,
+                y: 0,
+                props: Vec::new(),
+                away: false,
+                is_self: true,
+            },
+        );
+        harness.shared.set_mouse(272, 364);
+
+        scripts.load_room(&room_b);
+        scripts.set_view(host_view(&state, &harness.shared));
+        let report = scripts.fire_spot(ScriptEvent::Select, 102);
+        let effects: Vec<String> = report.effects.iter().map(Effect::to_string).collect();
+        assert_eq!(
+            effects,
+            vec!["GOTOROOM 31747".to_string()],
+            "the self exit the server sends on a room change must not blank cname"
         );
     }
 }

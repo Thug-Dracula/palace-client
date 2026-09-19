@@ -45,6 +45,7 @@ pub mod fixture;
 pub mod frame;
 pub mod messages;
 pub mod opcode;
+pub mod registration;
 
 pub use byteorder::{AlignedPString, ByteOrder, Reader, Writer};
 pub use error::{Result, WireError, MAX_PAYLOAD_LEN};
@@ -52,3 +53,4 @@ pub use fixture::{CapturedFrame, Direction, Fixture};
 pub use frame::{is_room_desc_end, navr_frame, read_handshake, Frame, Handshake, HEADER_LEN};
 pub use messages::Message;
 pub use opcode::Opcode;
+pub use registration::RegistrationCode;

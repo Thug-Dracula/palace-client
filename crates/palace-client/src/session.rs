@@ -15,7 +15,12 @@ use palace_wire::frame::{read_handshake, Frame, Handshake, HEADER_LEN};
 use crate::error::{ClientError, Result};
 
 /// How long a single non-blocking read waits before returning empty.
-pub const POLL_SLICE: Duration = Duration::from_millis(40);
+///
+/// This is also the worst-case delay before a click command is picked up (the
+/// loop only drains commands between reads) and before a locally-predicted move
+/// is composed, so it is deliberately short: 10 ms keeps input feeling
+/// immediate without busy-spinning the network thread.
+pub const POLL_SLICE: Duration = Duration::from_millis(10);
 
 /// An open connection to a pserver.
 #[derive(Debug)]

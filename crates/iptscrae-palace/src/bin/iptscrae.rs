@@ -3,7 +3,7 @@
 //! ```text
 //! iptscrae run   <file> [--handler NAME] [--dialect D] [--seed N] [--trace]
 //! iptscrae eval  "<source>"
-//! iptscrae corpus <dir> [--dialect D] [--seed N] [--examples N]
+//! iptscrae corpus <dir> [--dialect D] [--seed N] [--examples N] [--real-host]
 //! ```
 //!
 //! `run` and `eval` execute a script against the skeleton host and print the
@@ -17,9 +17,15 @@
 //! isolating each file, which is how a real session behaves: scripts that read a
 //! global another script in the room set can then run.
 //!
+//! `--real-host` selects the live `palace_host::ScriptEngine` dispatch instead
+//! of the skeleton host, which is the honest measure of Palace compatibility.
+//! This crate cannot link `palace-host` (that crate depends on this one), so the
+//! live walk lives in the `palace-host` test harness and the flag delegates to
+//! it through `cargo test -p palace-host --test real_corpus`.
+//!
 //! The skeleton host implements no Palace command: it consumes the documented
-//! operands and pushes neutral defaults. So `corpus` measures the VM core, not
-//! Palace semantics.
+//! operands and pushes neutral defaults. So plain `corpus` measures the VM core,
+//! not Palace semantics.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -60,8 +66,12 @@ USAGE:
   iptscrae run    <file> [--handler NAME] [--dialect D] [--seed N] [--trace]
   iptscrae eval   \"<source>\"
   iptscrae corpus <dir>  [--dialect D] [--seed N] [--examples N] [--shared-globals]
+                         [--real-host]
 
-DIALECTS: windows (256) | palacechat (1024, default) | openpalace (2048)"
+DIALECTS: windows (256) | palacechat (1024, default) | openpalace (2048)
+
+--real-host runs the harvested corpus through palace_host::ScriptEngine (the
+live Palace dispatch) instead of the skeleton host."
     );
 }
 
@@ -243,6 +253,9 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
         eprintln!("corpus: missing <dir>");
         return ExitCode::FAILURE;
     };
+    if args.iter().any(|arg| arg == "--real-host") {
+        return cmd_corpus_real(args);
+    }
     let mut dialect = StackDialect::PalaceChat;
     let mut seed = 0u64;
     let mut examples = 12usize;
@@ -462,6 +475,60 @@ fn cmd_corpus(args: &[String]) -> ExitCode {
 
     print!("{report}");
     ExitCode::SUCCESS
+}
+
+fn cmd_corpus_real(args: &[String]) -> ExitCode {
+    let Some(dir) = args.first() else {
+        eprintln!("corpus: missing <dir>");
+        return ExitCode::FAILURE;
+    };
+    let mut shared_globals = false;
+    let mut examples = 12usize;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--shared-globals" => shared_globals = true,
+            "--examples" => {
+                index += 1;
+                examples = args.get(index).and_then(|s| s.parse().ok()).unwrap_or(12);
+            }
+            "--real-host" => {}
+            other => eprintln!("corpus: ignoring unknown argument {other:?}"),
+        }
+        index += 1;
+    }
+
+    eprintln!(
+        "corpus --real-host: iptscrae-palace cannot link palace-host (palace-host \
+         depends on it), so the live walk lives in the palace-host test harness \
+         and this delegates: cargo test -p palace-host --test real_corpus"
+    );
+    let status = std::process::Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "palace-host",
+            "--test",
+            "real_corpus",
+            "--",
+            "--nocapture",
+        ])
+        .env("IPTSCRAE_CORPUS", dir)
+        .env("IPTSCRAE_CORPUS_REPORT_ONLY", "1")
+        .env(
+            "IPTSCRAE_CORPUS_SHARED_GLOBALS",
+            if shared_globals { "1" } else { "0" },
+        )
+        .env("IPTSCRAE_CORPUS_EXAMPLES", examples.to_string())
+        .status();
+    match status {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(error) => {
+            eprintln!("corpus --real-host: cannot run cargo: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn percent(part: u64, whole: u64) -> f64 {

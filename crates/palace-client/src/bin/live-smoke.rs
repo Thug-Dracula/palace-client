@@ -6,7 +6,11 @@
 //! PALACE_USER=Smoke cargo run -p palace-client --bin live-smoke
 //! PALACE_SMOKE_SECS=15 PALACE_SMOKE_ROOM=817 cargo run -p palace-client --bin live-smoke
 //! PALACE_DEBUG_FRAMES=1 cargo run -p palace-client --bin live-smoke
+//! PALACE_SMOKE_SAY=1 cargo run -p palace-client --bin live-smoke
 //! ```
+//!
+//! The harness stays silent in chat by default. With `PALACE_SMOKE_SAY=1` set
+//! it sends the single word `test`; every other phase runs either way.
 
 use std::time::{Duration, Instant};
 
@@ -78,6 +82,7 @@ async fn pump_for(
     clicked: &mut bool,
 ) {
     let deadline = tokio::time::Instant::now() + limit;
+    let mut self_known = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -93,9 +98,14 @@ async fn pump_for(
                         *switched = true;
                     }
                 }
+                if let ClientEvent::Users { users } = &event {
+                    self_known |= users.iter().any(|user| user.is_self);
+                }
                 if let ClientEvent::Screen { screen } = &event {
                     let in_target = target == 0 || screen.room_id == target;
-                    if let (Some((rx, ry)), false, true) = (click_room, *clicked, in_target) {
+                    if let (Some((rx, ry)), false, true, true) =
+                        (click_room, *clicked, in_target, self_known)
+                    {
                         let g = &screen.geometry;
                         let vx = g.content_x + rx * g.scale;
                         let vy = g.content_y + ry * g.scale;
@@ -160,6 +170,155 @@ async fn sweep_viewports(
     }
 }
 
+/// One action in `PALACE_SMOKE_STEPS`, so a live route can be replayed.
+enum Step {
+    /// `room:<id>`: request a goto and wait for the arrival.
+    Goto(i32),
+    /// `click:<x>,<y>`: click the next frame in the room coordinate space.
+    Click(f64, f64),
+    /// `script:<text>`: run a script body through the input path.
+    Script(String),
+    /// `wait:<secs>`: let the session run before the next step.
+    Wait(u64),
+}
+
+enum Awaiting {
+    Room(i32),
+    Screen,
+    Delay(tokio::time::Instant),
+}
+
+/// Parse `PALACE_SMOKE_STEPS` — `;`-separated `kind:argument` steps.
+fn parse_steps() -> Vec<Step> {
+    let Ok(spec) = std::env::var("PALACE_SMOKE_STEPS") else {
+        return Vec::new();
+    };
+    spec.split(';').filter_map(parse_step).collect()
+}
+
+fn parse_step(raw: &str) -> Option<Step> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (kind, arg) = raw.split_once(':')?;
+    match kind.trim() {
+        "room" => arg.trim().parse().ok().map(Step::Goto),
+        "click" => {
+            let (x, y) = arg.split_once(',')?;
+            Some(Step::Click(x.trim().parse().ok()?, y.trim().parse().ok()?))
+        }
+        "script" => Some(Step::Script(arg.to_string())),
+        "wait" => arg.trim().parse().ok().map(Step::Wait),
+        _ => None,
+    }
+}
+
+/// Run the steps in order, reporting every event as it arrives.
+async fn run_steps(
+    stream: &mut palace_client::ClientEventStream,
+    handle: &ClientHandle,
+    steps: &[Step],
+    limit: Duration,
+) {
+    let overall = tokio::time::Instant::now() + limit;
+    let mut room = 0i32;
+    let mut click_origin: Option<(f64, f64, f64)> = None;
+    let mut index = 0usize;
+    let mut awaiting: Option<Awaiting> = None;
+
+    while index < steps.len() {
+        if let Some(Awaiting::Delay(deadline)) = awaiting {
+            if tokio::time::Instant::now() >= deadline {
+                awaiting = None;
+            }
+        }
+        if awaiting.is_none() {
+            match &steps[index] {
+                Step::Goto(id) => {
+                    if room == *id {
+                        println!("[step] already in #{id}");
+                    } else {
+                        println!("[step] goto #{id}");
+                        handle.goto_room(*id);
+                        awaiting = Some(Awaiting::Room(*id));
+                    }
+                }
+                Step::Click(x, y) => {
+                    let Some((content_x, content_y, scale)) = click_origin else {
+                        awaiting = Some(Awaiting::Screen);
+                        continue;
+                    };
+                    let vx = content_x + x * scale;
+                    let vy = content_y + y * scale;
+                    println!("[step] click ({x},{y}) = viewport ({vx:.1},{vy:.1})");
+                    handle.click(vx, vy);
+                    awaiting = Some(Awaiting::Screen);
+                }
+                Step::Script(text) => {
+                    println!("[step] script {text:?}");
+                    handle.run_script(text.clone());
+                    awaiting = Some(Awaiting::Screen);
+                }
+                Step::Wait(secs) => {
+                    println!("[step] wait {secs}s");
+                    awaiting = Some(Awaiting::Delay(
+                        tokio::time::Instant::now() + Duration::from_secs(*secs),
+                    ));
+                }
+            }
+            index += 1;
+            continue;
+        }
+
+        let now = tokio::time::Instant::now();
+        let deadline = match awaiting {
+            Some(Awaiting::Delay(at)) => at.min(overall),
+            _ => overall,
+        };
+        if now >= deadline {
+            if matches!(awaiting, Some(Awaiting::Delay(_))) {
+                awaiting = None;
+                continue;
+            }
+            println!("[step] timeout with {} step(s) left", steps.len() - index);
+            return;
+        }
+        match tokio::time::timeout(deadline - now, stream.recv()).await {
+            Ok(Some(event)) => {
+                report(&event);
+                match &event {
+                    ClientEvent::RoomEntered { room: entered } => {
+                        room = entered.id;
+                        click_origin = None;
+                        if matches!(awaiting, Some(Awaiting::Room(id)) if id == room) {
+                            awaiting = None;
+                        }
+                    }
+                    ClientEvent::Screen { screen } if screen.room_id == room => {
+                        let g = &screen.geometry;
+                        click_origin = Some((g.content_x, g.content_y, g.scale));
+                        if matches!(awaiting, Some(Awaiting::Screen)) {
+                            awaiting = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => return,
+            Err(_) => {
+                if matches!(awaiting, Some(Awaiting::Delay(_))) {
+                    awaiting = None;
+                } else {
+                    println!("[step] timeout with {} step(s) left", steps.len() - index);
+                    return;
+                }
+            }
+        }
+    }
+    println!("[step] all {} step(s) done", steps.len());
+}
+
 fn main() {
     let cfg = ClientConfig {
         host: env_or("PALACE_HOST", "localhost"),
@@ -180,6 +339,16 @@ fn main() {
     );
 
     let (handle, mut stream) = ClientRuntime::spawn(cfg);
+    if let Ok(spec) = std::env::var("PALACE_VIEWPORT") {
+        let parts: Vec<f64> = spec
+            .split(',')
+            .filter_map(|part| part.trim().parse().ok())
+            .collect();
+        if let [width, height, dpr] = parts.as_slice() {
+            handle.set_viewport(*width, *height, *dpr, 1.0, false);
+            println!("[viewport] {width}x{height} dpr={dpr}");
+        }
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -187,15 +356,25 @@ fn main() {
 
     let mut switched = false;
     let mut clicked = false;
-    runtime.block_on(pump_for(
-        &mut stream,
-        &handle,
-        Duration::from_secs(seconds),
-        target,
-        &mut switched,
-        click_room,
-        &mut clicked,
-    ));
+    let steps = parse_steps();
+    if steps.is_empty() {
+        runtime.block_on(pump_for(
+            &mut stream,
+            &handle,
+            Duration::from_secs(seconds),
+            target,
+            &mut switched,
+            click_room,
+            &mut clicked,
+        ));
+    } else {
+        runtime.block_on(run_steps(
+            &mut stream,
+            &handle,
+            &steps,
+            Duration::from_secs(seconds),
+        ));
+    }
     runtime.block_on(pump_for(
         &mut stream,
         &handle,
@@ -251,7 +430,9 @@ fn main() {
         }
     }
 
-    handle.say("live-smoke ping");
+    if env_or("PALACE_SMOKE_SAY", "0") == "1" {
+        handle.say("test");
+    }
     std::thread::sleep(Duration::from_millis(1500));
     runtime.block_on(pump_for(
         &mut stream,

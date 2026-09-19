@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use palace_prop::{decode, decode_header, PropHeader, PropImage, HEADER_LEN};
 
@@ -65,6 +66,10 @@ pub fn decode_prop_blob(bytes: &[u8]) -> Result<PropImage, String> {
 #[derive(Debug, Default)]
 pub struct MediaStore {
     by_name: HashMap<String, PathBuf>,
+    /// Decoded images, keyed by resolved file name. A room re-composites on
+    /// every click and every incoming frame, so re-reading and re-decoding the
+    /// background and overlays from disk each time dominated the frame.
+    images: Mutex<HashMap<String, PropImage>>,
 }
 
 impl MediaStore {
@@ -77,7 +82,10 @@ impl MediaStore {
         for root in roots {
             index_dir(root, &mut by_name);
         }
-        MediaStore { by_name }
+        MediaStore {
+            by_name,
+            images: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Number of indexed file names.
@@ -122,7 +130,7 @@ impl MediaStore {
         None
     }
 
-    /// Resolve and decode a named image.
+    /// Resolve and decode a named image, reusing the decode across frames.
     pub fn load(&self, name: &str) -> Result<PropImage, RenderError> {
         let Some(path) = self.resolve(name) else {
             return Err(RenderError::BackgroundDecode {
@@ -130,11 +138,25 @@ impl MediaStore {
                 detail: "not present in any media root".to_string(),
             });
         };
+        let key = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(name)
+            .to_ascii_lowercase();
+        if let Ok(cache) = self.images.lock() {
+            if let Some(image) = cache.get(&key) {
+                return Ok(image.clone());
+            }
+        }
         let bytes = std::fs::read(path).map_err(RenderError::Io)?;
-        decode_image_bytes(&bytes).map_err(|detail| RenderError::BackgroundDecode {
+        let image = decode_image_bytes(&bytes).map_err(|detail| RenderError::BackgroundDecode {
             file: name.to_string(),
             detail,
-        })
+        })?;
+        if let Ok(mut cache) = self.images.lock() {
+            cache.insert(key, image.clone());
+        }
+        Ok(image)
     }
 
     /// Register a file fetched after the store was built, keyed like [`MediaStore::new`].
@@ -151,6 +173,9 @@ impl MediaStore {
             .to_ascii_lowercase();
         let existed = self.by_name.contains_key(&base);
         self.by_name.insert(base, path);
+        if let Ok(mut cache) = self.images.lock() {
+            cache.clear();
+        }
         existed
     }
 }
@@ -202,6 +227,10 @@ enum PropBackend {
 pub struct PropStore {
     blobs: HashMap<u32, PropBackend>,
     entries: Vec<(u32, PropBackend)>,
+    /// Decoded props, keyed by asset id. Every avatar and loose prop re-decodes
+    /// on every composite without this; the decode is the expensive half of the
+    /// prop lookup.
+    decoded: Mutex<HashMap<u32, DecodedProp>>,
 }
 
 impl PropStore {
@@ -297,6 +326,9 @@ impl PropStore {
     fn insert(&mut self, id: u32, backend: PropBackend) {
         self.entries.push((id, backend.clone()));
         self.blobs.insert(id, backend);
+        if let Ok(mut cache) = self.decoded.lock() {
+            cache.remove(&id);
+        }
     }
 
     /// Number of prop ids in the store.
@@ -388,18 +420,29 @@ impl PropStore {
     /// This is the one place the "a missing prop is a placeholder, not a crash"
     /// policy is enforced.
     pub fn prop_or_placeholder(&self, id: u32, notes: &mut Vec<AssetNote>) -> DecodedProp {
+        if let Ok(cache) = self.decoded.lock() {
+            if let Some(prop) = cache.get(&id) {
+                return prop.clone();
+            }
+        }
         let Some(bytes) = self.blob(id) else {
             notes.push(AssetNote::MissingProp { id });
             return DecodedProp::placeholder(id);
         };
         match decode(&bytes) {
-            Ok(prop) => DecodedProp {
-                image: prop.image,
-                alpha: if prop.header.is_ghost() { 0.5 } else { 1.0 },
-                h_offset: prop.header.h_offset,
-                v_offset: prop.header.v_offset,
-                is_head: prop.header.is_head(),
-            },
+            Ok(prop) => {
+                let decoded = DecodedProp {
+                    image: prop.image,
+                    alpha: if prop.header.is_ghost() { 0.5 } else { 1.0 },
+                    h_offset: prop.header.h_offset,
+                    v_offset: prop.header.v_offset,
+                    is_head: prop.header.is_head(),
+                };
+                if let Ok(mut cache) = self.decoded.lock() {
+                    cache.insert(id, decoded.clone());
+                }
+                decoded
+            }
             Err(err) => {
                 notes.push(AssetNote::BadProp {
                     id,

@@ -25,6 +25,8 @@ use std::fmt;
 pub enum ScriptEvent {
     /// `SIGNON` — the client signed on to the server.
     SignOn,
+    /// `SIGNOFF` — the client is signing off or lost the connection.
+    SignOff,
     /// `ENTER` — you entered the room the script lives in.
     Enter,
     /// `LEAVE` — you left that room.
@@ -61,8 +63,14 @@ pub enum ScriptEvent {
     HttpError,
     /// `USERLEAVE` — a user left the room.
     UserLeave,
+    /// `USERENTER` — a user entered the room.
+    UserEnter,
     /// `STATECHANGE` — a spot changed state.
     StateChange,
+    /// `PROPCHANGE` — a user's worn props changed.
+    PropChange,
+    /// `MOUSEDOWN` — a mouse button was pressed over the room.
+    MouseDown,
     /// `MOUSEUP` — a mouse button was released over the room.
     MouseUp,
     /// `MOUSEDRAG` — the pointer moved with a button held.
@@ -71,6 +79,12 @@ pub enum ScriptEvent {
     MouseMove,
     /// `DOCURL` — a URL was opened.
     DocUrl,
+    /// `PPA_MACRO` — a Palace plugin macro ran (`LAUNCHPPA`).
+    PpaMacro,
+    /// `PPA_MESSAGE` — text was sent to a Palace plugin (`TALKPPA`).
+    PpaMessage,
+    /// `UNHANDLED` — an event no handler claimed.
+    Unhandled,
     /// `MACRO0` … `MACRO9` — an avatar macro key.
     Macro(u8),
     /// `ON 0` … `ON 9` — a numeric handler (an avatar macro slot).
@@ -83,6 +97,7 @@ impl ScriptEvent {
     pub fn handler_name(self) -> String {
         match self {
             ScriptEvent::SignOn => "SIGNON".to_owned(),
+            ScriptEvent::SignOff => "SIGNOFF".to_owned(),
             ScriptEvent::Enter => "ENTER".to_owned(),
             ScriptEvent::Leave => "LEAVE".to_owned(),
             ScriptEvent::Select => "SELECT".to_owned(),
@@ -101,11 +116,17 @@ impl ScriptEvent {
             ScriptEvent::HttpReceived => "HTTPRECEIVED".to_owned(),
             ScriptEvent::HttpError => "HTTPERROR".to_owned(),
             ScriptEvent::UserLeave => "USERLEAVE".to_owned(),
+            ScriptEvent::UserEnter => "USERENTER".to_owned(),
             ScriptEvent::StateChange => "STATECHANGE".to_owned(),
+            ScriptEvent::PropChange => "PROPCHANGE".to_owned(),
+            ScriptEvent::MouseDown => "MOUSEDOWN".to_owned(),
             ScriptEvent::MouseUp => "MOUSEUP".to_owned(),
             ScriptEvent::MouseDrag => "MOUSEDRAG".to_owned(),
             ScriptEvent::MouseMove => "MOUSEMOVE".to_owned(),
             ScriptEvent::DocUrl => "DOCURL".to_owned(),
+            ScriptEvent::PpaMacro => "PPA_MACRO".to_owned(),
+            ScriptEvent::PpaMessage => "PPA_MESSAGE".to_owned(),
+            ScriptEvent::Unhandled => "UNHANDLED".to_owned(),
             ScriptEvent::Macro(n) => format!("MACRO{}", n.min(9)),
             ScriptEvent::Number(n) => (n % 10).to_string(),
         }
@@ -122,6 +143,7 @@ impl ScriptEvent {
     pub fn vocabulary() -> Vec<ScriptEvent> {
         let mut out = vec![
             ScriptEvent::SignOn,
+            ScriptEvent::SignOff,
             ScriptEvent::Enter,
             ScriptEvent::Leave,
             ScriptEvent::Select,
@@ -140,11 +162,17 @@ impl ScriptEvent {
             ScriptEvent::HttpReceived,
             ScriptEvent::HttpError,
             ScriptEvent::UserLeave,
+            ScriptEvent::UserEnter,
             ScriptEvent::StateChange,
+            ScriptEvent::PropChange,
+            ScriptEvent::MouseDown,
             ScriptEvent::MouseUp,
             ScriptEvent::MouseDrag,
             ScriptEvent::MouseMove,
             ScriptEvent::DocUrl,
+            ScriptEvent::PpaMacro,
+            ScriptEvent::PpaMessage,
+            ScriptEvent::Unhandled,
         ];
         for n in 0..10 {
             out.push(ScriptEvent::Macro(n));
@@ -208,12 +236,19 @@ mod tests {
             "LOCK",
             "HTTPRECEIVED",
             "SIGNON",
+            "SIGNOFF",
             "USERLEAVE",
+            "USERENTER",
             "STATECHANGE",
+            "PROPCHANGE",
+            "MOUSEDOWN",
             "MOUSEUP",
             "MOUSEDRAG",
             "HTTPERROR",
             "MOUSEMOVE",
+            "PPA_MACRO",
+            "PPA_MESSAGE",
+            "UNHANDLED",
             "0",
             "1",
             "2",

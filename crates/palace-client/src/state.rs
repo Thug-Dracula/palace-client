@@ -14,7 +14,7 @@ use palace_render::{DrawList, RoomDesc};
 use palace_room::{LooseProp, LoosePropSpec};
 use palace_wire::byteorder::ByteOrder;
 use palace_wire::frame::{navr_frame, Frame};
-use palace_wire::messages::{self, authresponse_frame, AssetSpec, Message, Point};
+use palace_wire::messages::{self, authresponse_frame, AssetSpec, Message, Point, UserRec};
 use palace_wire::opcode;
 use serde::Serialize;
 
@@ -133,6 +133,34 @@ pub struct Applied {
     pub disconnect: Option<messages::ServerDown>,
 }
 
+/// How long a remote avatar takes to glide from one reported position to the
+/// next. The server sends chunky position updates; the renderer samples this
+/// window so other players slide instead of jumping. The local user is never
+/// glided — the client is authoritative for its own avatar and applies a click
+/// at once.
+pub const MOVE_GLIDE_MS: u64 = 120;
+
+/// One remote avatar's in-flight glide between two reported positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Motion {
+    from: (i16, i16),
+    to: (i16, i16),
+    start_ms: u64,
+}
+
+impl Motion {
+    /// The position `now_ms` into the glide, clamped to the two endpoints.
+    fn at(&self, now_ms: u64) -> (i16, i16) {
+        let window = MOVE_GLIDE_MS.max(1);
+        let elapsed = now_ms.saturating_sub(self.start_ms).min(window);
+        let t = elapsed as f64 / window as f64;
+        let lerp = |a: i16, b: i16| -> i16 {
+            (f64::from(a) + (f64::from(b) - f64::from(a)) * t).round() as i16
+        };
+        (lerp(self.from.0, self.to.0), lerp(self.from.1, self.to.1))
+    }
+}
+
 /// The sign-in name and password used to answer an `auth` challenge.
 #[derive(Debug)]
 struct Credential {
@@ -149,13 +177,27 @@ pub struct SessionState {
     pub users: BTreeMap<i32, UserInfo>,
     pub room_users: Vec<i32>,
     pub current_room: Option<RoomInfo>,
+    /// The room a `navR` is leaving, remembered until the destination's
+    /// descriptor arrives. A refused change (`sErr`) restores it, so a dead
+    /// door cannot strand the session with no room and no hotspots.
+    previous_room: Option<RoomInfo>,
     pub room_desc: Option<RoomDesc>,
     /// Client-side `DIMROOM` level for the current room; `1.0` is undimmed.
     pub room_dim: f64,
     /// Client-side `HIDEAVATARS` flag; entering a room clears it.
     pub avatars_hidden: bool,
+    /// Client-side `HIDESMILEYS` flag.
+    pub hide_smileys: bool,
+    /// Client-side `LOCKUSERPROPS` flag.
+    pub lock_user_props: bool,
+    /// Client-side `AUTOUSERLAYER` flag.
+    pub auto_user_layer: bool,
     /// Client-side `SETPICOPACITY`, keyed by hotspot id and state index.
     pub pic_opacity: BTreeMap<(i16, i16), f64>,
+    /// Client-side `SETPICBRIGHTNESS`, keyed by hotspot id and state index.
+    pub pic_brightness: BTreeMap<(i16, i16), i32>,
+    /// Client-side `SETPICSATURATION`, keyed by hotspot id and state index.
+    pub pic_saturation: BTreeMap<(i16, i16), i32>,
     /// The hover tooltip text a script set with `SETTOOLTIP`, or `None` after
     /// `CLEARTOOLTIP`. Local-only: it is never sent to the server.
     pub tooltip: Option<String>,
@@ -173,11 +215,18 @@ pub struct SessionState {
     /// the spot and the main loop drains it. Cleared on room change, like
     /// `pending_fetches`, so a left room's spot cannot name the new room's.
     pub pending_spot_scripts: Vec<i32>,
+    /// Prop ids a `LOADPROPS` asked the client to preload. The runtime unions
+    /// them with the room's props when it queues asset requests, so a later
+    /// `DONPROP` does not have to wait on a fresh fetch. Cleared on room change.
+    pub pending_prop_loads: Vec<u32>,
     pub chat: Vec<ChatLine>,
     chat_seq: u64,
     last_error: Option<String>,
     /// The credential that answers an `auth` challenge, when one is configured.
     credential: Option<Credential>,
+    /// Remote avatars' in-flight movement glides, keyed by user id. The local
+    /// user is never animated here: its position is applied on click.
+    motion: BTreeMap<i32, Motion>,
 }
 
 impl SessionState {
@@ -195,19 +244,27 @@ impl SessionState {
             users: BTreeMap::new(),
             room_users: Vec::new(),
             current_room: None,
+            previous_room: None,
             room_desc: None,
             room_dim: 1.0,
             avatars_hidden: false,
+            hide_smileys: false,
+            lock_user_props: false,
+            auto_user_layer: false,
             pic_opacity: BTreeMap::new(),
+            pic_brightness: BTreeMap::new(),
+            pic_saturation: BTreeMap::new(),
             tooltip: None,
             draw: DrawList::new(),
             pending_fetches: Vec::new(),
             pending_fetch_room: None,
             pending_spot_scripts: Vec::new(),
+            pending_prop_loads: Vec::new(),
             chat: Vec::new(),
             chat_seq: 0,
             last_error: None,
             credential: None,
+            motion: BTreeMap::new(),
         }
     }
 
@@ -273,17 +330,52 @@ impl SessionState {
             .unwrap_or_else(|| format!("user #{user_id}"))
     }
 
+    fn user_info_from_record(&self, rec: &UserRec) -> UserInfo {
+        let record_props: Vec<u32> = rec
+            .prop_spec
+            .iter()
+            .take(rec.nbr_props.clamp(0, 9) as usize)
+            .map(|spec| spec.id)
+            .filter(|id| *id > 0)
+            .map(|id| id as u32)
+            .collect();
+        // A worn list we authored (`PalaceUser.setProps` sends it through
+        // `updatePropsOnServer`) outranks the record: the server's snapshot can
+        // predate a room script's `SETPROPS` and would otherwise undress us on
+        // entry. An empty local list claims nothing, so the record fills it in.
+        let props = match self.users.get(&rec.user_id) {
+            Some(local) if rec.user_id == self.banner.user_id && !local.props.is_empty() => {
+                local.props.clone()
+            }
+            _ => record_props,
+        };
+        UserInfo {
+            id: rec.user_id,
+            name: rec.name.clone(),
+            face: rec.face_nbr,
+            color: rec.color_nbr,
+            room_id: rec.room_id,
+            x: rec.room_pos.h,
+            y: rec.room_pos.v,
+            props,
+            away: rec.away_flag != 0,
+            is_self: rec.user_id == self.banner.user_id,
+        }
+    }
+
     /// Reset per-room state before entering a new room.
     pub fn begin_room_change(&mut self) {
         self.room_users.clear();
         self.room_desc = None;
-        self.current_room = None;
+        self.previous_room = self.current_room.take();
         // Paint is room state: leaving must not leave another room's strokes on
         // the canvas. The arriving room seeds its own list instead.
         self.draw = DrawList::new();
         self.pending_fetches.clear();
         self.pending_fetch_room = None;
         self.pending_spot_scripts.clear();
+        self.pending_prop_loads.clear();
+        self.motion.clear();
     }
 
     /// Start the draw list from a room's own stored commands.
@@ -382,10 +474,16 @@ impl SessionState {
                 applied.rooms = true;
             }
             Message::UserList(list) => {
-                if frame.opcode == opcode::USERLIST {
-                    self.room_users = list.users.iter().map(|u| u.user_id).collect();
-                    for rec in &list.users {
-                        let entry = self.users.entry(rec.user_id).or_insert_with(|| UserInfo {
+                for rec in &list.users {
+                    self.users
+                        .entry(rec.user_id)
+                        .and_modify(|u| {
+                            if !rec.name.is_empty() {
+                                u.name = rec.name.clone();
+                            }
+                            u.room_id = rec.room_id;
+                        })
+                        .or_insert_with(|| UserInfo {
                             id: rec.user_id,
                             name: rec.name.clone(),
                             face: 0,
@@ -397,94 +495,81 @@ impl SessionState {
                             away: false,
                             is_self: rec.user_id == self.banner.user_id,
                         });
-                        if !rec.name.is_empty() {
-                            entry.name = rec.name.clone();
-                        }
-                        entry.room_id = rec.room_id;
-                        entry.is_self = rec.user_id == self.banner.user_id;
-                    }
-                    self.merge_room_users();
-                    applied.users = true;
-                } else {
-                    for rec in &list.users {
-                        self.users
-                            .entry(rec.user_id)
-                            .and_modify(|u| {
-                                if !rec.name.is_empty() {
-                                    u.name = rec.name.clone();
-                                }
-                                u.room_id = rec.room_id;
-                            })
-                            .or_insert_with(|| UserInfo {
-                                id: rec.user_id,
-                                name: rec.name.clone(),
-                                face: 0,
-                                color: 0,
-                                room_id: rec.room_id,
-                                x: 0,
-                                y: 0,
-                                props: Vec::new(),
-                                away: false,
-                                is_self: rec.user_id == self.banner.user_id,
-                            });
-                    }
-                    applied.users = true;
                 }
+                applied.users = true;
             }
-            Message::UserNew(new) => {
-                let rec = &new.record;
-                let props: Vec<u32> = rec
-                    .prop_spec
-                    .iter()
-                    .take(rec.nbr_props.clamp(0, 9) as usize)
-                    .map(|spec| spec.id)
-                    .filter(|id| *id > 0)
-                    .map(|id| id as u32)
-                    .collect();
-                let entry = UserInfo {
-                    id: rec.user_id,
-                    name: rec.name.clone(),
-                    face: rec.face_nbr,
-                    color: rec.color_nbr,
-                    room_id: rec.room_id,
-                    x: rec.room_pos.h,
-                    y: rec.room_pos.v,
-                    props,
-                    away: rec.away_flag != 0,
-                    is_self: rec.user_id == self.banner.user_id,
-                };
-                if frame.opcode == opcode::USERNEW {
-                    self.users.insert(rec.user_id, entry);
-                    if !self.room_users.contains(&rec.user_id) {
-                        self.room_users.push(rec.user_id);
-                    }
-                } else {
+            Message::RoomUsers(list) => {
+                self.room_users = list.users.iter().map(|u| u.user_id).collect();
+                for rec in &list.users {
+                    let entry = self.user_info_from_record(rec);
                     self.users.insert(rec.user_id, entry);
                 }
                 self.merge_room_users();
                 applied.users = true;
                 applied.render = true;
             }
-            Message::UserMove(mv) => {
-                let name = self.name_of(mv.user_id);
-                let entry = self.users.entry(mv.user_id).or_insert_with(|| UserInfo {
-                    id: mv.user_id,
-                    name,
-                    face: 0,
-                    color: 0,
-                    room_id: 0,
-                    x: mv.position.h,
-                    y: mv.position.v,
-                    props: Vec::new(),
-                    away: false,
-                    is_self: mv.user_id == self.banner.user_id,
-                });
-                entry.x = mv.position.h;
-                entry.y = mv.position.v;
+            Message::UserNew(new) => {
+                let rec = &new.record;
+                let entry = self.user_info_from_record(rec);
+                self.users.insert(rec.user_id, entry);
+                if !self.room_users.contains(&rec.user_id) {
+                    self.room_users.push(rec.user_id);
+                }
+                self.merge_room_users();
+                applied.users = true;
                 applied.render = true;
+                if rec.user_id != self.banner.user_id {
+                    applied.scripts.push(ScriptStimulus {
+                        event: ScriptEvent::UserEnter,
+                        spot: None,
+                    });
+                }
+            }
+            Message::UserMove(mv) => {
+                if mv.user_id == self.banner.user_id {
+                    // The client already moved its own avatar when the click
+                    // was made; only redraw when the server genuinely disagrees
+                    // with the predicted position.
+                    let reconciled = self.reconcile_self_move(mv.position.h, mv.position.v);
+                    if crate::trace::enabled() {
+                        crate::trace::state(&format!(
+                            "self_move echo id={} at=({},{}) redrew={reconciled}",
+                            mv.user_id, mv.position.h, mv.position.v
+                        ));
+                    }
+                    if reconciled {
+                        applied.render = true;
+                    }
+                } else {
+                    let name = self.name_of(mv.user_id);
+                    let entry = self.users.entry(mv.user_id).or_insert_with(|| UserInfo {
+                        id: mv.user_id,
+                        name,
+                        face: 0,
+                        color: 0,
+                        room_id: 0,
+                        x: mv.position.h,
+                        y: mv.position.v,
+                        props: Vec::new(),
+                        away: false,
+                        is_self: false,
+                    });
+                    entry.x = mv.position.h;
+                    entry.y = mv.position.v;
+                    applied.render = true;
+                }
             }
             Message::UserExit(exit) => {
-                let was_known = self.users.remove(&exit.user_id).is_some();
+                // The server reports us leaving the room we came from as part
+                // of a room change, and `USERNAME` reads this very entry, so the
+                // self entry outlives the gap until the destination names us
+                // again. The room-scoped list still drops us, so the avatar is
+                // not drawn in the wrong room.
+                let was_known = if exit.user_id == self.banner.user_id {
+                    self.users.contains_key(&exit.user_id)
+                } else {
+                    self.users.remove(&exit.user_id).is_some()
+                };
                 self.room_users.retain(|id| *id != exit.user_id);
                 applied.users = true;
                 applied.render = true;
@@ -521,6 +606,12 @@ impl SessionState {
                 let changed = self.set_user_props(prop.user_id, &prop.props);
                 applied.users = changed;
                 applied.render = changed;
+                if changed {
+                    applied.scripts.push(ScriptStimulus {
+                        event: ScriptEvent::PropChange,
+                        spot: None,
+                    });
+                }
             }
             Message::UserDesc(desc) => {
                 let face = self.set_user_face(desc.user_id, desc.face_nbr);
@@ -529,6 +620,12 @@ impl SessionState {
                 if face || color || props {
                     applied.users = true;
                     applied.render = true;
+                }
+                if props {
+                    applied.scripts.push(ScriptStimulus {
+                        event: ScriptEvent::PropChange,
+                        spot: None,
+                    });
                 }
             }
             Message::PropNew(new) => {
@@ -645,6 +742,10 @@ impl SessionState {
                 applied
                     .chat
                     .push(self.system_line(ChatKind::Error, err.describe()));
+                if let Some(room) = self.previous_room.take() {
+                    applied.outbound.push(self.navigate_frame(room.id));
+                    self.current_room = Some(room);
+                }
             }
             Message::RoomDescription(_) => {
                 match palace_room::decode_payload(&frame.payload, order) {
@@ -661,10 +762,11 @@ impl SessionState {
                             users: room.header.nbr_people.max(0) as u16,
                             flags: room.header.room_flags,
                         });
-                        if arrived {
+                        if arrived || self.room_desc.is_none() {
                             self.load_room_draw(&room);
                         }
                         self.room_desc = Some(room);
+                        self.previous_room = None;
                         self.room_dim = 1.0;
                         self.avatars_hidden = false;
                         self.pic_opacity.clear();
@@ -729,6 +831,10 @@ impl SessionState {
             Message::ServerDown(down) => {
                 self.status = ConnectionStatus::Disconnected;
                 applied.disconnect = Some(down);
+                applied.scripts.push(ScriptStimulus {
+                    event: ScriptEvent::SignOff,
+                    spot: None,
+                });
             }
             Message::Unknown { opcode: op, .. } if op.is_known() => {
                 let line = self.system_line(
@@ -897,6 +1003,163 @@ impl SessionState {
         self.room_users.dedup();
     }
 
+    /// Apply the local user's own move to the model at once.
+    ///
+    /// The reference server relays our own `uLoc` only to the *other* users in
+    /// the room, so the client is authoritative for where its avatar is drawn.
+    /// The wire message still goes out alongside; it is simply not awaited.
+    /// Returns whether the position changed.
+    pub fn predict_self_move(&mut self, x: i32, y: i32) -> bool {
+        let id = self.banner.user_id;
+        if let Some(user) = self.users.get_mut(&id) {
+            let changed = user.x != x as i16 || user.y != y as i16;
+            user.x = x as i16;
+            user.y = y as i16;
+            return changed;
+        }
+        // The server has not named us in this room yet. Drop the move only if
+        // there is nowhere to draw it; otherwise insert ourselves so the click
+        // is applied and rendered now, and let the server's record reconcile it
+        // when it arrives.
+        let room_id = self.current_room.as_ref().map(|room| room.id as i16);
+        if room_id.is_none() {
+            return false;
+        }
+        let name = self.name_of(id);
+        self.users.insert(
+            id,
+            UserInfo {
+                id,
+                name,
+                face: 0,
+                color: 0,
+                room_id: room_id.unwrap_or(0),
+                x: x as i16,
+                y: y as i16,
+                props: Vec::new(),
+                away: false,
+                is_self: true,
+            },
+        );
+        if !self.room_users.contains(&id) {
+            self.room_users.push(id);
+        }
+        true
+    }
+
+    /// Reconcile a server-reported position for the local user.
+    ///
+    /// Prediction means the server's value normally matches what is already
+    /// shown, in which case there is nothing to redraw and this returns
+    /// `false`. When the server genuinely disagrees (a validation correction),
+    /// snap the model to it and return `true`.
+    pub fn reconcile_self_move(&mut self, x: i16, y: i16) -> bool {
+        let id = self.banner.user_id;
+        if let Some(user) = self.users.get_mut(&id) {
+            if user.x == x && user.y == y {
+                return false;
+            }
+            user.x = x;
+            user.y = y;
+            return true;
+        }
+        let name = self.name_of(id);
+        self.users.insert(
+            id,
+            UserInfo {
+                id,
+                name,
+                face: 0,
+                color: 0,
+                room_id: 0,
+                x,
+                y,
+                props: Vec::new(),
+                away: false,
+                is_self: true,
+            },
+        );
+        true
+    }
+
+    /// Snapshot every user's position, for motion bookkeeping across `apply`.
+    #[must_use]
+    pub fn user_positions(&self) -> BTreeMap<i32, (i16, i16)> {
+        self.users.iter().map(|(id, u)| (*id, (u.x, u.y))).collect()
+    }
+
+    /// Start a glide for every remote user whose position just changed.
+    ///
+    /// `before` is [`Self::user_positions`] sampled before the frame was
+    /// applied. A glide already in flight is re-targeted from its current
+    /// sample, so a second update mid-glide does not snap backwards.
+    pub fn begin_motions(&mut self, before: &BTreeMap<i32, (i16, i16)>, now_ms: u64) {
+        let self_id = self.banner.user_id;
+        let ids: Vec<i32> = self.users.keys().copied().collect();
+        for id in ids {
+            if id == self_id {
+                self.motion.remove(&id);
+                continue;
+            }
+            let Some(user) = self.users.get(&id) else {
+                continue;
+            };
+            let now_pos = (user.x, user.y);
+            if before.get(&id) == Some(&now_pos) {
+                continue;
+            }
+            let from = self
+                .motion
+                .get(&id)
+                .map(|motion| motion.at(now_ms))
+                .or_else(|| before.get(&id).copied())
+                .unwrap_or(now_pos);
+            if from == now_pos {
+                self.motion.remove(&id);
+                continue;
+            }
+            self.motion.insert(
+                id,
+                Motion {
+                    from,
+                    to: now_pos,
+                    start_ms: now_ms,
+                },
+            );
+        }
+        let known: Vec<i32> = self.users.keys().copied().collect();
+        self.motion
+            .retain(|id, _| *id != self_id && known.contains(id));
+    }
+
+    /// Advance the glide clock and drop completed glides.
+    ///
+    /// Returns whether any remote avatar is still gliding, so the runtime keeps
+    /// sampling and redrawing until every avatar has arrived.
+    pub fn advance_motion(&mut self, now_ms: u64) -> bool {
+        self.motion
+            .retain(|_, motion| now_ms < motion.start_ms.saturating_add(MOVE_GLIDE_MS));
+        !self.motion.is_empty()
+    }
+
+    /// Whether any remote avatar is mid-glide.
+    #[must_use]
+    pub fn has_motion(&self) -> bool {
+        !self.motion.is_empty()
+    }
+
+    /// The position to draw `id` at `now_ms`: a sample of its glide while one
+    /// is in flight, otherwise the model's own position.
+    #[must_use]
+    pub fn position_at(&self, id: i32, now_ms: u64) -> (i16, i16) {
+        if let Some(motion) = self.motion.get(&id) {
+            if now_ms < motion.start_ms.saturating_add(MOVE_GLIDE_MS) {
+                return motion.at(now_ms);
+            }
+        }
+        self.users.get(&id).map_or((0, 0), |user| (user.x, user.y))
+    }
+
     /// The users currently in the entered room, in a stable order.
     #[must_use]
     pub fn users_in_room(&self) -> Vec<UserInfo> {
@@ -918,7 +1181,7 @@ impl SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use palace_wire::byteorder::Writer;
+    use palace_wire::byteorder::{Reader, Writer};
 
     const SELF: i32 = 13;
 
@@ -953,6 +1216,21 @@ mod tests {
         );
     }
 
+    fn user_rec(user_id: i32, name: &str) -> UserRec {
+        UserRec {
+            user_id,
+            room_pos: Point::default(),
+            prop_spec: [AssetSpec::default(); AssetSpec::USER_PROP_SLOTS],
+            room_id: 0,
+            face_nbr: 0,
+            color_nbr: 0,
+            away_flag: 0,
+            open_to_msgs: 0,
+            nbr_props: 0,
+            name: name.to_owned(),
+        }
+    }
+
     fn user_at(id: i32, x: i16, y: i16) -> UserInfo {
         UserInfo {
             id,
@@ -966,6 +1244,98 @@ mod tests {
             away: false,
             is_self: id == SELF,
         }
+    }
+
+    #[test]
+    fn a_self_move_applies_at_once_and_an_agreeing_echo_is_not_a_redraw() {
+        let mut state = room_state();
+        add_user(&mut state, SELF);
+        assert!(
+            state.predict_self_move(123, 45),
+            "the click moves the local avatar before any server reply"
+        );
+        assert!(
+            !state.predict_self_move(123, 45),
+            "moving to the same spot changes nothing"
+        );
+        assert!(
+            !state.reconcile_self_move(123, 45),
+            "the server echoing what we already show is a no-op"
+        );
+        assert!(
+            state.reconcile_self_move(120, 40),
+            "a server position that genuinely differs snaps the avatar"
+        );
+        let me = state.users.get(&SELF).expect("the self user is known");
+        assert_eq!((me.x, me.y), (120, 40));
+    }
+
+    #[test]
+    fn a_click_before_the_server_names_us_still_moves_our_avatar() {
+        let mut state = room_state();
+        state.current_room = Some(RoomInfo {
+            id: 901,
+            name: "Balamb Garden".to_string(),
+            users: 0,
+            flags: 0,
+        });
+        assert!(
+            !state.users.contains_key(&SELF),
+            "the server has not named us in the room yet"
+        );
+        assert!(
+            state.predict_self_move(200, 150),
+            "the click still moves the local avatar"
+        );
+        assert!(
+            state
+                .users_in_room()
+                .iter()
+                .any(|user| user.is_self && user.x == 200 && user.y == 150),
+            "and the predicted self is in the room, so the renderer draws it"
+        );
+    }
+
+    #[test]
+    fn a_server_move_is_glided_rather_than_jumped() {
+        let mut state = room_state();
+        add_user(&mut state, 21);
+        let before = state.user_positions();
+        state.users.get_mut(&21).expect("user 21").x = 120;
+        state.users.get_mut(&21).expect("user 21").y = 40;
+        state.begin_motions(&before, 1_000);
+
+        assert_eq!(
+            state.position_at(21, 1_000),
+            (0, 0),
+            "the glide starts where the avatar was"
+        );
+        let mid = state.position_at(21, 1_000 + MOVE_GLIDE_MS / 2);
+        assert_ne!(mid, (0, 0), "the midpoint has left the origin");
+        assert_ne!(mid, (120, 40), "the midpoint has not arrived yet");
+        assert_eq!(
+            state.position_at(21, 1_000 + MOVE_GLIDE_MS),
+            (120, 40),
+            "the glide lands exactly on the reported position"
+        );
+        assert!(
+            !state.advance_motion(1_000 + MOVE_GLIDE_MS),
+            "a finished glide stops asking for redraws"
+        );
+    }
+
+    #[test]
+    fn a_self_move_is_never_glided() {
+        let mut state = room_state();
+        add_user(&mut state, SELF);
+        let before = state.user_positions();
+        assert!(state.predict_self_move(200, 150));
+        state.begin_motions(&before, 1_000);
+        assert!(
+            !state.has_motion(),
+            "the local avatar is drawn where the click put it, not glided"
+        );
+        assert_eq!(state.position_at(SELF, 1_000), (200, 150));
     }
 
     /// The compositor draws avatars in the order this returns, so the order must
@@ -1175,6 +1545,56 @@ mod tests {
             line.text
         );
         assert_eq!(state.last_error(), Some(line.text.as_str()));
+    }
+
+    #[test]
+    fn a_refused_room_change_re_requests_the_room_we_never_left() {
+        let mut state = room_state();
+        let room_id = i32::from(state.room_desc.as_ref().expect("a room").header.room_id);
+        state.current_room = Some(RoomInfo {
+            id: room_id,
+            name: "Balamb Garden".to_string(),
+            users: 0,
+            flags: 0,
+        });
+
+        state.begin_room_change();
+
+        let applied = state.apply(
+            &Frame::new(opcode::NAVERROR, 1, Vec::new()),
+            ByteOrder::Little,
+        );
+
+        let frame = applied
+            .outbound
+            .iter()
+            .find(|frame| frame.opcode == opcode::ROOMGOTO)
+            .expect("a refused change must re-request the room we are still in");
+        let mut reader = Reader::new(&frame.payload, ByteOrder::Little);
+        assert_eq!(reader.read_u16().expect("the room id"), room_id as u16);
+        assert_eq!(
+            state.current_room.as_ref().map(|room| room.id),
+            Some(room_id),
+            "the room we never left is current again"
+        );
+
+        let desc = Frame::new(
+            opcode::ROOMDESC,
+            0,
+            include_bytes!("../../../fixtures/rooms/86.bin").to_vec(),
+        );
+        let applied = state.apply(&desc, ByteOrder::Little);
+        assert!(
+            state.room_desc.is_some(),
+            "the re-requested descriptor restores the room"
+        );
+        assert!(
+            !applied
+                .scripts
+                .iter()
+                .any(|stimulus| stimulus.event == ScriptEvent::Enter),
+            "recovering a refused change must not re-run the room's ENTER lifecycle"
+        );
     }
 
     #[test]
@@ -1587,6 +2007,100 @@ mod tests {
         assert!(
             applied.scripts.is_empty(),
             "an exit for an unknown user runs nothing"
+        );
+    }
+
+    #[test]
+    fn a_self_exit_keeps_the_identity_username_answers_from() {
+        let mut state = room_state();
+        add_user(&mut state, SELF);
+        let name = state.users[&SELF].name.clone();
+
+        state.apply(
+            &Frame::new(opcode::USEREXIT, SELF, Vec::new()),
+            ByteOrder::Little,
+        );
+
+        assert_eq!(
+            state.users.get(&SELF).map(|user| user.name.clone()),
+            Some(name),
+            "a room-change self exit must not blank the name USERNAME answers"
+        );
+        assert!(
+            !state.room_users.contains(&SELF),
+            "the room-scoped list still drops us"
+        );
+    }
+
+    #[test]
+    fn a_new_user_records_a_room_level_userenter() {
+        let mut state = room_state();
+        let mut w = Writer::new(ByteOrder::Little);
+        user_rec(21, "Rico").encode(&mut w);
+        let applied = state.apply(
+            &Frame::new(opcode::USERNEW, 21, w.into_vec()),
+            ByteOrder::Little,
+        );
+        assert_eq!(
+            applied.scripts,
+            vec![ScriptStimulus {
+                event: ScriptEvent::UserEnter,
+                spot: None,
+            }],
+            "a new user runs the room's ON USERENTER"
+        );
+    }
+
+    #[test]
+    fn our_own_entry_records_no_userenter() {
+        let mut state = room_state();
+        let mut w = Writer::new(ByteOrder::Little);
+        user_rec(SELF, "Me").encode(&mut w);
+        let applied = state.apply(
+            &Frame::new(opcode::USERNEW, SELF, w.into_vec()),
+            ByteOrder::Little,
+        );
+        assert!(
+            applied.scripts.is_empty(),
+            "our own entry must not run ON USERENTER"
+        );
+    }
+
+    #[test]
+    fn a_worn_prop_change_records_a_propchange() {
+        let mut state = room_state();
+        add_user(&mut state, 21);
+        let frame = messages::UserProp {
+            user_id: 21,
+            props: vec![AssetSpec { id: 5, crc: 0 }],
+        }
+        .frame(ByteOrder::Little)
+        .expect("a prop frame encodes");
+        let applied = state.apply(&frame, ByteOrder::Little);
+        assert_eq!(
+            applied.scripts,
+            vec![ScriptStimulus {
+                event: ScriptEvent::PropChange,
+                spot: None,
+            }],
+            "a worn prop change runs the room's ON PROPCHANGE"
+        );
+    }
+
+    #[test]
+    fn a_server_down_records_a_signoff() {
+        let mut state = room_state();
+        let applied = state.apply(
+            &Frame::new(opcode::SERVERDOWN, 0, Vec::new()),
+            ByteOrder::Little,
+        );
+        assert_eq!(
+            applied.scripts,
+            vec![ScriptStimulus {
+                event: ScriptEvent::SignOff,
+                spot: None,
+            }],
+            "losing the connection runs ON SIGNOFF"
         );
     }
 

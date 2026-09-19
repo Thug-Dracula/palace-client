@@ -28,3 +28,6 @@ tools/public-scrub.map
 # Python bytecode from the prop-codec oracles
 __pycache__/
 *.pyc
+
+# Local, non-committed project notes
+NOTES.local.md

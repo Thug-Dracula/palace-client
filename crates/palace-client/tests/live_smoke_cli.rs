@@ -62,6 +62,7 @@ fn env_configuration_is_echoed_and_a_refused_connection_exits_successfully() {
         .env_remove("PALACE_RUN_SCRIPT")
         .env_remove("PALACE_CLICK_ROOM")
         .env_remove("PALACE_DEBUG_FRAMES")
+        .env_remove("PALACE_SMOKE_SAY")
         .output()
         .expect("spawn live-smoke");
 

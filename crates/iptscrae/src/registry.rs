@@ -8,7 +8,7 @@
 //! Two layers register names, mirroring the reference implementation's split
 //! between a generic engine and a host:
 //!
-//! 1. [`CommandSet::core`] — the ~72 commands every IPTSCRAE engine ships
+//! 1. [`CommandSet::core`] — the ~73 commands every IPTSCRAE engine ships
 //!    (stack, math, strings, control flow, arrays, comparison).
 //! 2. [`CommandSet::register_host`] — names whose behaviour belongs to the host
 //!    (every Palace command: `SAY`, `SETPOS`, `GOTOROOM`, …).
@@ -78,6 +78,8 @@ pub enum Builtin {
     Cosine,
     /// `TANGENT` — tangent of degrees, scaled by 1000.
     Tangent,
+    /// `SQUAREROOT` — integer part of the square root; host-independent.
+    SquareRoot,
     /// `ATOI` — string to integer.
     Atoi,
     /// `ITOA` — integer to string.
@@ -236,6 +238,19 @@ impl CommandSet {
         }
     }
 
+    /// Remove a name from the parse dictionary, returning whether it was there.
+    ///
+    /// The reference resolves a symbol through the host's command table at parse
+    /// time (`IptParser.parseSymbol`): a name in the table becomes a command,
+    /// anything else a variable. A host can answer a word through its dispatch
+    /// table without reserving it here; keep the name out of the dictionary or an
+    /// existing script using the same spelling as a variable changes meaning.
+    pub fn unregister(&mut self, name: &str) -> bool {
+        self.map
+            .remove(name.to_ascii_uppercase().as_str())
+            .is_some()
+    }
+
     /// Register a builtin under an explicit name.
     pub fn register_builtin(&mut self, name: &str, builtin: Builtin) {
         self.map.insert(
@@ -275,8 +290,9 @@ impl CommandSet {
     }
 }
 
-/// The 72 commands in the reference engine's default dictionary, with the
-/// spellings the guide documents.
+/// The core commands: the reference engine's 72-name default dictionary plus
+/// `SQUAREROOT`, which the official guide documents but `IptDefaultCommands`
+/// omits (guide quick reference `docs/iptscrae.txt:5018`).
 pub const CORE_COMMANDS: &[(&str, Builtin)] = &[
     ("DUP", Builtin::Dup),
     ("POP", Builtin::Pop),
@@ -302,6 +318,7 @@ pub const CORE_COMMANDS: &[(&str, Builtin)] = &[
     ("SINE", Builtin::Sine),
     ("COSINE", Builtin::Cosine),
     ("TANGENT", Builtin::Tangent),
+    ("SQUAREROOT", Builtin::SquareRoot),
     ("ATOI", Builtin::Atoi),
     ("ITOA", Builtin::Itoa),
     ("DATETIME", Builtin::DateTime),
@@ -357,9 +374,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn core_has_the_seventy_two_documented_names() {
-        assert_eq!(CORE_COMMANDS.len(), 72);
-        assert_eq!(CommandSet::core().len(), 72, "no duplicate spellings");
+    fn core_is_the_reference_dictionary_plus_squareroot() {
+        assert_eq!(CORE_COMMANDS.len(), 73);
+        assert_eq!(CommandSet::core().len(), 73, "no duplicate spellings");
+        assert_eq!(
+            CommandSet::core().get("SQUAREROOT"),
+            Some(CommandKind::Builtin(Builtin::SquareRoot))
+        );
     }
 
     #[test]
@@ -394,5 +415,15 @@ mod tests {
         assert_eq!(set.get("="), set.get("DEF"));
         assert_eq!(set.get("!"), set.get("NOT"));
         assert_eq!(set.get("!="), set.get("<>"));
+    }
+
+    #[test]
+    fn unregister_makes_a_name_lex_as_a_variable_again() {
+        let mut set = CommandSet::core();
+        set.register_host("MOUSEX");
+        assert_eq!(set.get("MOUSEX"), Some(CommandKind::Host));
+        assert!(set.unregister("mousEx"), "lookup is case-insensitive");
+        assert_eq!(set.get("MOUSEX"), None);
+        assert!(!set.unregister("MOUSEX"), "a second removal is a no-op");
     }
 }

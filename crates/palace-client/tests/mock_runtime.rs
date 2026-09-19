@@ -27,10 +27,10 @@ use palace_client::{
 };
 use palace_wire::byteorder::{ByteOrder, Reader, Writer};
 use palace_wire::fixture::{default_fixture_dir, Fixture};
-use palace_wire::frame::Frame;
+use palace_wire::frame::{user_move_frame, Frame};
 use palace_wire::messages::{
-    aux_flags, client_logon_record, reference_logon_record, AssetSpec, Message, Point, UserProp,
-    UserRec,
+    aux_flags, client_logon_record_with_identity, reference_logon_record, AssetSpec,
+    ClientIdentity, Message, Point, UserProp, UserRec,
 };
 use palace_wire::opcode;
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
@@ -442,11 +442,24 @@ fn serve(
     let _ = stream.flush();
 
     if let Some(gate) = gate {
+        let mut buf = [0u8; 8192];
         while !gate.load(Ordering::Relaxed) {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            thread::sleep(Duration::from_millis(5));
+            match stream.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => received
+                    .lock()
+                    .expect("received")
+                    .extend_from_slice(&buf[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => return,
+            }
         }
         for bytes in &tail {
             if stream.write_all(bytes).is_err() {
@@ -546,6 +559,7 @@ fn config_for(port: u16, cache_root: PathBuf, seed_media: PathBuf) -> ClientConf
         seed_media: vec![seed_media],
         seed_props: Vec::new(),
         password: None,
+        identity: ClientIdentity::default(),
     }
 }
 
@@ -883,8 +897,9 @@ fn the_runtime_replays_the_recorded_logon_burst() {
     );
 
     // The real bytes of the client's reply went out over the socket: the runtime
-    // built its logon from the honest client profile, which differs from the
-    // reference record only in the cleared `AUTHENTICATE` bit.
+    // built its logon from the honest client profile carrying this install's
+    // generated identity, which differs from the reference record in the cleared
+    // `AUTHENTICATE` bit, the registration pair and the PUID fields.
     assert!(
         wait_for(
             || !server.received_bytes().is_empty(),
@@ -898,10 +913,11 @@ fn the_runtime_replays_the_recorded_logon_burst() {
         .find(|frame| frame.opcode == opcode::LOGON)
         .expect("the runtime sent a logon");
     assert_eq!(logon.ref_num, 0);
-    let expected = client_logon_record("RustProbe", 0).logon_frame(order);
+    let expected = client_logon_record_with_identity("RustProbe", 0, ClientIdentity::default())
+        .logon_frame(order);
     assert_eq!(
         logon.payload, expected.payload,
-        "the configured user's logon is the client profile, byte for byte"
+        "the configured user's logon carries this install's identity"
     );
 
     // The capture still holds the reference client's logon, unchanged.
@@ -915,8 +931,9 @@ fn the_runtime_replays_the_recorded_logon_burst() {
         "the capture still reproduces the reference logon"
     );
 
-    // The sent logon must differ from that capture in the `auxFlags` word at
-    // offset 72 and nowhere else, and there only in the cleared bit.
+    // The sent logon must differ from that capture in the registration pair at
+    // offsets 0..8, the `auxFlags` word at offset 72 and the PUID words at
+    // offsets 76..84, and nowhere else.
     let captured = &captured_logon.frame.payload;
     assert_eq!(captured.len(), logon.payload.len());
     let differing: Vec<usize> = (0..captured.len())
@@ -927,8 +944,21 @@ fn the_runtime_replays_the_recorded_logon_burst() {
         "the runtime logon must differ from the capture"
     );
     assert!(
-        differing.iter().all(|&i| (72..76).contains(&i)),
-        "the runtime logon differs from the capture only in auxFlags, got {differing:?}"
+        differing
+            .iter()
+            .all(|&i| (0..8).contains(&i) || (72..76).contains(&i) || (76..84).contains(&i)),
+        "the runtime logon differs from the capture only in the registration pair, \
+         auxFlags and the PUID, got {differing:?}"
+    );
+    assert_ne!(
+        &logon.payload[0..8],
+        &captured[0..8],
+        "the registration pair must not be the captured identity"
+    );
+    assert_ne!(
+        &logon.payload[76..84],
+        &captured[76..84],
+        "the PUID must not be the captured identity"
     );
     let sent_flags = u32::from_le_bytes(logon.payload[72..76].try_into().expect("four bytes"));
     let captured_flags = u32::from_le_bytes(captured[72..76].try_into().expect("four bytes"));
@@ -1012,6 +1042,480 @@ fn an_empty_capture_is_sent_by_the_runtime_as_empty_list_requests() {
             opcode_wanted.describe()
         );
     }
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_floor_click_shows_the_move_before_the_server_replies() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let server = MockServer::start(server_bytes(&fixture));
+    let cache = unique_temp_dir("predict-cache");
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    // The click needs the compositor's transform, so wait for the first frame.
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901)
+        .expect("a frame was composed");
+
+    let settled = settled_frame_version(&handle, Duration::from_secs(5));
+
+    // Click the floor far past the room edge: it clamps to the avatar margin and
+    // cannot be inside a hotspot (the reference room's hotspots end well short).
+    let floor = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
+    handle.click(floor.x, floor.y);
+
+    // The predicted move is drawn locally without waiting for the server.
+    assert!(
+        wait_for(
+            || handle.frames().version() > settled,
+            Duration::from_secs(5)
+        ),
+        "the click's predicted position was composited before any server reply"
+    );
+
+    // The server is still told where we went: a `uLoc` went out alongside.
+    assert!(
+        wait_for(
+            || server
+                .received_frames(order)
+                .iter()
+                .any(|frame| frame.opcode == opcode::USERMOVE),
+            Duration::from_secs(5)
+        ),
+        "the runtime still notified the server with a USERMOVE frame"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+/// True once the server has named our own user in the room.
+fn self_is_known(events: &[ClientEvent]) -> bool {
+    user_lists(events)
+        .iter()
+        .any(|users| users.iter().any(|user| user.is_self))
+}
+
+#[test]
+fn a_click_applies_the_local_move_before_the_frame_is_sent() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let server = MockServer::start(server_bytes(&fixture));
+    let cache = unique_temp_dir("order-cache");
+    let seed = seed_media_dir(&room);
+
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    // The click needs the compositor's transform and the self record.
+    let events = collect_events(
+        &mut rx,
+        |collected| !screens(collected).is_empty() && self_is_known(collected),
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901)
+        .expect("a frame was composed");
+    let before = handle.frames().version();
+
+    // A floor click far outside the room clamps to the avatar margin.
+    let floor = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
+    handle.click(floor.x, floor.y);
+
+    let expected = (
+        screen.geometry.room_w as i32 - 22,
+        screen.geometry.room_h as i32 - 22,
+    );
+    // Each session owns its event stream, so this order stands even while other
+    // tests share the process-wide tracer.
+    let after = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.starts_with("walk: sent"))
+        },
+        Duration::from_secs(5),
+    );
+    let walk_notes: Vec<&str> = notes(&after)
+        .into_iter()
+        .filter(|text| text.starts_with("walk: local apply") || text.starts_with("walk: sent"))
+        .collect();
+    assert_eq!(
+        walk_notes.len(),
+        2,
+        "the walk emitted a local-apply and a sent note: {walk_notes:?}"
+    );
+    assert!(
+        walk_notes[0].starts_with("walk: local apply") && walk_notes[1].starts_with("walk: sent"),
+        "the local apply is reported before the send: {walk_notes:?}"
+    );
+    let target = format!("to=({},{})", expected.0, expected.1);
+    assert!(
+        walk_notes[0].contains(&target) && walk_notes[1].contains(&target),
+        "both diagnostics name the same clamped target: {walk_notes:?}"
+    );
+    assert!(
+        wait_for(
+            || sent_moves(&server, order).contains(&expected),
+            Duration::from_secs(5)
+        ),
+        "the server was told where the local avatar went"
+    );
+    assert!(
+        wait_for(
+            || handle.frames().version() > before,
+            Duration::from_secs(5)
+        ),
+        "the local move was composited without waiting for the server"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_walk_click_is_applied_locally_then_sent_with_the_same_target() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, mut rx, screen, cache, seed) =
+        start_room_with_self(&fixture, "walk-order");
+
+    let floor = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
+    handle.click(floor.x, floor.y);
+
+    let expected = (
+        screen.geometry.room_w as i32 - 22,
+        screen.geometry.room_h as i32 - 22,
+    );
+    let after = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.starts_with("walk: sent"))
+        },
+        Duration::from_secs(5),
+    );
+    let walk_notes: Vec<&str> = notes(&after)
+        .into_iter()
+        .filter(|text| text.starts_with("walk: local apply") || text.starts_with("walk: sent"))
+        .collect();
+    assert_eq!(
+        walk_notes.len(),
+        2,
+        "one local-apply and one sent note: {walk_notes:?}"
+    );
+    assert!(
+        walk_notes[0].starts_with("walk: local apply") && walk_notes[1].starts_with("walk: sent"),
+        "the notes are local-first: {walk_notes:?}"
+    );
+    let target = format!("to=({},{})", expected.0, expected.1);
+    assert!(
+        walk_notes[0].contains(&target) && walk_notes[1].contains(&target),
+        "both notes name the same target: {walk_notes:?}"
+    );
+    assert_eq!(
+        sent_moves(&server, order),
+        vec![expected],
+        "the server was told exactly where the local avatar was placed"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+/// A local move must ask for its own redraw in the click path, before the wire
+/// is touched and without waiting for any server frame. The trigger is the
+/// position change, so a no-op click must not ask for a redraw.
+#[test]
+fn a_walk_click_requests_a_redraw_before_the_server_is_told() {
+    let fixture = logon_fixture();
+    let (server, handle, mut rx, screen, cache, seed) =
+        start_room_with_self(&fixture, "walk-redraw");
+
+    let floor = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
+    let expected = (
+        screen.geometry.room_w as i32 - 22,
+        screen.geometry.room_h as i32 - 22,
+    );
+
+    // Stop at the server send: every event before it came from the local path.
+    handle.click(floor.x, floor.y);
+    let after = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.starts_with("walk: sent"))
+        },
+        Duration::from_secs(5),
+    );
+    let walk_notes: Vec<&str> = notes(&after)
+        .into_iter()
+        .filter(|text| {
+            text.starts_with("walk: local apply")
+                || text.starts_with("walk: redraw requested")
+                || text.starts_with("walk: sent")
+        })
+        .collect();
+    assert_eq!(
+        walk_notes.len(),
+        3,
+        "the move applies, requests a redraw, then tells the server: {walk_notes:?}"
+    );
+    assert!(
+        walk_notes[0].starts_with("walk: local apply")
+            && walk_notes[1].starts_with("walk: redraw requested")
+            && walk_notes[2].starts_with("walk: sent"),
+        "the redraw request is part of the local apply, before the send: {walk_notes:?}"
+    );
+    let target = format!("to=({},{})", expected.0, expected.1);
+    assert!(
+        walk_notes[0].contains(&target)
+            && walk_notes[1].contains(&target)
+            && walk_notes[2].contains(&target),
+        "every walk diagnostic names the clicked target: {walk_notes:?}"
+    );
+
+    // The trigger is the change: clicking the same spot again moves nothing and
+    // so must not request another redraw.
+    handle.click(floor.x, floor.y);
+    let repeat = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.starts_with("walk: sent"))
+        },
+        Duration::from_secs(5),
+    );
+    let repeat_notes: Vec<&str> = notes(&repeat)
+        .into_iter()
+        .filter(|text| text.starts_with("walk:"))
+        .collect();
+    assert!(
+        repeat_notes
+            .iter()
+            .any(|text| text.starts_with("walk: local apply") && text.contains("changed=false")),
+        "the repeat click changed nothing: {repeat_notes:?}"
+    );
+    assert!(
+        !repeat_notes
+            .iter()
+            .any(|text| text.starts_with("walk: redraw requested")),
+        "a move that changes nothing must not request a redraw: {repeat_notes:?}"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn an_agreeing_server_echo_does_not_recompose_the_frame() {
+    let _guard = trace_guard();
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let probe = unique_temp_dir("echo-trace");
+    let trace_path = probe.join("session.log");
+    trace::install(Some(Arc::new(
+        Tracer::to_path(&trace_path).expect("the trace file opens"),
+    )));
+    // The click lands at room (30_000, 30_000), which clamps to (490, 362); the
+    // server then echoes exactly that position back.
+    let echo = user_move_frame(Point::new(362, 490), SELF_ID, order)
+        .encode(order)
+        .expect("the echo encodes");
+    let (server, gate) = MockServer::start_gated(server_bytes(&fixture), vec![echo]);
+    let cache = unique_temp_dir("echo-cache");
+    let seed = seed_media_dir(&room);
+
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| !screens(collected).is_empty() && self_is_known(collected),
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901)
+        .expect("a frame was composed");
+    let floor = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
+    handle.click(floor.x, floor.y);
+
+    // Wait for the click's own predicted frame and its local application.
+    assert!(
+        wait_for(
+            || handle.frames().version() > screen.version,
+            Duration::from_secs(5)
+        ),
+        "the click composited a local frame"
+    );
+
+    // Now the server echoes the same position: reconciliation must be silent.
+    gate.store(true, Ordering::Relaxed);
+    assert!(
+        wait_for(
+            || trace_text(&trace_path).contains("self_move echo"),
+            Duration::from_secs(3)
+        ),
+        "the server echo was processed"
+    );
+    let text = trace_text(&trace_path);
+    assert!(
+        text.contains("self_move local id=13 to=(490,362) changed=true"),
+        "the click applied the local move: {text}"
+    );
+    assert!(
+        text.contains("self_move echo id=13 at=(490,362) redrew=false"),
+        "the agreeing server echo was reconciled without a redraw"
+    );
+    assert!(
+        server
+            .received_frames(order)
+            .iter()
+            .any(|frame| frame.opcode == opcode::USERMOVE),
+        "the client still told the server where it moved"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_click_at_a_hotspot_resolves_at_dpr_two() {
+    let fixture = logon_fixture();
+    let room = room_desc(&fixture);
+    let server = MockServer::start(server_bytes(&fixture));
+    let cache = unique_temp_dir("dpr2-map-cache");
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    collect_events(
+        &mut rx,
+        |collected| !screens(collected).is_empty(),
+        Duration::from_secs(20),
+    );
+
+    // A non-integer fit scale at DPR 2, the shape the live report showed.
+    handle.set_viewport(960.0, 540.0, 2.0, 1.0, false);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| (screen.geometry.dpr - 2.0).abs() < f64::EPSILON)
+        },
+        Duration::from_secs(10),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| (screen.geometry.dpr - 2.0).abs() < f64::EPSILON)
+        .expect("the geometry reached DPR 2");
+    assert!(
+        (screen.geometry.scale.fract()).abs() > f64::EPSILON,
+        "the scale is deliberately not a whole number: {}",
+        screen.geometry.scale
+    );
+
+    let spot = room
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot
+                .script
+                .as_deref()
+                .is_some_and(|script| script.contains("ON SELECT"))
+        })
+        .expect("the room has a scripted hotspot");
+    let point = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(
+            f64::from(spot.loc.h),
+            f64::from(spot.loc.v),
+        ));
+    handle.click(point.x, point.y);
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("script: click at room"))
+                && script_runs(collected)
+                    .iter()
+                    .any(|run| run.event == "SELECT")
+        },
+        Duration::from_secs(10),
+    );
+    let click_note = notes(&events)
+        .into_iter()
+        .find(|text| text.starts_with("script: click at room"))
+        .expect("the click was reported");
+    assert!(
+        click_note.contains("hit hotspot"),
+        "a click on a hotspot's rendered centre must hit it at DPR 2: {click_note}"
+    );
+    assert!(
+        script_runs(&events)
+            .iter()
+            .any(|run| run.event == "SELECT" && run.fired >= 1),
+        "the hotspot's ON SELECT handler fired"
+    );
 
     handle.disconnect();
     drop(server);
@@ -1664,6 +2168,135 @@ fn leaving_a_room_dispatches_the_leave_handler() {
             .iter()
             .any(|run| run.event == "LEAVE" && run.fired >= 1),
         "the room's ON LEAVE handler fired: {leave:?}"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_refused_room_change_restores_the_room_and_its_scripts() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let payload = room_desc_payload(&fixture);
+
+    let mut initial = vec![server_bytes(&fixture)[0].clone()];
+    initial.push(
+        Frame::new(opcode::ROOMDESC, 0, payload.clone())
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let tail = vec![
+        Frame::new(opcode::NAVERROR, 1, Vec::new())
+            .encode(order)
+            .expect("the nav error encodes"),
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    ];
+    let (server, gate) = MockServer::start_gated(initial, tail);
+    let cache = unique_temp_dir("refused-nav-cache");
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
+        Duration::from_secs(20),
+    );
+    let before = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901)
+        .expect("the room composited before the refused change")
+        .version;
+
+    handle.goto_room(750);
+    assert!(
+        wait_for(
+            || sent_room_goto(&server, order) == Some(750),
+            Duration::from_secs(5),
+        ),
+        "the client asked for room 750"
+    );
+    gate.store(true, Ordering::Relaxed);
+
+    assert!(
+        wait_for(
+            || {
+                server
+                    .received_frames(order)
+                    .iter()
+                    .filter(|frame| frame.opcode == opcode::ROOMGOTO)
+                    .count()
+                    >= 2
+            },
+            Duration::from_secs(10),
+        ),
+        "a refused change must be answered by re-requesting the room we are still in"
+    );
+    let gotos: Vec<u16> = server
+        .received_frames(order)
+        .iter()
+        .filter(|frame| frame.opcode == opcode::ROOMGOTO)
+        .filter_map(|frame| Reader::new(&frame.payload, order).read_u16().ok())
+        .collect();
+    assert_eq!(
+        gotos,
+        vec![750, room.header.room_id as u16],
+        "the client asked for room 750, was refused, then asked for its own room again"
+    );
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901 && screen.version > before)
+        },
+        Duration::from_secs(10),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901 && screen.version > before)
+        .expect("the restored room recomposited");
+
+    let spot = room
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot
+                .script
+                .as_deref()
+                .is_some_and(|script| script.contains("ON SELECT"))
+        })
+        .expect("the room has a scripted hotspot");
+    let (x, y) = hotspot_click(spot, screen);
+    handle.click(x, y);
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "SELECT" && run.fired >= 1)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        script_runs(&events)
+            .iter()
+            .any(|run| run.event == "SELECT" && run.fired >= 1),
+        "the restored room still dispatches the hotspot's ON SELECT: {:?}",
+        script_runs(&events)
     );
 
     handle.disconnect();
@@ -4117,6 +4750,78 @@ fn a_click_on_a_door_with_no_handler_navigates_to_its_destination() {
 }
 
 #[test]
+fn a_scripted_gotoroom_runs_on_leave_through_the_session_loop() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("25567");
+    let room = palace_room::decode_payload(&payload, order).expect("room 25567 decodes");
+    let door = room
+        .hotspots
+        .iter()
+        .find(|hotspot| {
+            hotspot.hotspot_type == 1
+                && hotspot.dest != 0
+                && hotspot.script.as_deref().is_some_and(|script| {
+                    script.contains("ON SELECT") && script.contains("DEST GOTOROOM")
+                })
+        })
+        .expect("room 25567 has a door whose SELECT walks its DEST");
+
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("door-gotoroom-leave-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 25567)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 25567)
+        .expect("a frame was composed for room 25567");
+
+    let (x, y) = hotspot_click(door, screen);
+    handle.set_mouse(300, 200);
+    handle.click(x, y);
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            script_runs(collected)
+                .iter()
+                .any(|run| run.event == "LEAVE" && run.fired >= 1)
+        },
+        Duration::from_secs(15),
+    );
+    assert!(
+        script_runs(&events)
+            .iter()
+            .any(|run| run.event == "LEAVE" && run.fired >= 1),
+        "a scripted GOTOROOM ran the room's ON LEAVE handlers: {:?}",
+        script_runs(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
 fn a_door_with_a_select_handler_does_not_auto_navigate() {
     let fixture = logon_fixture();
     let order = fixture.byte_order;
@@ -4902,6 +5607,87 @@ fn a_script_hasprop_reads_the_locally_worn_list() {
     assert!(
         !chats(&events).contains(&"worn-99"),
         "HASPROP is false for an id we do not wear: {:?}",
+        chats(&events)
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn an_alarm_hasprop_reads_the_worn_list_the_last_event_left() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let payload = room_payload("25567");
+    let room = palace_room::decode_payload(&payload, order).expect("room 25567 decodes");
+    let spot = room
+        .hotspots
+        .iter()
+        .find(|hotspot| hotspot.hotspot_type != 1 || hotspot.dest == 0)
+        .expect("room 25567 has a hotspot that does not change rooms");
+    let spot_id = i32::from(spot.id);
+
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("hasprop-alarm-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 25567)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 25567)
+        .expect("a frame was composed for room 25567")
+        .clone();
+
+    handle.run_script(format!(
+        "{{ [ 10 ] SETPROPS {{ {{ \"alarm-worn-10\" SAY }} 10 HASPROP IF }} 3 ALARMEXEC }} \
+         \"SELECT\" {spot_id} SETSPOTSCRIPT"
+    ));
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.contains("SETSPOTSCRIPT"))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        notes(&events)
+            .iter()
+            .any(|text| text.contains("SETSPOTSCRIPT")),
+        "the SELECT handler attached: {:?}",
+        notes(&events)
+    );
+
+    let (vx, vy) = hotspot_click(spot, &screen);
+    handle.click(vx, vy);
+    let events = collect_events(
+        &mut rx,
+        |collected| chats(collected).contains(&"alarm-worn-10"),
+        Duration::from_secs(6),
+    );
+    assert!(
+        chats(&events).contains(&"alarm-worn-10"),
+        "the alarm's HASPROP read the worn list the click event left: {:?}",
         chats(&events)
     );
 

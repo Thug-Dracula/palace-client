@@ -13,20 +13,22 @@ use common::*;
 use iptscrae::value::Value;
 use iptscrae::{Chunk, Host, IptError};
 use palace_host::view::{HostView, SpotView};
-use palace_host::{AlarmKind, Effect, PendingAlarm, ScriptHost, PALACECHAT_VERSION};
+use palace_host::{AlarmKind, Effect, PendingAlarm, ScriptEngine, ScriptHost, PALACECHAT_VERSION};
 
 // --------------------------------------------------------------- state getters
 
 #[test]
 fn identity_and_room_getters_answer_from_the_snapshot() {
-    for name in ["ID", "USERID", "WHOME"] {
+    // `ID` is `ME`: the hotspot executing the script (0 here), not the user id.
+    assert_eq!(pushed("ID", &[]), ints(&[0]), "ID");
+    for name in ["USERID", "WHOME"] {
         assert_eq!(pushed(name, &[]), ints(&[13]), "{name}");
     }
     // `ME` is the hotspot the running script belongs to, not the user.
     assert_eq!(pushed("ME", &[]), ints(&[0]));
     assert_eq!(pushed("USERNAME", &[]), vec![Value::str("RustProbe")]);
     assert_eq!(pushed("SERVERNAME", &[]), vec![Value::str("TestServer")]);
-    assert_eq!(pushed("CLIENTTYPE", &[]), vec![Value::str("OPENPALACE")]);
+    assert_eq!(pushed("CLIENTTYPE", &[]), vec![Value::str("WINDOWS32")]);
     assert_eq!(pushed("ROOMID", &[]), ints(&[901]));
     assert_eq!(pushed("ROOMNAME", &[]), vec![Value::str("Balamb Garden")]);
     assert_eq!(pushed("ROOMWIDTH", &[]), ints(&[512]));
@@ -38,7 +40,6 @@ fn identity_and_room_getters_answer_from_the_snapshot() {
     assert_eq!(pushed("MOUSEY", &[]), ints(&[200]));
     assert_eq!(pushed("WHOCHAT", &[]), ints(&[7]));
     assert_eq!(pushed("WHOTARGET", &[]), ints(&[9]));
-    assert_eq!(pushed("LASTNAME", &[]), vec![Value::str("")]);
     assert_eq!(pushed("HTTPRECEIVED", &[]), ints(&[0]));
     // Version banners the corpus scripts probe.
     assert_eq!(pushed("OPENPALACE", &[]), ints(&[1]));
@@ -301,8 +302,9 @@ fn spot_mutation_commands_record_their_effects() {
     );
     assert_eq!(
         effect_of("SETSPOTNAMELOCAL", &[Value::str("New"), Value::Int(5)]),
-        Effect::Unsupported {
-            command: "SETSPOTNAMELOCAL(5,New)".to_owned()
+        Effect::SetSpotNameLocal {
+            spot: 5,
+            name: "New".to_owned()
         }
     );
     assert_eq!(
@@ -599,7 +601,7 @@ fn prop_commands_record_their_effects() {
     assert_eq!(effect_of("DOFFPROP", &[]), Effect::DoffProp);
     assert_eq!(effect_of("NAKED", &[]), Effect::Naked);
     assert_eq!(effect_of("CLEARPROPS", &[]), Effect::Naked);
-    // LOADPROPS is a cache warm-up: it records nothing.
+    // LOADPROPS queues a preload so a later DONPROP does not stall.
     let mut host = populated_host();
     let warm_up = Value::array(vec![Value::Int(7), Value::Int(9)]);
     assert_eq!(
@@ -607,7 +609,10 @@ fn prop_commands_record_their_effects() {
             .unwrap(),
         Vec::new()
     );
-    assert!(host.effects.is_empty());
+    assert_eq!(
+        host.take_effects(),
+        vec![Effect::LoadProps { props: vec![7, 9] }]
+    );
 }
 
 #[test]
@@ -649,9 +654,13 @@ fn prop_ids_accept_numbers_and_quoted_numbers() {
         effect_of("DONPROP", &strs(&[" 7 "])),
         Effect::DonProp { prop: 7 }
     );
-    assert_eq!(
-        effect_of("DONPROP", &strs(&["hat"])),
-        Effect::DonProp { prop: 0 }
+    // A name that does not resolve to a prop id is a no-op, matching
+    // `get_prop_id_by_name` returning 0.
+    let mut host = populated_host();
+    host.command("DONPROP", &strs(&["hat"])).unwrap();
+    assert!(
+        host.effects.is_empty(),
+        "an unknown prop name moves nothing"
     );
     assert_eq!(effect_of("DONPROP", &[]), Effect::DonProp { prop: 0 });
     assert_eq!(
@@ -821,8 +830,8 @@ fn loose_prop_commands_record_their_effects() {
     );
     assert_eq!(
         effect_of("SHOWLOOSEPROPS", &[]),
-        Effect::Unsupported {
-            command: "SHOWLOOSEPROPS".to_owned()
+        Effect::LogMessage {
+            text: "1073741825 10 20 ADDLOOSEPROP\n99 30 40 ADDLOOSEPROP\n".to_owned()
         }
     );
 }
@@ -922,7 +931,7 @@ fn unimplemented_commands_are_tallied_and_recorded() {
         assert_eq!(host.command("PING", &[]).unwrap(), Vec::new());
     }
     host.command("NOPE", &[]).unwrap();
-    host.command("KILLUSER", &ints(&[7])).unwrap();
+    host.command("ROOMDESC", &[]).unwrap();
     host.command("FLUSH", &[]).unwrap();
     assert_eq!(
         host.take_effects(),
@@ -937,7 +946,7 @@ fn unimplemented_commands_are_tallied_and_recorded() {
                 command: "NOPE".to_owned()
             },
             Effect::Unsupported {
-                command: "KILLUSER".to_owned()
+                command: "ROOMDESC".to_owned()
             },
             Effect::Unsupported {
                 command: "FLUSH".to_owned()
@@ -946,27 +955,13 @@ fn unimplemented_commands_are_tallied_and_recorded() {
     );
     assert_eq!(host.unsupported.get("PING"), Some(&2));
     assert_eq!(host.unsupported.get("NOPE"), Some(&1));
-    assert_eq!(host.unsupported.get("KILLUSER"), Some(&1));
+    assert_eq!(host.unsupported.get("ROOMDESC"), Some(&1));
     assert_eq!(host.unsupported.get("FLUSH"), Some(&1));
 }
 
 #[test]
-fn the_stubbed_spot_colour_commands_are_reported_not_dropped() {
-    for name in [
-        "SETPICBRIGHTNESS",
-        "SETPICSATURATION",
-        "SETPICDIM",
-        "GOTOURLFRAME",
-        "LAUNCHEVENT",
-        "LAUNCHPPA",
-        "LOADJAVA",
-        "TALKPPA",
-        "BAN",
-        "KICK",
-        "ROOMDESC",
-        "OFFLINE",
-        "ONLINE",
-    ] {
+fn the_stubbed_legacy_words_are_reported_not_dropped() {
+    for name in ["SETPICDIM", "ROOMDESC", "OFFLINE", "ONLINE"] {
         assert_eq!(
             effect_of(name, &[]),
             Effect::Unsupported {
@@ -1096,5 +1091,40 @@ fn encodeurl_percent_encodes_like_the_reference() {
         pushed("ENCODEURL", &[Value::str("é")]),
         vec![Value::str("%C3%A9")],
         "non-ASCII goes out as UTF-8 percent-encoding"
+    );
+}
+
+#[test]
+fn error_msg_is_seeded_as_a_string_variable() {
+    let mut engine = ScriptEngine::with_palace_limits();
+    assert!(
+        engine.run_source("ERRORMSG LOGMSG").is_ok(),
+        "the ON HTTPERROR ERRORMSG LOGMSG idiom must not fault"
+    );
+}
+
+#[test]
+fn the_mouse_axis_words_lex_as_variables_not_commands() {
+    let mut engine = ScriptEngine::with_palace_limits();
+    assert!(
+        engine.commands().get("MOUSEX").is_none(),
+        "no reference command table reserves MOUSEX, so scripts must see the variable"
+    );
+    assert!(engine.commands().get("MOUSEY").is_none());
+    assert!(engine.run_source("MOUSEX POP").is_ok());
+}
+
+#[test]
+fn the_colosseum_mousex_global_idiom_runs_clean() {
+    // 5308_hs1.txt and 5308_hs5.txt open their ON SELECT with this sequence:
+    // globalise MOUSEX/MOUSEY, seed them, then read MOUSEPOS. When MOUSEX was
+    // reserved as a command the first `mousex` pushed a number and `GLOBAL`
+    // faulted.
+    let mut engine = ScriptEngine::with_palace_limits();
+    assert!(
+        engine
+            .run_source("mousex GLOBAL 0 mousex = mousey GLOBAL MOUSEPOS mousey = mousex =")
+            .is_ok(),
+        "the Colosseum mouse idiom must run"
     );
 }

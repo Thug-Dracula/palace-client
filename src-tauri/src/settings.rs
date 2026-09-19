@@ -9,11 +9,117 @@
 
 use std::path::{Path, PathBuf};
 
-use palace_client::Secret;
+use palace_client::{ClientIdentity, Puid, RegistrationCode, Secret};
 use tauri::Manager;
 
 /// The settings file's name inside the platform app-config directory.
 pub const CONFIG_FILE: &str = "settings.json";
+
+/// The reference client's identity seed: the wall clock in milliseconds since
+/// the Unix epoch, truncated to 32 bits.
+fn clock_seed() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u32)
+        .unwrap_or(0)
+}
+
+/// The per-install PUID as it is stored in `settings.json`.
+///
+/// The wire type lives in `palace-wire`, which has no serde dependency; this is
+/// the one-line persistence mirror of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredPuid {
+    pub ctr: u32,
+    pub crc: u32,
+}
+
+impl From<StoredPuid> for Puid {
+    fn from(stored: StoredPuid) -> Self {
+        Puid {
+            ctr: stored.ctr,
+            crc: stored.crc,
+        }
+    }
+}
+
+impl From<Puid> for StoredPuid {
+    fn from(puid: Puid) -> Self {
+        StoredPuid {
+            ctr: puid.ctr,
+            crc: puid.crc,
+        }
+    }
+}
+
+/// The registration-code pair as it is stored in `settings.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredRegistration {
+    pub crc: u32,
+    pub counter: u32,
+}
+
+impl From<RegistrationCode> for StoredRegistration {
+    fn from(code: RegistrationCode) -> Self {
+        StoredRegistration {
+            crc: code.crc,
+            counter: code.counter,
+        }
+    }
+}
+
+impl From<StoredRegistration> for RegistrationCode {
+    fn from(stored: StoredRegistration) -> Self {
+        RegistrationCode {
+            crc: stored.crc,
+            counter: stored.counter,
+        }
+    }
+}
+
+/// The per-install identity as it is stored in `settings.json`: both the
+/// registration pair and the PUID, so every run sends the same two pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredIdentity {
+    pub registration: StoredRegistration,
+    pub puid: StoredPuid,
+}
+
+impl StoredIdentity {
+    /// Mint a fresh identity from the wall clock.
+    #[must_use]
+    pub fn generate() -> Self {
+        ClientIdentity::generate(clock_seed()).into()
+    }
+
+    /// Rebuild an identity from a pre-identity file's `puid`, minting the
+    /// registration pair that file never stored. The stored PUID is preserved.
+    #[must_use]
+    fn from_legacy_puid(puid: StoredPuid) -> Self {
+        StoredIdentity {
+            registration: RegistrationCode::generate(clock_seed()).into(),
+            puid,
+        }
+    }
+}
+
+impl From<StoredIdentity> for ClientIdentity {
+    fn from(stored: StoredIdentity) -> Self {
+        ClientIdentity {
+            registration: stored.registration.into(),
+            puid: stored.puid.into(),
+        }
+    }
+}
+
+impl From<ClientIdentity> for StoredIdentity {
+    fn from(identity: ClientIdentity) -> Self {
+        StoredIdentity {
+            registration: identity.registration.into(),
+            puid: identity.puid.into(),
+        }
+    }
+}
 
 /// Where to connect, who to be, and how the audio engine should start.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -26,6 +132,14 @@ pub struct Settings {
     pub audio_enabled: bool,
     #[serde(default = "audio_volume_default")]
     pub audio_volume: f32,
+    /// The per-install identity. `None` until [`Settings::ensure_identity`]
+    /// mints one.
+    #[serde(default)]
+    pub identity: Option<StoredIdentity>,
+    /// The `puid` field of a settings file written before identities existed.
+    /// Read once for migration by [`Settings::ensure_identity`]; never written.
+    #[serde(default, skip_serializing)]
+    pub puid: Option<StoredPuid>,
     /// The credential for an `auth` challenge. Sourced only from
     /// `PALACE_PASSWORD` or `--password`, so it is never read from or written to
     /// the config file.
@@ -55,11 +169,31 @@ impl Settings {
             soundfont: std::env::var_os("PALACE_SOUNDFONT").map(PathBuf::from),
             audio_enabled: audio_enabled_default(),
             audio_volume: audio_volume_default(),
+            identity: None,
+            puid: None,
             password: std::env::var("PALACE_PASSWORD")
                 .ok()
                 .filter(|value| !value.is_empty())
                 .map(Secret::new),
         }
+    }
+
+    /// Mint and store an identity if this install does not have one yet.
+    ///
+    /// A file that predates identities still has its old `puid` field, which is
+    /// migrated into the identity unchanged while the registration pair it
+    /// never stored is minted. Returns `true` when an identity was produced, so
+    /// the caller can persist it. An install that already has one keeps it
+    /// unchanged forever.
+    pub fn ensure_identity(&mut self) -> bool {
+        if self.identity.is_some() {
+            return false;
+        }
+        self.identity = Some(match self.puid.take() {
+            Some(puid) => StoredIdentity::from_legacy_puid(puid),
+            None => StoredIdentity::generate(),
+        });
+        true
     }
 
     /// Apply `--host` / `--port` / `--user` / `--soundfont` / `--password` from
@@ -243,6 +377,8 @@ mod tests {
             soundfont: None,
             audio_enabled: true,
             audio_volume: 1.0,
+            identity: None,
+            puid: None,
             password: None,
         }
     }
@@ -294,6 +430,17 @@ mod tests {
             soundfont: Some(PathBuf::from("/fonts/tim.sf2")),
             audio_enabled: false,
             audio_volume: 0.4,
+            identity: Some(StoredIdentity {
+                registration: StoredRegistration {
+                    crc: 0x0102_0304,
+                    counter: 0x0a0b_0c0d,
+                },
+                puid: StoredPuid {
+                    ctr: 0x1122_3344,
+                    crc: 0x5566_7788,
+                },
+            }),
+            puid: None,
             password: None,
         };
         save(&path, &original).expect("the settings are writable");
@@ -387,6 +534,104 @@ mod tests {
         let loaded = load(&path).expect("a file with the core fields loads");
         assert!(loaded.audio_enabled, "the absent field takes its default");
         assert_eq!(loaded.audio_volume, 1.0);
+        assert_eq!(
+            loaded.identity, None,
+            "an install with no identity has none until one is minted"
+        );
+        assert_eq!(loaded.puid, None);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_missing_identity_is_minted_once_and_then_stays() {
+        let mut settings = sample();
+        assert!(settings.ensure_identity());
+        let minted = settings.identity.expect("an identity was minted");
+        assert!(
+            !settings.ensure_identity(),
+            "an existing identity is never replaced"
+        );
+        assert_eq!(settings.identity, Some(minted));
+    }
+
+    #[test]
+    fn a_persisted_identity_survives_a_restart() {
+        let directory = scratch("identity-persist");
+        let path = directory.join(CONFIG_FILE);
+        let mut first = sample();
+        assert!(first.ensure_identity());
+        save(&path, &first).expect("the settings are writable");
+
+        let reloaded = load(&path).expect("the settings are readable again");
+        let mut restarted = Settings::resolve(sample(), Some(reloaded), args(&[]));
+        assert_eq!(
+            restarted.identity, first.identity,
+            "the identity was reloaded"
+        );
+        assert!(
+            !restarted.ensure_identity(),
+            "a restart must not mint a second identity"
+        );
+        assert_eq!(restarted.identity, first.identity);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_legacy_puid_is_migrated_into_an_identity_without_changing_it() {
+        let directory = scratch("identity-migrate");
+        let path = directory.join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            r#"{"host":"h.test","port":4,"username":"N","soundfont":null,
+                "puid":{"ctr":287454020,"crc":1432778632}}"#,
+        )
+        .expect("the legacy file is writable");
+
+        let loaded = load(&path).expect("the legacy file loads");
+        assert_eq!(loaded.identity, None, "the legacy file has no identity yet");
+        assert_eq!(
+            loaded.puid,
+            Some(StoredPuid {
+                ctr: 0x1122_3344,
+                crc: 0x5566_7788,
+            })
+        );
+
+        let mut migrated = Settings::resolve(sample(), Some(loaded), args(&[]));
+        assert!(migrated.ensure_identity());
+        let identity = migrated.identity.expect("an identity was produced");
+        assert_eq!(
+            identity.puid,
+            StoredPuid {
+                ctr: 0x1122_3344,
+                crc: 0x5566_7788,
+            },
+            "the existing PUID is preserved, not reshuffled"
+        );
+        assert_ne!(
+            identity.registration,
+            StoredRegistration {
+                crc: 0x32fb_23e9,
+                counter: 0xaa18_198f,
+            },
+            "the registration pair must not be the captured one"
+        );
+        assert!(!migrated.ensure_identity());
+
+        save(&path, &migrated).expect("the migrated settings are writable");
+        let raw = std::fs::read_to_string(&path).expect("the file is readable");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("the saved JSON is valid");
+        assert!(
+            doc.get("puid").is_none(),
+            "the legacy top-level field must not be written back: {raw}"
+        );
+        assert!(
+            doc.get("identity").is_some(),
+            "the identity was written: {raw}"
+        );
+        let reloaded = load(&path).expect("the migrated file loads");
+        assert_eq!(reloaded.identity, Some(identity));
+        assert_eq!(reloaded.puid, None);
         let _ = std::fs::remove_dir_all(&directory);
     }
 

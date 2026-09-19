@@ -6,6 +6,7 @@
 //! a real event selects and returns what each one did.
 
 use iptscrae::budget::{Limits, StackDialect};
+use iptscrae::error::IptError;
 use iptscrae::registry::CommandSet;
 use iptscrae::value::Chunk;
 use iptscrae::{parse_script, Engine, Value};
@@ -89,6 +90,18 @@ impl ScriptEngine {
     pub fn new(limits: Limits) -> Self {
         let mut commands = CommandSet::core();
         register_palace_commands(&mut commands);
+        // The reference command tables have no `MOUSEX`/`MOUSEY` (the tracked
+        // pointer is read with `MOUSEPOS`: `iptService.js` table at line 69, only
+        // `MOUSEPOS` at 2300; `PalaceIptscraeCommands.as` and `IptDefaultCommands.as`
+        // likewise). Keep the words out of the parse dictionary whatever the host
+        // table reserves, because the parser turns any registered name into a
+        // command (`IptParser.parseSymbol`). A real corpus script uses them as
+        // variables — `mousex GLOBAL` in 5308_hs1/hs5 globalises `MOUSEX` — and
+        // were `mousex` a command it would push a number where `GLOBAL` needs an
+        // `IptVariable` (`GLOBALCommand.as:10`). The dispatch table still answers
+        // the words for a host that asks directly.
+        commands.unregister("MOUSEX");
+        commands.unregister("MOUSEY");
         let mut host = ScriptHost::new(HostView::default());
         host.limits = limits;
         let engine = Engine::new(host)
@@ -116,6 +129,16 @@ impl ScriptEngine {
         &self.engine.host
     }
 
+    /// The session's global variables rendered as text, for diagnostics.
+    #[must_use]
+    pub fn globals_snapshot(&self) -> Vec<(String, String)> {
+        self.engine
+            .globals_snapshot()
+            .into_iter()
+            .map(|(name, value)| (name, format!("{value:?}")))
+            .collect()
+    }
+
     /// The underlying host, mutably.
     pub fn host_mut(&mut self) -> &mut ScriptHost {
         &mut self.engine.host
@@ -125,6 +148,23 @@ impl ScriptEngine {
     #[must_use]
     pub fn scripts(&self) -> &[LoadedScript] {
         &self.scripts
+    }
+
+    /// The command dictionary this engine parses and runs with.
+    #[must_use]
+    pub fn commands(&self) -> &CommandSet {
+        &self.engine.commands
+    }
+
+    /// The resource limits this engine applies.
+    #[must_use]
+    pub fn limits(&self) -> Limits {
+        self.engine.limits
+    }
+
+    /// Forget every global, isolating the next corpus file or session.
+    pub fn reset_globals(&mut self) {
+        self.engine.reset_globals();
     }
 
     /// Replace the view a script observes.
@@ -213,6 +253,29 @@ impl ScriptEngine {
             .any(|script| script.script.handler(&name).is_some())
     }
 
+    /// Run one parsed handler body against the live host.
+    ///
+    /// [`ScriptEngine::fire`] reduces a fault to a string for the session log.
+    /// A corpus run needs the raw [`IptError`] so it can classify the failure
+    /// the same way the skeleton-host harness does, so this returns it
+    /// unchanged. `spot` is the hotspot the body belongs to; `0` runs
+    /// room-level.
+    pub fn run_chunk(&mut self, spot: i32, chunk: &Chunk) -> Result<HandlerRun, IptError> {
+        self.engine.host.current_spot = spot;
+        self.engine.host.effects.clear();
+        let outcome = self.engine.run_handler_capture(chunk, i64::from(spot), &[]);
+        let effects = self.engine.host.take_effects();
+        match outcome {
+            Ok(captured) => Ok(HandlerRun {
+                spot,
+                steps: captured.steps,
+                error: None,
+                effects,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Parse and run a bare instruction sequence (no `ON` handler).
     ///
     /// Used by the client's script box: the effects are returned in
@@ -240,18 +303,15 @@ impl ScriptEngine {
     /// runs room-level.
     pub fn execute_fetched_source(&mut self, source: &str, spot: i32) -> HandlerRun {
         self.engine.host.current_spot = spot;
-        let run =
-            match iptscrae::lexer::parse_body(source, &self.engine.commands, &self.engine.limits) {
-                Ok(chunk) => self.run_handler(spot, &chunk, false),
-                Err(error) => HandlerRun {
-                    spot,
-                    steps: 0,
-                    error: Some(error.to_string()),
-                    effects: Vec::new(),
-                },
-            };
-        self.engine.reset_globals(); // CUT-MARKER
-        run
+        match iptscrae::lexer::parse_body(source, &self.engine.commands, &self.engine.limits) {
+            Ok(chunk) => self.run_handler(spot, &chunk, false),
+            Err(error) => HandlerRun {
+                spot,
+                steps: 0,
+                error: Some(error.to_string()),
+                effects: Vec::new(),
+            },
+        }
     }
 
     /// Fire an event at every script that handles it.
@@ -260,6 +320,12 @@ impl ScriptEngine {
     /// `CHATSTR`; whatever the handlers leave there comes back as
     /// [`DispatchReport::chat_string`], which is how a script rewrites or
     /// suppresses chat.
+    ///
+    /// A handler fault aborts the rest of the dispatch, matching the
+    /// reference, where `IptManager.step` clears the call stack every queued
+    /// handler shares; the fault is still reported in
+    /// [`DispatchReport::runs`]. Alarms queued before the fault survive, as
+    /// they do on the reference's `step` path.
     pub fn fire(&mut self, event: ScriptEvent) -> DispatchReport {
         self.fire_inner(event, None)
     }
@@ -283,7 +349,8 @@ impl ScriptEngine {
 
         let capture_chat = report.chat_string.is_some();
         let scripts = self.scripts.clone();
-        for script in &scripts {
+        for index in Self::dispatch_order(&scripts) {
+            let script = &scripts[index];
             if only.is_some_and(|spot| spot != script.spot) {
                 continue;
             }
@@ -298,11 +365,37 @@ impl ScriptEngine {
                 report.chat_string = Some(text);
             }
             report.effects.extend(run.effects.iter().cloned());
+            let faulted = run.error.is_some();
             report.runs.push(run);
+            if faulted {
+                // Reference: `IptManager.step()` catches an `IptError` from a
+                // handler and calls `clearCallStack()`. Every handler queued
+                // for one event shares that stack, so the fault aborts the
+                // rest of the dispatch, not just the faulting handler.
+                break;
+            }
         }
 
         self.absorb_alarms();
         report
+    }
+
+    /// The order handlers run in: hotspots last to first, then the cyborg.
+    ///
+    /// `PalaceController.triggerHotspotEvents`
+    /// (`OpenPalace/PalaceClient/.../iptscrae/PalaceController.as:81-93`) walks
+    /// `currentRoom.hotSpots` from `length-1` down to `0` and only then
+    /// triggers `cyborgHotspot`. Hotspot scripts are loaded in room order
+    /// (`scripts_from_room` follows `room.hotspots`) and the cyborg is appended
+    /// (`load_cyborg`), so reversing the hotspot run and leaving spot `0` last
+    /// reproduces the reference.
+    fn dispatch_order(scripts: &[LoadedScript]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..scripts.len())
+            .filter(|&index| scripts[index].spot != 0)
+            .collect();
+        order.reverse();
+        order.extend((0..scripts.len()).filter(|&index| scripts[index].spot == 0));
+        order
     }
 
     /// Fire any alarm whose deadline has passed.

@@ -307,7 +307,17 @@ impl Fixture {
                         ));
                     }
                 }
-                Ok(Message::UserList(list)) | Ok(Message::RoomUsers(list)) => {
+                Ok(Message::UserList(list)) => {
+                    if list.users.len() != cf.frame.ref_num.max(0) as usize {
+                        return Err(format!(
+                            "frame {} user count {} != refNum {}",
+                            cf.seq,
+                            list.users.len(),
+                            cf.frame.ref_num
+                        ));
+                    }
+                }
+                Ok(Message::RoomUsers(list)) => {
                     if list.users.len() != cf.frame.ref_num.max(0) as usize {
                         return Err(format!(
                             "frame {} user count {} != refNum {}",

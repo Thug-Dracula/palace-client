@@ -248,6 +248,127 @@ pub fn faulting_command(error: &IptError) -> Option<&str> {
     }
 }
 
+/// Registered command names a source uses as the target of an assignment.
+///
+/// This is the `mousex` bug generalised. IPTSCRAE has no reserved words: the
+/// lexer turns any registered name into a command, so a script that used that
+/// name as a variable now gets an instruction in the variable slot `GLOBAL`,
+/// `=`, `DEF`, `++`, `--` or a compound assignment needs. `GLOBALCommand` and
+/// the assignment builtins read the raw reference from the stack, so a command
+/// there faults (or silently corrupts the stack).
+///
+/// The scan mirrors [`SourceSpellings::scan`] — strings and comments are
+/// skipped — and only reports a name when it is *spelled with a lower-case
+/// letter* and its upper-cased form is registered. That spelling rule keeps the
+/// legitimate idioms out: `value direction DUP GLOBAL` and
+/// `{ a } { b } cond IFELSE =` are commands (upper case) producing the
+/// reference, not variables.
+///
+/// A collision inside a string fed to `STRTOATOM` is out of scope: chat text
+/// that merely contains a word like `DEF` would be a false positive.
+#[must_use]
+pub fn variable_position_collisions(source: &str, commands: &CommandSet) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut last_word: Option<String> = None;
+    let mut chars = source.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' | '\0' => break,
+                        _ => {}
+                    }
+                }
+                last_word = None;
+            }
+            '#' | ';' => {
+                while let Some(&c) = chars.peek() {
+                    if c == '\r' || c == '\n' || c == '\0' {
+                        break;
+                    }
+                    chars.next();
+                }
+                last_word = None;
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' => {
+                let mut word = String::from(c);
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        word.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let is_target_word =
+                    word.eq_ignore_ascii_case("GLOBAL") || word.eq_ignore_ascii_case("DEF");
+                if is_target_word {
+                    record_collision(&mut out, last_word.as_deref(), commands);
+                }
+                last_word = Some(word);
+            }
+            c if c.is_ascii_whitespace() => {}
+            c => {
+                let op = read_operator(c, &mut chars);
+                if is_assignment_target(&op) {
+                    record_collision(&mut out, last_word.as_deref(), commands);
+                }
+                last_word = None;
+            }
+        }
+    }
+    out
+}
+
+fn record_collision(out: &mut Vec<String>, spelling: Option<&str>, commands: &CommandSet) {
+    let Some(spelling) = spelling else {
+        return;
+    };
+    if !spelling.chars().any(|c| c.is_ascii_lowercase()) {
+        return;
+    }
+    let upper = spelling.to_ascii_uppercase();
+    if commands.contains(&upper) && !out.iter().any(|name| name == &upper) {
+        out.push(upper);
+    }
+}
+
+/// Read the longest operator starting at `c`, consuming the lookahead it uses.
+fn read_operator(c: char, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let next = chars.peek().copied();
+    let is_pair = matches!(
+        (c, next),
+        ('=', Some('='))
+            | ('!', Some('='))
+            | ('<', Some('='))
+            | ('>', Some('='))
+            | ('+', Some('='))
+            | ('+', Some('+'))
+            | ('-', Some('='))
+            | ('-', Some('-'))
+            | ('*', Some('='))
+            | ('/', Some('='))
+            | ('%', Some('='))
+            | ('<', Some('>'))
+    );
+    let mut op = String::from(c);
+    if is_pair {
+        chars.next();
+        if let Some(ch) = next {
+            op.push(ch);
+        }
+    }
+    op
+}
+
+fn is_assignment_target(op: &str) -> bool {
+    matches!(op, "=" | "++" | "--" | "+=" | "-=" | "*=" | "/=" | "%=")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +514,58 @@ mod tests {
         .in_command("Concat");
         assert_eq!(faulting_command(&error), Some("Concat"));
         assert_eq!(faulting_command(&IptError::Host("x".to_owned())), None);
+    }
+
+    fn commands_with(names: &[&str]) -> CommandSet {
+        let mut set = CommandSet::core();
+        for name in names {
+            set.register_host(name);
+        }
+        set
+    }
+
+    #[test]
+    fn a_lower_case_spelling_of_a_registered_name_at_an_assignment_target_is_a_collision() {
+        let commands = commands_with(&["STR", "MOUSEX"]);
+        assert_eq!(
+            variable_position_collisions("str GLOBAL 0 str =", &commands),
+            vec!["STR"]
+        );
+        assert_eq!(
+            variable_position_collisions("0 mousex GLOBAL =", &commands),
+            vec!["MOUSEX"]
+        );
+        assert_eq!(
+            variable_position_collisions("x += 1", &commands_with(&["X"])),
+            vec!["X"]
+        );
+    }
+
+    #[test]
+    fn unregistered_lower_case_names_are_variables_not_collisions() {
+        let commands = commands_with(&["STR"]);
+        assert!(variable_position_collisions("walci GLOBAL 0 walci =", &commands).is_empty());
+        assert!(variable_position_collisions("mousex GLOBAL", &commands).is_empty());
+        assert!(
+            variable_position_collisions("str GLOBAL", &CommandSet::core()).is_empty(),
+            "with STR unregistered the name is a variable"
+        );
+    }
+
+    #[test]
+    fn the_legitimate_command_idioms_are_not_collisions() {
+        let commands = commands_with(&["STR", "GET", "IFELSE"]);
+        assert!(variable_position_collisions("value direction DUP GLOBAL =", &commands).is_empty());
+        assert!(variable_position_collisions("[ a b ] i GET =", &commands).is_empty());
+        assert!(variable_position_collisions("{ a } { b } c IFELSE =", &commands).is_empty());
+    }
+
+    #[test]
+    fn comments_strings_and_comparisons_do_not_produce_collisions() {
+        let commands = commands_with(&["STR", "DEF"]);
+        assert!(variable_position_collisions("; str GLOBAL", &commands).is_empty());
+        assert!(variable_position_collisions("\"str GLOBAL\" SAY", &commands).is_empty());
+        assert!(variable_position_collisions("str == other", &commands).is_empty());
+        assert!(variable_position_collisions("a str <> b", &commands).is_empty());
     }
 }

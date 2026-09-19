@@ -74,6 +74,9 @@ pub const ENV_VAR: &str = "PALACE_TRACE";
 /// The environment variable that turns the hotspot-script dump on.
 pub const DUMP_SCRIPTS_ENV_VAR: &str = "PALACE_DUMP_SCRIPTS";
 
+/// The environment variable that turns the script variable-store dump on.
+pub const DUMP_VARS_ENV_VAR: &str = "PALACE_DUMP_VARS";
+
 /// Longest single line the tracer will write before truncating. A script can
 /// echo arbitrarily long chat, and a trace must not grow an unbounded line.
 const MAX_LINE: usize = 4096;
@@ -88,6 +91,8 @@ static ENV_INIT: Once = Once::new();
 static NOTE_ONCE: AtomicBool = AtomicBool::new(false);
 /// Caches the `PALACE_DUMP_SCRIPTS` decision so it is read at most once.
 static DUMP_SCRIPTS: OnceLock<bool> = OnceLock::new();
+/// Caches the `PALACE_DUMP_VARS` decision so it is read at most once.
+static DUMP_VARS: OnceLock<bool> = OnceLock::new();
 
 /// One open trace target.
 ///
@@ -528,6 +533,33 @@ pub fn worn_props(user_id: i32, props: &[AssetSpec]) {
     }
 }
 
+/// The signed-in user's own move was applied to the model before the wire.
+pub fn self_move_applied(user_id: i32, x: i32, y: i32, changed: bool) {
+    let Some(tracer) = tracer() else {
+        return;
+    };
+    tracer.state(&format!(
+        "self_move local id={user_id} to=({x},{y}) changed={changed}"
+    ));
+}
+
+/// The predicted move was written to the server.
+pub fn move_sent(user_id: i32, x: i32, y: i32) {
+    let Some(tracer) = tracer() else {
+        return;
+    };
+    tracer.state(&format!("move_sent id={user_id} to=({x},{y})"));
+}
+
+/// The predicted move asked for its own frame, before the loop waits on the
+/// socket for a server reply.
+pub fn redraw_requested(user_id: i32, x: i32, y: i32) {
+    let Some(tracer) = tracer() else {
+        return;
+    };
+    tracer.state(&format!("redraw_requested id={user_id} to=({x},{y})"));
+}
+
 // ---------------------------------------------------------------------------
 // PALACE_DUMP_SCRIPTS: the live hotspot-script dump
 // ---------------------------------------------------------------------------
@@ -575,6 +607,51 @@ pub fn dump_scripts(room: &RoomDesc) {
             hotspot.id
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// PALACE_DUMP_VARS: the script variable store at each dispatch
+// ---------------------------------------------------------------------------
+
+/// Whether the script variable-store dump is on.
+///
+/// Read once and cached, like [`dump_scripts_enabled`], so the hot path never
+/// touches the environment.
+#[must_use]
+pub fn dump_vars_enabled() -> bool {
+    *DUMP_VARS.get_or_init(|| std::env::var_os(DUMP_VARS_ENV_VAR).is_some())
+}
+
+/// Print the script variable store around one dispatch to stderr.
+///
+/// Enabled by `PALACE_DUMP_VARS`. `before` is the global store as the handlers
+/// saw it and `after` as they left it, both already rendered as text, so the
+/// line shows both the gate's inputs and any assignment the handler made.
+/// `username` is the host's `USERNAME`, which is a command rather than a
+/// variable and so never appears in the global store itself.
+pub fn dump_vars(
+    handler: &str,
+    spot: Option<i32>,
+    username: &str,
+    before: &[(String, String)],
+    after: &[(String, String)],
+) {
+    if !dump_vars_enabled() {
+        return;
+    }
+    eprintln!(
+        "palace-dump-vars: event={handler} spot={} USERNAME={username:?} before=[{}] after=[{}]",
+        spot.map_or_else(|| "-".to_string(), |spot| spot.to_string()),
+        render_vars(before),
+        render_vars(after)
+    );
+}
+
+fn render_vars(vars: &[(String, String)]) -> String {
+    vars.iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ---------------------------------------------------------------------------

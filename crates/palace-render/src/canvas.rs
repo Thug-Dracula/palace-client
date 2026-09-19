@@ -47,15 +47,16 @@ impl Dpr {
 
 /// Deflate mode for the frame PNG.
 ///
-/// The frame is re-encoded on every click and served to a webview, so encoding
-/// latency dominates the compose path. The `png` crate default (deflate level 6
-/// with adaptive row filtering) costs ~160 ms per frame in release and over a
-/// second in a debug build; fdeflate does the same job in ~4 ms and ~120 ms.
-const FRAME_COMPRESSION: png::Compression = png::Compression::Fastest;
+/// The frame is re-encoded on every click and served to a webview over the
+/// in-process `palace://` scheme, so encoding latency dominates the compose path
+/// while the transfer is essentially free. Stored (uncompressed) deflate trades
+/// a larger frame for a much shorter encode: in a debug build the fastest deflate
+/// still costs ~100 ms per 1024x768 frame, where storing is a copy.
+const FRAME_COMPRESSION: png::Compression = png::Compression::NoCompression;
 
-/// Row filter for the frame PNG. A fixed `Up` filter is what makes
-/// [`FRAME_COMPRESSION`] fast: adaptive filtering re-scores every row.
-const FRAME_FILTER: png::Filter = png::Filter::Up;
+/// Row filter for the frame PNG. Filtering only helps compression, which is
+/// disabled, so it would be pure per-pixel work.
+const FRAME_FILTER: png::Filter = png::Filter::NoFilter;
 
 /// Apply the frame-PNG encoder settings, shared by [`Canvas::to_png_bytes`] and
 /// [`Canvas::write_png`] so the in-memory and file paths can never drift apart.

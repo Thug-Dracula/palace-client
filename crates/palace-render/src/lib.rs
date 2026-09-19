@@ -76,7 +76,10 @@ pub use chattext::{
     chat_position, chat_text, draw_chat_text, ChatRender, ChatStyle, ChatText, CHAT_GLOW_RADIUS,
     CHAT_X_GAP, CHAT_Y_OFFSET, MAX_CHAT_TEXT_CHARS,
 };
-pub use compositor::{draw_into, render, sort_avatars, AnimationClock, RenderOptions};
+pub use compositor::{
+    draw_above_into, draw_base_into, draw_into, render, render_base, sort_avatars, AnimationClock,
+    RenderOptions,
+};
 pub use corpus::RoomSource;
 pub use draw::{
     absolute_points, ellipse_geometry, is_ellipse, layer_of, rasterize_back, rasterize_front,

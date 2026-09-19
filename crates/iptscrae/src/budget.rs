@@ -12,11 +12,11 @@
 //! GREPSUB results. Later clients raised the stack limit, so the same script can
 //! run or overflow depending on who hosts it:
 //!
-//! | Dialect | Stack items | Source |
-//! |---|---|---|
-//! | Windows / Mac client | 256 | *Iptscrae Language Guide*, appendix B |
-//! | PalaceChat | 1024 | [iptService.js] `MAX_STACK` |
-//! | OpenPalace | 2048 | `IptConstants.STACK_DEPTH` |
+//! | Dialect | Stack items | Nesting | `WHILE` iterations | Source |
+//! |---|---|---|---|---|
+//! | Windows / Mac client | 256 | 64 | 7500 | *Iptscrae Language Guide*, appendix B |
+//! | PalaceChat | 1024 | 256 | 7500 | [iptService.js] `MAX_STACK`, `gWhileMaxIteration` |
+//! | OpenPalace | 2048 | 256 | unbounded | `IptConstants.STACK_DEPTH`, `RECURSION_LIMIT` |
 //!
 //! [iptService.js]: https://github.com/OpenPalace
 //!
@@ -25,6 +25,17 @@
 //! tested against — and the iptService budgets for loops and nesting. Use
 //! [`Limits::windows`], [`Limits::palacechat`] or [`Limits::openpalace`] to pin a
 //! specific dialect; every field is public so a host can mix and match.
+//!
+//! ## Deliberate divergences from OpenPalace
+//!
+//! OpenPalace's AS3 VM has no `WHILE` cap: a loop runs until its condition is
+//! false, and only the executor's step slicing keeps the UI responsive. Our
+//! `while_iterations` cap is hardening inherited from PalaceChat
+//! (`iptService.js:14`, `gWhileMaxIteration = 7500`), so it is absent from
+//! [`Limits::openpalace`] (`while_iterations = u64::MAX`, i.e. unbounded). A
+//! runaway loop is still stopped by [`Limits::steps`], which is also not a
+//! reference limit — the AS3 VM is unbounded per activation — but is kept so an
+//! untrusted script can never hang the client.
 
 /// A named stack-limit dialect from the reference clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +92,25 @@ impl StackDialect {
             StackDialect::OpenPalace => 2048,
         }
     }
+
+    /// The atomlist/`EXEC` nesting this dialect allows.
+    pub const fn nesting(self) -> usize {
+        match self {
+            StackDialect::Windows => 64,
+            StackDialect::PalaceChat | StackDialect::OpenPalace => 256,
+        }
+    }
+
+    /// The `WHILE` iteration cap this dialect allows.
+    ///
+    /// `u64::MAX` means the reference's unbounded loop; PalaceChat and the
+    /// original Windows client cap at 7500.
+    pub const fn while_iterations(self) -> u64 {
+        match self {
+            StackDialect::Windows | StackDialect::PalaceChat => 7_500,
+            StackDialect::OpenPalace => u64::MAX,
+        }
+    }
 }
 
 impl Limits {
@@ -88,7 +118,8 @@ impl Limits {
     pub const fn windows() -> Self {
         Self {
             stack_depth: StackDialect::Windows.stack_depth(),
-            nesting: 64,
+            nesting: StackDialect::Windows.nesting(),
+            while_iterations: StackDialect::Windows.while_iterations(),
             ..Self::base()
         }
     }
@@ -97,15 +128,18 @@ impl Limits {
     pub const fn palacechat() -> Self {
         Self {
             stack_depth: StackDialect::PalaceChat.stack_depth(),
+            nesting: StackDialect::PalaceChat.nesting(),
+            while_iterations: StackDialect::PalaceChat.while_iterations(),
             ..Self::base()
         }
     }
 
-    /// OpenPalace's VM limits: 2048 stack items, 256 recursion.
+    /// OpenPalace's VM limits: 2048 stack items, 256 recursion, no `WHILE` cap.
     pub const fn openpalace() -> Self {
         Self {
             stack_depth: StackDialect::OpenPalace.stack_depth(),
-            nesting: 256,
+            nesting: StackDialect::OpenPalace.nesting(),
+            while_iterations: StackDialect::OpenPalace.while_iterations(),
             ..Self::base()
         }
     }
@@ -128,9 +162,13 @@ impl Limits {
         }
     }
 
-    /// Override the stack depth with a named dialect, keeping everything else.
+    /// Select a named dialect, applying all of its limits (stack, nesting and
+    /// `WHILE` cap). This is how a host that only knows the dialect name — for
+    /// example the `--dialect` flag — reaches [`Self::openpalace`].
     pub const fn with_dialect(mut self, dialect: StackDialect) -> Self {
         self.stack_depth = dialect.stack_depth();
+        self.nesting = dialect.nesting();
+        self.while_iterations = dialect.while_iterations();
         self
     }
 }
@@ -151,6 +189,11 @@ mod tests {
         assert_eq!(StackDialect::Windows.stack_depth(), 256);
         assert_eq!(StackDialect::PalaceChat.stack_depth(), 1024);
         assert_eq!(StackDialect::OpenPalace.stack_depth(), 2048);
+        assert_eq!(StackDialect::Windows.nesting(), 64);
+        assert_eq!(StackDialect::PalaceChat.nesting(), 256);
+        assert_eq!(StackDialect::OpenPalace.nesting(), 256);
+        assert_eq!(StackDialect::PalaceChat.while_iterations(), 7_500);
+        assert_eq!(StackDialect::OpenPalace.while_iterations(), u64::MAX);
     }
 
     #[test]
@@ -158,18 +201,31 @@ mod tests {
         assert_eq!(Limits::windows().stack_depth, 256);
         assert_eq!(Limits::windows().nesting, 64);
         assert_eq!(Limits::palacechat().stack_depth, 1024);
+        assert_eq!(Limits::palacechat().while_iterations, 7_500);
         assert_eq!(Limits::openpalace().stack_depth, 2048);
         assert_eq!(Limits::openpalace().nesting, 256);
+        assert_eq!(
+            Limits::openpalace().while_iterations,
+            u64::MAX,
+            "the reference AS3 VM has no WHILE iteration cap"
+        );
         // Default is the PalaceChat dialect.
         assert_eq!(Limits::default().stack_depth, 1024);
     }
 
     #[test]
-    fn with_dialect_only_changes_the_stack_depth() {
-        let base = Limits::default();
-        let swapped = base.with_dialect(StackDialect::OpenPalace);
-        assert_eq!(swapped.stack_depth, 2048);
-        assert_eq!(swapped.while_iterations, base.while_iterations);
-        assert_eq!(swapped.nesting, base.nesting);
+    fn with_dialect_selects_the_whole_preset() {
+        assert_eq!(
+            Limits::default().with_dialect(StackDialect::OpenPalace),
+            Limits::openpalace()
+        );
+        assert_eq!(
+            Limits::default().with_dialect(StackDialect::Windows),
+            Limits::windows()
+        );
+        assert_eq!(
+            Limits::default().with_dialect(StackDialect::PalaceChat),
+            Limits::palacechat()
+        );
     }
 }

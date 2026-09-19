@@ -91,6 +91,10 @@ class PalaceStore {
     void api.setProps(props).catch(() => {});
   }
 
+  takeOffAvatar(): void {
+    this.setProps([]);
+  }
+
   setScale(value: number): void {
     const clamped = Math.min(MAX_SCALE, Math.max(MIN_SCALE, value));
     this.scale = Math.round(clamped * 100) / 100;

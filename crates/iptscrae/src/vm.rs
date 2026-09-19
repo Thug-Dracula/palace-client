@@ -599,6 +599,13 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
             Builtin::Sine => self.trig(Trig::Sine),
             Builtin::Cosine => self.trig(Trig::Cosine),
             Builtin::Tangent => self.trig(Trig::Tangent),
+            Builtin::SquareRoot => {
+                // PalaceChat `iptService.js:478` is `Math.floor(Math.sqrt(n))`;
+                // a negative `n` is NaN there, which `to_int32` maps to 0.
+                let n = self.pop_int()?;
+                self.stack
+                    .push(Value::Int(to_int32(f64::from(n).sqrt().floor())))
+            }
             Builtin::Atoi => {
                 let s = self.pop_str()?;
                 self.stack.push(Value::Int(parse_int_js(&s)))
@@ -617,8 +624,19 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
             }
             Builtin::IptVersion => self.stack.push(Value::Int(1)),
             Builtin::Concat => {
-                let b = self.pop_str()?;
-                let a = self.pop_str()?;
+                let b = self.pop_deref()?;
+                let a = self.pop_deref()?;
+                // PalaceChat `iptService.js:2716` — `&` needs at least one string
+                // operand; when the other is a number it is stringified (JS `+`).
+                // Two non-strings are still a type error.
+                if !matches!(a, Value::Str(_)) && !matches!(b, Value::Str(_)) {
+                    return Err(IptError::TypeMismatch {
+                        expected: "at least one string",
+                        found: b.type_name(),
+                    });
+                }
+                let a = concat_operand(&a)?;
+                let b = concat_operand(&b)?;
                 let mut s = String::with_capacity(a.len() + b.len());
                 s.push_str(&a);
                 s.push_str(&b);
@@ -974,13 +992,15 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
         Ok(Value::Int(0))
     }
 
+    /// Read a name from this activation's local store.
+    ///
+    /// A non-globalized name never reaches the global store: the reference only
+    /// links a name to it through `GLOBAL` (`IptVariable.as` getter/setter,
+    /// `GLOBALCommand.as`). Adding a fallback here would be a superset.
     fn var_get(&mut self, name: &Rc<str>) -> Result<Value> {
         self.ensure_local(name)?;
-        let global = self.locals.get(name).map(|v| v.global).unwrap_or(false);
-        if global {
+        if self.locals.get(name).map(|v| v.global).unwrap_or(false) {
             Ok(self.globals.get(name).cloned().unwrap_or(Value::Int(0)))
-        } else if let Some(stored) = self.globals.get(name).cloned() {
-            Ok(stored)
         } else {
             Ok(self
                 .locals
@@ -1002,12 +1022,14 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
     }
 
     fn globalize(&mut self, name: &Rc<str>) -> Result<()> {
-        if let Some(value) = self.locals.get(name).and_then(|v| v.value.clone()) {
-            self.globals.insert(name.clone(), value);
+        let local = self.locals.get(name).and_then(|v| v.value.clone());
+        let slot = self.globals.entry(name.clone()).or_insert(Value::Int(0));
+        if let Some(value) = local {
+            *slot = value;
         }
         self.ensure_local(name)?;
-        if let Some(slot) = self.locals.get_mut(name) {
-            slot.global = true;
+        if let Some(local) = self.locals.get_mut(name) {
+            local.global = true;
         }
         Ok(())
     }
@@ -1103,6 +1125,19 @@ enum Ordering {
     Le,
     Gt,
     Ge,
+}
+
+/// The text form `&` gives an operand: strings pass through, numbers become
+/// decimal text (`iptService.js:2716`, JS `+`); any other kind is a type error.
+fn concat_operand(value: &Value) -> Result<Rc<str>> {
+    match value {
+        Value::Str(s) => Ok(s.clone()),
+        Value::Int(n) => Ok(Rc::from(n.to_string().as_str())),
+        other => Err(IptError::TypeMismatch {
+            expected: "string or number",
+            found: other.type_name(),
+        }),
+    }
 }
 
 /// ECMAScript `ToInt32`: truncate, wrap modulo 2³², and map non-finite to 0.
@@ -1301,6 +1336,21 @@ impl<H: Host> Engine<H> {
     pub fn globals_len(&self) -> usize {
         self.globals.len()
     }
+
+    /// A snapshot of the shared global store, sorted by name.
+    ///
+    /// Diagnostic only: the values are clones, so the caller cannot change the
+    /// session, and sorting keeps the output stable from run to run.
+    #[must_use]
+    pub fn globals_snapshot(&self) -> Vec<(String, Value)> {
+        let mut out: Vec<(String, Value)> = self
+            .globals
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect();
+        out.sort_by(|left, right| left.0.cmp(&right.0));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -1351,10 +1401,15 @@ mod tests {
     }
 
     #[test]
-    fn plus_is_polymorphic_and_ampersand_is_strict() {
+    fn plus_is_polymorphic_and_ampersand_stringifies_a_number() {
         assert_eq!(text("\"ab\" \"cd\" +"), "abcd");
         assert_eq!(text("\"ab\" \"cd\" &"), "abcd");
-        assert!(run("1 \"cd\" &").is_err(), "& requires two strings");
+        assert_eq!(
+            text("1 \"cd\" &"),
+            "1cd",
+            "& stringifies the number when the other operand is a string"
+        );
+        assert!(run("1 2 &").is_err(), "& still rejects two non-strings");
         assert!(run("1 \"cd\" +").is_err(), "+ needs matching kinds");
     }
 
@@ -1501,6 +1556,59 @@ mod tests {
     }
 
     #[test]
+    fn exec_of_an_unset_name_pushes_nothing_so_the_consumer_underflows() {
+        // The reference's `EXEC` pops and dereferences its operand
+        // (`EXECCommand.as:14`), and an unassigned variable dereferences to the
+        // integer zero (`IptVariable.as:34-35`), on which `EXEC` returns without
+        // pushing (`EXECCommand.as:17-18`). The consumer then pops an empty stack
+        // (`IptTokenStack.as:31-34`), which `AssignOperator.as:11-12` and
+        // `ConcatOperator.as:11-12` surface. Five real-host handlers do exactly
+        // this: `prar` (144_hs1/hs2, defined by 144_hs0's ON ENTER), `hnd`/`vlus`
+        // (9211_hs2, defined by 9211_hs0's ON ENTER), `iam` (5308_hs4, 889_hs0,
+        // defined by 893_hs1:58) and `tavstand` (889_hs0, defined at offset 2970
+        // after `rollit EXEC` runs it). This pins the behaviour so the residual
+        // cannot be "fixed" by inventing a value the reference never pushes.
+        assert_eq!(
+            run("prar EXEC proparray ="),
+            Err(IptError::CommandFailed {
+                command: "Assign".to_owned(),
+                source: Box::new(IptError::StackUnderflow {
+                    needed: 1,
+                    available: 0,
+                }),
+            })
+        );
+        assert_eq!(
+            run("\"x\" iam EXEC &"),
+            Err(IptError::CommandFailed {
+                command: "Concat".to_owned(),
+                source: Box::new(IptError::StackUnderflow {
+                    needed: 1,
+                    available: 0,
+                }),
+            })
+        );
+        assert_eq!(
+            run("4 { 1 + } EXEC"),
+            Ok(vec![Value::Int(5)]),
+            "a defined chunk still supplies its value"
+        );
+    }
+
+    #[test]
+    fn a_global_chunk_defined_by_an_earlier_activation_satisfies_a_later_exec() {
+        let mut engine = Engine::new(NullHost);
+        engine.run_source("{ 7 } prar DEF prar GLOBAL").unwrap();
+        assert_eq!(
+            engine
+                .run_source_resolved("prar GLOBAL prar EXEC proparray = proparray")
+                .unwrap(),
+            vec![Value::Int(7)],
+            "the defining handler and the consumer share one session's globals"
+        );
+    }
+
+    #[test]
     fn def_binds_a_chunk_and_global_shares_it() {
         assert_eq!(int("{ 41 1 + } f DEF f EXEC"), 42);
     }
@@ -1546,6 +1654,27 @@ mod tests {
     #[test]
     fn strtoatom_compiles_and_runs() {
         assert_eq!(int("\"1 2 +\" STRTOATOM EXEC"), 3);
+    }
+
+    #[test]
+    fn squareroot_is_the_integer_part() {
+        assert_eq!(int("0 SQUAREROOT"), 0);
+        assert_eq!(int("9 SQUAREROOT"), 3);
+        assert_eq!(int("16 SQUAREROOT"), 4);
+        assert_eq!(int("20 SQUAREROOT"), 4, "integer part of 4.47…");
+        assert_eq!(int("15 SQUAREROOT"), 3);
+        assert_eq!(int("2147483647 SQUAREROOT"), 46340, "no i32 overflow");
+    }
+
+    #[test]
+    fn squareroot_of_a_negative_is_zero() {
+        assert_eq!(int("-1 SQUAREROOT"), 0);
+        assert_eq!(int("-16 SQUAREROOT"), 0);
+    }
+
+    #[test]
+    fn squareroot_rejects_a_non_number() {
+        assert!(run("\"x\" SQUAREROOT").is_err());
     }
 
     #[test]
@@ -1608,6 +1737,68 @@ mod tests {
     #[test]
     fn global_promotes_an_existing_local_value() {
         assert_eq!(int("9 x = x GLOBAL x"), 9);
+    }
+
+    #[test]
+    fn a_globalized_name_materialises_in_the_shared_store() {
+        let mut engine = Engine::new(NullHost);
+        engine.run_source("boubou GLOBAL").unwrap();
+        assert_eq!(
+            engine.globals_snapshot(),
+            vec![("BOUBOU".to_owned(), Value::Int(0))],
+            "GLOBAL creates the shared slot the reference's store does"
+        );
+    }
+
+    #[test]
+    fn globalize_does_not_clobber_a_shared_value_with_an_unset_local() {
+        let mut engine = Engine::new(NullHost);
+        engine.run_source("boubou GLOBAL 1 boubou =").unwrap();
+        engine.run_source("boubou GLOBAL").unwrap();
+        assert_eq!(
+            engine.globals_snapshot(),
+            vec![("BOUBOU".to_owned(), Value::Int(1))],
+            "a later GLOBAL keeps the value when its local is uninitialised"
+        );
+    }
+
+    #[test]
+    fn a_global_assignment_lands_in_the_shared_store() {
+        let mut engine = Engine::new(NullHost);
+        engine.run_source("X GLOBAL 2 X =").unwrap();
+        assert_eq!(
+            engine.globals_snapshot(),
+            vec![("X".to_owned(), Value::Int(2))],
+            "X GLOBAL must link X to the shared slot the assignment writes"
+        );
+        assert_eq!(
+            engine.run_source_resolved("X GLOBAL X").unwrap(),
+            vec![Value::Int(2)],
+            "a later handler that globalizes X reads the assigned value"
+        );
+    }
+
+    #[test]
+    fn a_non_globalized_name_does_not_see_the_global_store() {
+        let mut engine = Engine::new(NullHost);
+        engine.run_source("7 g GLOBAL g =").unwrap();
+        assert_eq!(
+            engine.run_source_resolved("g").unwrap(),
+            vec![Value::Int(0)],
+            "the reference only reaches the global store through GLOBAL"
+        );
+    }
+
+    #[test]
+    fn a_local_shadowing_a_global_does_not_write_through() {
+        let mut engine = Engine::new(NullHost);
+        engine.run_source("7 g GLOBAL g =").unwrap();
+        engine.run_source("9 g =").unwrap();
+        assert_eq!(
+            engine.run_source_resolved("g GLOBAL g").unwrap(),
+            vec![Value::Int(7)],
+            "the un-globalized assignment wrote a discarded local"
+        );
     }
 
     #[test]

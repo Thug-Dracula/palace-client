@@ -314,6 +314,58 @@ mod tests {
         }
     }
 
+    /// `dpr` sizes the frame buffer, so it must never move where a CSS click
+    /// lands: if a device-pixel factor leaks into the inverse, the same click
+    /// resolves a whole cell away at DPR 2.
+    #[test]
+    fn the_click_inverse_is_a_css_only_map_and_does_not_move_with_dpr() {
+        let room = (512.0, 384.0);
+        let viewport = (878.0, 412.0);
+        for (sx, sy) in [
+            (0.0, 0.0),
+            (160.0, 90.0),
+            (439.0, 206.0),
+            (600.0, 300.0),
+            viewport,
+        ] {
+            let reference =
+                clicked_room_point(&geometry(room, viewport, 1.0, false, 1.0), (sx, sy));
+            for dpr in [1.0, 1.5, 2.0] {
+                let g = geometry(room, viewport, 1.0, false, dpr);
+                assert_eq!(
+                    clicked_room_point(&g, (sx, sy)),
+                    reference,
+                    "the CSS click ({sx},{sy}) must resolve to the same cell at dpr {dpr}"
+                );
+            }
+        }
+    }
+
+    /// A device-pixel position fed to the CSS inverse must not pass for the CSS
+    /// position it came from; the error is many cells, not float noise.
+    #[test]
+    fn a_device_pixel_position_is_not_a_css_viewport_position() {
+        let room = (512.0, 384.0);
+        let viewport = (878.0, 412.0);
+        let dpr = 2.0;
+        let g = geometry(room, viewport, 1.0, false, dpr);
+        for (rx, ry) in [(260.0, 251.0), (255.0, 92.0), (250.0, 221.0)] {
+            let css = g.transform().room_to_viewport(PointF::new(rx, ry));
+            let device = (css.x * dpr, css.y * dpr);
+            assert_eq!(
+                clicked_room_point(&g, (css.x, css.y)),
+                (rx.round(), ry.round()),
+                "the CSS position of room ({rx},{ry}) resolves to that cell"
+            );
+            let via_device = clicked_room_point(&g, device);
+            assert!(
+                (via_device.0 - rx).abs() > 1.0 || (via_device.1 - ry).abs() > 1.0,
+                "a device-pixel position ({device:?}) must not pass for the CSS one: \
+                 room ({rx},{ry}) resolved to {via_device:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_missed_cell_click_returns_that_cell_not_a_neighbour() {
         for (viewport_w, viewport_h, dpr) in [

@@ -68,9 +68,10 @@ const STR: Push = Push::Str;
 /// Extended signatures below cite `reference/repos/sparky/index.js` under the
 /// colosseum reference root: the `GS` command table and handler classes on line 7.
 /// The OpenPalace AS3Iptscrae and PalaceClient command directories have no classes
-/// for these additions. Names absent from both references remain unregistered:
-/// guessing their operand counts would corrupt the stack. In particular, `TEXT`
-/// is not `DRAWTEXT`, and the wire-protocol `PING` constant is not a command.
+/// for these additions. Legacy words with no known stack effect are registered
+/// at the end of the table with zero operands, so a call is an explicit, traced
+/// refusal rather than a silent auto-vivified variable; guessing an operand
+/// count would corrupt the stack. `TEXT` is not `DRAWTEXT`.
 pub const PALACE_COMMANDS: &[CommandSpec] = &[
     // ---- messaging --------------------------------------------------------
     spec("SAY", 1, 0, NONE),
@@ -85,6 +86,9 @@ pub const PALACE_COMMANDS: &[CommandSpec] = &[
     spec("LOGMSG", 1, 0, NONE),
     // ---- identity and state ----------------------------------------------
     spec("ME", 0, 1, INT),
+    // `ID` is the hotspot id, the same value as `ME`
+    // (`PalaceIptscraeCommands.as:29` maps it to `MECommand`); it is not the
+    // user id, which is `USERID`/`WHOME`.
     spec("ID", 0, 1, INT),
     spec("USERID", 0, 1, INT),
     spec("WHOME", 0, 1, INT),
@@ -97,12 +101,19 @@ pub const PALACE_COMMANDS: &[CommandSpec] = &[
     spec("POSX", 0, 1, INT),
     spec("POSY", 0, 1, INT),
     spec("MOUSEPOS", 0, 2, INT),
+    // `MOUSEX`/`MOUSEY` have host arms (`ScriptHost`) but no reference command
+    // table entry (`PalaceIptscraeCommands.as`, `sparky/index.js`). Registering
+    // them would shadow the arena's `mousex`/`mousey` variables — the corpus
+    // declares them with `mousex GLOBAL` — because PalaceChat resolves symbols
+    // to commands case-insensitively, so they stay unregistered variables.
     spec("CLIENTTYPE", 0, 1, STR),
     spec("OPENPALACE", 0, 1, INT),
     spec("IPTVERSION", 0, 1, INT),
     spec("ISGOD", 0, 1, INT),
     spec("ISGUEST", 0, 1, INT),
     spec("ISWIZARD", 0, 1, INT),
+    // Sparky GS `ISRIGHTCLICK:RS` pushes one int.
+    spec("ISRIGHTCLICK", 0, 1, INT),
     spec("WHOCHAT", 0, 1, INT),
     spec("WHOTARGET", 0, 1, INT),
     spec("DEST", 0, 1, INT),
@@ -234,6 +245,17 @@ pub const PALACE_COMMANDS: &[CommandSpec] = &[
     spec("PALACECHAT", 0, 1, INT),
     // Percent-encode a string; Sparky's ENCODEURL wraps `encodeURIComponent`.
     spec("ENCODEURL", 1, 1, STR),
+    // `STR` is deliberately *not* registered. It is not a reference command
+    // (`IptDefaultCommands.as`, `sparky/index.js`); the converter is `ITOA`.
+    // The harvested corpus uses the lower-case spelling as a variable in
+    // `5011_hs0` and `5013_hs1` — `str GLOBAL`, `$1 str =`, `str 2 ==` — and in
+    // a dynamically compiled template (`"str GLOBAL $1 str ="` through
+    // `STRTOATOM`). Registering it turns every one of those into a command call
+    // that never leaves the variable slot `GLOBAL`/`=` need. The host dispatch
+    // table still answers `STR` for a caller that asks directly.
+    // A completed in-script HTTP fetch. Sparky dispatches HTTPRECEIVED as an
+    // event name; called as a word the host answers `0`.
+    spec("HTTPRECEIVED", 0, 1, INT),
     // Ask the user to confirm; Sparky's CONFIRMBOX pops a string and pushes a
     // 0/1 answer. The corpus calls it as `"message" CONFIRMBOX IF`.
     spec("CONFIRMBOX", 1, 1, INT),
@@ -242,6 +264,148 @@ pub const PALACE_COMMANDS: &[CommandSpec] = &[
     spec("HIDESMILEYS", 0, 0, NONE),
     // Stop other users changing our props. Bare, as above.
     spec("LOCKUSERPROPS", 0, 0, NONE),
+    // ---- Sparky GS: pen and drawing -------------------------------------
+    // Operand counts come from the handler classes in the Sparky `GS` table
+    // (`reference/repos/sparky/index.js` line 7); the symbol and byte offset of
+    // each table entry are cited per group below.
+    spec("DRAWTEXT", 3, 0, NONE),       // e1 @56542
+    spec("OVAL", 4, 0, NONE),           // Qw @56534
+    spec("POLYGON", 1, 0, NONE),        // qw @56496
+    spec("PENFONT", 1, 0, NONE),        // t1 @56554
+    spec("PENBOLD", 1, 0, NONE),        // n1 @56565
+    spec("PENITALIC", 1, 0, NONE),      // s1 @56592
+    spec("PENUNDERLINE", 1, 0, NONE),   // o1 @56576
+    spec("PENSHADOW", 1, 0, NONE),      // r1 @56605
+    spec("PENOPACITY", 1, 0, NONE),     // jw @56448
+    spec("PENFILLCOLOR", 3, 0, NONE),   // Xw @56462
+    spec("PENFILLOPACITY", 1, 0, NONE), // Kw @56478
+    // ---- Sparky GS: spot geometry and queries ---------------------------
+    spec("SETSPOTLOC", 3, 0, NONE),          // T1 @56814
+    spec("SETSPOTDEST", 2, 0, NONE),         // E1 @56828
+    spec("SETSPOTPOINTS", 4, 0, NONE),       // Eb @48267
+    spec("SETSPOTPICMODE", 2, 0, NONE),      // Ub @57862
+    spec("SETSPOTCLIP", 2, 0, NONE),         // Lb @57831
+    spec("SETSPOTCURVE", 2, 0, NONE),        // Mb @57846
+    spec("SETSPOTGRADIENT", 4, 0, NONE),     // _b @57758
+    spec("SETSPOTPATHGRADIENT", 4, 0, NONE), // Rb @57777
+    spec("SETSPOTSTYLE", 4, 0, NONE),        // Ob @57800
+    spec("SETSPOTFONT", 10, 0, NONE),        // Ab @57816
+    spec("ADDPICNAME", 3, 0, NONE),          // I1 @56870
+    spec("INSERTPIC", 3, 0, NONE),           // P1 @56884
+    spec("REMOVESPOT", 1, 0, NONE),          // v1 @56800
+    spec("GETSPOTOPTIONS", 1, 3, INT),       // kb @57632
+    spec("GETSPOTPOINTS", 1, 1, INT),        // Tb @57668
+    spec("GETSPOTTYPE", 1, 1, INT),          // S1 @56774
+    spec("GETROOMOPTIONS", 0, 1, INT),       // Sb @57614
+    spec("LOCINSPOT", 2, 1, INT),            // z1 @57089
+    spec("GETSPOTTEXTSIZE", 3, 4, INT),      // BS @58781
+    // ---- Sparky GS: pictures --------------------------------------------
+    spec("GETPICNAME", 2, 1, STR),       // $b @57911
+    spec("GETPICBRIGHTNESS", 2, 1, INT), // Hb @57960
+    spec("GETPICSATURATION", 2, 1, INT), // Wb @57980
+    spec("GETPICOPACITY", 2, 1, INT),    // zb @58000
+    spec("GETPICANGLE", 2, 1, INT),      // Gb @58017
+    spec("GETPICPIXEL", 4, 1, INT),      // Fb @57945
+    spec("SETPICCONTRAST", 3, 0, NONE),  // Vb @58052
+    spec("SETPICHUE", 3, 0, NONE),       // Xb @58090
+    spec("SETPICANGLE", 3, 0, NONE),     // qb @58120
+    spec("SETPICBLUR", 3, 0, NONE),      // Zb @58135
+    spec("SETPICFRAME", 3, 0, NONE),     // Qb @58165
+    spec("NBRPICFRAMES", 2, 1, INT),     // Jb @58149
+    spec("PAUSEPIC", 2, 0, NONE),        // eS @58180
+    spec("RESUMEPIC", 2, 0, NONE),       // tS @58192
+    // ---- Sparky GS: sound -----------------------------------------------
+    spec("SOUNDPLAY", 1, 0, NONE),       // Sr @57382
+    spec("SOUNDPLAYFROM", 1, 0, NONE),   // Sr @57395
+    spec("SOUNDOPEN", 1, 0, NONE),       // Sr @57412
+    spec("SOUNDLOOP", 1, 0, NONE),       // Pc @57425
+    spec("SOUNDSTOP", 1, 0, NONE),       // kr @57450
+    spec("SOUNDPAUSE", 1, 0, NONE),      // kr @57463
+    spec("SOUNDSEEK", 2, 0, NONE),       // NS @58753
+    spec("SOUNDGETPOSITION", 1, 1, INT), // US @58718
+    spec("SOUNDLENGTH", 1, 1, INT),      // DS @58738
+    spec("ISSOUNDPLAYING", 1, 1, INT),   // _c @57489
+    spec("SOUNDISPLAYING", 1, 1, INT),   // _c @57507
+    // ---- Sparky GS: web -------------------------------------------------
+    spec("WEBEMBED", 2, 0, NONE),     // uS @58333
+    spec("WEBLOCATION", 1, 1, STR),   // pS @58345
+    spec("WEBSCRIPT", 2, 0, NONE),    // fS @58372
+    spec("WEBTITLE", 1, 1, STR),      // hS @58360
+    spec("WEBCLICKTHRU", 2, 0, NONE), // mS @58385
+    spec("LOADWEBSITE", 1, 0, NONE),  // dS @58318
+    // ---- Sparky GS: HTTP headers and POST -------------------------------
+    spec("ADDHEADER", 2, 0, NONE),    // u1 @56641
+    spec("REMOVEHEADER", 1, 0, NONE), // p1 @56654
+    spec("RESETHEADERS", 0, 0, NONE), // h1 @56670
+    spec("HTTPPOST", 2, 0, NONE),     // d1 @39854
+    spec("HTTPCANCEL", 0, 0, NONE),   // f1 @56686
+    // ---- Sparky GS: files -----------------------------------------------
+    spec("FILEEXISTS", 1, 1, INT),  // vS @58546
+    spec("FILEDATE", 1, 1, STR),    // TS @58560
+    spec("FILEDELETE", 1, 0, NONE), // ES @58572
+    spec("SELECTFILE", 1, 1, INT),  // xS @58586
+    // ---- Sparky GS: alerts, prompts, cursor and help --------------------
+    spec("ALERTBOX", 1, 0, NONE),     // iS @58282
+    spec("PROMPT", 2, 1, STR),        // lS @58308
+    spec("SETCURSOR", 1, 0, NONE),    // gS @58401
+    spec("SETCURSORPIC", 3, 0, NONE), // yS @58414
+    spec("SETHELPTAG", 1, 0, NONE),   // Rc @58460
+    spec("CLEARHELPTAG", 0, 0, NONE), // Oc @58474
+    // ---- Sparky GS: alarms, identity and time ---------------------------
+    spec("STOPALARM", 1, 0, NONE),  // N1 @57019
+    spec("STOPALARMS", 0, 0, NONE), // $1 @57032
+    spec("TIMEREXEC", 2, 0, NONE),  // D1 @57006
+    spec("CLIENTID", 0, 1, INT),    // Ic @57251
+    spec("GETTIMEZONE", 0, 1, INT), // CS @58600
+    // ---- Sparky GS: other queries and no-ops ----------------------------
+    spec("MEDIAADDRESS", 0, 1, STR),   // IS @58615
+    spec("NBRSERVERUSERS", 0, 1, INT), // tb @57233
+    spec("NBRROOMPICS", 0, 1, INT),    // y1 @56729
+    spec("ROOMPICNAME", 0, 1, STR),    // Q1 @57204
+    spec("ISKEYDOWN", 1, 1, INT),      // _S @58643
+    spec("ISFUNCTION", 1, 1, INT),     // g1 @56715
+    spec("WHEREPROP", 0, 2, INT),      // yw @56117
+    spec("WHOCOLOR", 1, 1, INT),       // rb @57294
+    spec("WHOFACE", 1, 1, INT),        // sb @57283
+    spec("MUTE", 1, 0, NONE),          // Nw @56347
+    spec("UNMUTE", 1, 0, NONE),        // $w @56355
+    spec("CACHESCRIPT", 2, 0, NONE),   // m1 @56700
+    spec("IMAGETOPROP", 1, 0, NONE),   // $S @58766
+    spec("TEXTSPEECH", 1, 0, NONE),    // wb (extends sn) @57586
+    spec("UPDATELATER", 0, 0, NONE),   // bS @58501
+    spec("UPDATENOW", 0, 0, NONE),     // SS @58516
+    // ---- legacy Palace words ------------------------------------------------
+    // No corpus reference defines these (OpenPalace registry, Sparky `GS`,
+    // `docs/iptscrae.txt`). Zero operands matches how the recovered scripts
+    // call them, and keeps a call an explicit refusal rather than a silent
+    // variable; an invented operand count would corrupt the stack.
+    spec("ADDPROP", 0, 0, NONE),
+    spec("AWAY", 0, 0, NONE),
+    spec("CIRCLE", 0, 0, NONE),
+    spec("CLRPROPS", 0, 0, NONE),
+    spec("DELPIC", 0, 0, NONE),
+    spec("FILL", 0, 0, NONE),
+    spec("FLUSH", 0, 0, NONE),
+    spec("GETWHOTALKING", 0, 0, NONE),
+    spec("HIDEPROPS", 0, 0, NONE),
+    spec("MSGTO", 0, 0, NONE),
+    spec("NBRUSERS", 0, 0, NONE),
+    spec("OFFLINE", 0, 0, NONE),
+    spec("ONLINE", 0, 0, NONE),
+    spec("PAINT", 0, 0, NONE),
+    spec("PING", 0, 0, NONE),
+    spec("PURGE", 0, 0, NONE),
+    spec("ROOMDESC", 0, 0, NONE),
+    spec("ROOMUNZOOM", 0, 0, NONE),
+    spec("ROOMZOOM", 0, 0, NONE),
+    spec("SETDESC", 0, 0, NONE),
+    spec("SETPICDIM", 0, 0, NONE),
+    spec("SETPROPSLOCAL", 0, 0, NONE),
+    spec("SETSPOTSTATEALL", 0, 0, NONE),
+    spec("SHOWALLPROPS", 0, 0, NONE),
+    spec("SHOWPROPS", 0, 0, NONE),
+    spec("TEXT", 0, 0, NONE),
+    spec("TOGGLECTRL", 0, 0, NONE),
 ];
 
 /// Register every Palace command name as a host command.
@@ -413,5 +577,128 @@ fn text_arg(args: &[Value], index: usize) -> Result<String> {
             needed: index + 1,
             available: args.len(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_revived_host_names_are_registered() {
+        for name in ["ISRIGHTCLICK", "HTTPRECEIVED"] {
+            assert!(command_spec(name).is_some(), "{name} must be a command");
+        }
+        for name in ["MOUSEX", "MOUSEY", "STR"] {
+            assert!(
+                command_spec(name).is_none(),
+                "{name} must stay a variable: the corpus uses it as one"
+            );
+        }
+    }
+
+    #[test]
+    fn lastname_is_not_a_command() {
+        assert!(command_spec("LASTNAME").is_none());
+    }
+
+    #[test]
+    fn str_is_a_variable_because_the_corpus_assigns_to_it() {
+        assert!(command_spec("STR").is_none());
+        let mut set = CommandSet::core();
+        register_palace_commands(&mut set);
+        assert_eq!(set.get("STR"), None);
+        let limits = iptscrae::Limits::default();
+        let body = iptscrae::lexer::parse_body("str GLOBAL 0 str =", &set, &limits).unwrap();
+        let names: Vec<&str> = body
+            .ops()
+            .iter()
+            .filter_map(|op| match op {
+                iptscrae::value::Op::Var(name) => Some(&**name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["STR", "STR"], "str must lex as a variable");
+    }
+
+    #[test]
+    fn the_legacy_words_are_registered_as_bare_refusals() {
+        for name in [
+            "ADDPROP",
+            "AWAY",
+            "CIRCLE",
+            "CLRPROPS",
+            "DELPIC",
+            "FILL",
+            "FLUSH",
+            "GETWHOTALKING",
+            "HIDEPROPS",
+            "MSGTO",
+            "NBRUSERS",
+            "OFFLINE",
+            "ONLINE",
+            "PAINT",
+            "PING",
+            "PURGE",
+            "ROOMDESC",
+            "ROOMUNZOOM",
+            "ROOMZOOM",
+            "SETDESC",
+            "SETPICDIM",
+            "SETPROPSLOCAL",
+            "SETSPOTSTATEALL",
+            "SHOWALLPROPS",
+            "SHOWPROPS",
+            "TEXT",
+            "TOGGLECTRL",
+        ] {
+            let spec = command_spec(name).unwrap_or_else(|| panic!("{name} must be registered"));
+            assert_eq!(spec.pops, 0, "{name} must not consume operands");
+            assert_eq!(spec.pushes, 0, "{name} must not push a value");
+        }
+    }
+
+    #[test]
+    fn every_group1_host_word_resolves_to_a_command_not_a_variable() {
+        for name in [
+            "ISRIGHTCLICK",
+            "HTTPRECEIVED",
+            "ADDPROP",
+            "AWAY",
+            "CIRCLE",
+            "CLRPROPS",
+            "DELPIC",
+            "FILL",
+            "FLUSH",
+            "GETWHOTALKING",
+            "HIDEPROPS",
+            "MSGTO",
+            "NBRUSERS",
+            "OFFLINE",
+            "ONLINE",
+            "PAINT",
+            "PING",
+            "PURGE",
+            "ROOMDESC",
+            "ROOMUNZOOM",
+            "ROOMZOOM",
+            "SETDESC",
+            "SETPICDIM",
+            "SETPROPSLOCAL",
+            "SETSPOTSTATEALL",
+            "SHOWALLPROPS",
+            "SHOWPROPS",
+            "TEXT",
+            "TOGGLECTRL",
+        ] {
+            assert!(
+                command_spec(name).is_some(),
+                "{name} must resolve to a command, not a variable"
+            );
+        }
+        assert!(
+            command_spec("LASTNAME").is_none(),
+            "LASTNAME was dropped: no reference table defines it"
+        );
     }
 }

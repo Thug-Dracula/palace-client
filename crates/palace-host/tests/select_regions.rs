@@ -153,3 +153,106 @@ fn an_unenrolled_clicker_gets_the_rooms_fallback() {
         );
     }
 }
+
+/// Room 31743's Audience hotspot: `cname GLOBAL USERNAME cname = 1 in69 GLOBAL in69 =`.
+const ENROLL_ON_LEAVE: &str =
+    r#"ON LEAVE { CLEARLOOSEPROPS cname GLOBAL USERNAME cname = 1 in69 GLOBAL in69 = }"#;
+
+fn enrollment_room() -> RoomDesc {
+    let hotspot = Hotspot {
+        id: 1,
+        script: Some(ENROLL_ON_LEAVE.to_string()),
+        ..Hotspot::default()
+    };
+    RoomDesc {
+        header: RoomRec {
+            room_id: 31743,
+            nbr_hotspots: 1,
+            ..RoomRec::default()
+        },
+        name: "<[ Colosseum Menu ]>".to_string(),
+        picture: String::new(),
+        artist: String::new(),
+        password: String::new(),
+        pictures: Vec::new(),
+        hotspots: vec![hotspot],
+        loose_props: Vec::new(),
+        draw_cmds: Vec::new(),
+        var_data: Vec::new(),
+        trailing_len: 0,
+        warnings: Vec::new(),
+    }
+}
+
+fn view_for(room_id: i32, mouse: (i32, i32)) -> HostView {
+    HostView {
+        self_id: 13,
+        self_name: "ArenaTester".to_string(),
+        room_id,
+        room_width: 512,
+        room_height: 384,
+        mouse,
+        ..HostView::default()
+    }
+}
+
+#[test]
+fn a_global_set_in_room_a_is_readable_after_moving_to_room_b() {
+    let mut engine = ScriptEngine::with_palace_limits();
+    engine.set_view(view_for(31743, (0, 0)));
+    engine.load_room(&enrollment_room());
+    let leave = engine.fire(ScriptEvent::Leave);
+    assert!(
+        leave.runs.iter().all(|run| run.error.is_none()),
+        "room 31743's LEAVE enrolls cleanly: {:?}",
+        leave.runs
+    );
+
+    engine.set_view(view_for(7774, (0, 0)));
+    engine.load_room(&room_with(r#"ON SELECT { cname GLOBAL cname SAY }"#));
+    assert_eq!(
+        effects_after(&mut engine, ScriptEvent::Select),
+        vec!["SAY \"ArenaTester\"".to_string()],
+        "the global cname survives the room change"
+    );
+}
+
+/// The exact arena failure: enroll in room 31743, load and fetch in room 7774,
+/// then run the guarded `ON SELECT`. The fetched body must not drop the globals.
+#[test]
+fn enrollment_in_room_a_survives_room_b_and_its_fetched_interface() {
+    let mut engine = ScriptEngine::with_palace_limits();
+    engine.set_view(view_for(31743, (0, 0)));
+    engine.load_room(&enrollment_room());
+    let leave = engine.fire(ScriptEvent::Leave);
+    assert!(
+        leave.runs.iter().all(|run| run.error.is_none()),
+        "room 31743's LEAVE enrolls cleanly: {:?}",
+        leave.runs
+    );
+
+    engine.set_view(view_for(7774, (278, 375)));
+    engine.load_room(&room_with(LIVE_GUARDED_CHAIN));
+    let fetched =
+        engine.execute_fetched_source("but1 GLOBAL but2 GLOBAL \"cust.gif\" but2 =", 7774);
+    assert!(
+        fetched.error.is_none(),
+        "room 7774's fetched interface runs: {:?}",
+        fetched.error
+    );
+
+    assert_eq!(
+        effects_after(&mut engine, ScriptEvent::Select),
+        vec!["GOTOROOM 31747".to_string()],
+        "the enrolled player reaches the band, not the room's fallback"
+    );
+}
+
+fn effects_after(engine: &mut ScriptEngine, event: ScriptEvent) -> Vec<String> {
+    engine
+        .fire_spot(event, 102)
+        .effects
+        .iter()
+        .map(|effect| effect.to_string())
+        .collect()
+}

@@ -5,6 +5,7 @@ use crate::byteorder::{ByteOrder, Reader, Writer};
 use crate::error::{Result, WireError};
 use crate::frame::Frame;
 use crate::opcode;
+use crate::registration::RegistrationCode;
 
 /// Encoded size of an [`AuxRegistrationRec`], in bytes.
 pub const AUX_REGISTRATION_REC_LEN: usize = 128;
@@ -156,6 +157,96 @@ fn read_reserved(r: &mut Reader<'_>) -> Result<[u8; RESERVED_LEN]> {
     Ok(out)
 }
 
+/// A client-generated PUID: the per-install identity a Palace server keys a
+/// session on.
+///
+/// The reference client mints one with [`RegistrationCode::generate`] the first
+/// time it runs and persists it, then sends that same pair on every logon. A
+/// server that sees two connections with one PUID treats them as the same user
+/// and disconnects one, which is why this must not be copied from another
+/// client's capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Puid {
+    /// The wire `puidCtr` (`RegistrationCode::counter`).
+    pub ctr: u32,
+    /// The wire `puidCRC` (`RegistrationCode::crc`).
+    pub crc: u32,
+}
+
+impl From<RegistrationCode> for Puid {
+    fn from(code: RegistrationCode) -> Self {
+        // The reference maps the registration code's `counter` onto `puidCtr`
+        // and its `crc` onto `puidCRC` (`PalaceClient.setPuid`).
+        Puid {
+            ctr: code.counter,
+            crc: code.crc,
+        }
+    }
+}
+
+impl Puid {
+    /// Mint a PUID from `seed`: the current time in milliseconds truncated to
+    /// 32 bits, as the reference client seeds its persisted identity.
+    #[must_use]
+    pub fn generate(seed: u32) -> Self {
+        RegistrationCode::generate(seed).into()
+    }
+}
+
+impl Default for Puid {
+    fn default() -> Self {
+        // OpenPalace's `OPENPALACE_GUEST_PUID` and Taj's guest PUID are both
+        // `generate(0)`; using it keeps a config-less client on a legitimate
+        // guest identity instead of an identity copied from a capture.
+        RegistrationCode::generate(0).into()
+    }
+}
+
+/// The seed offset that keeps the PUID draw distinct from the registration
+/// draw when one persisted seed mints both pairs.
+const PUID_SEED_OFFSET: u32 = 0x9e37_79b9;
+
+/// The per-install identity a logon advertises: the registration pair the
+/// server validates at `crc`/`counter` and the PUID pair at
+/// `puidCtr`/`puidCRC`.
+///
+/// The reference client mints both with [`RegistrationCode::generate`] the
+/// first time it runs and persists them; a server treats two sessions with the
+/// same identity as one user and drops one of them, so neither pair may be
+/// copied from another client's capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIdentity {
+    /// The registration pair written to `crc`/`counter`.
+    pub registration: RegistrationCode,
+    /// The PUID pair written to `puidCtr`/`puidCRC`.
+    pub puid: Puid,
+}
+
+impl ClientIdentity {
+    /// Mint both pairs from `seed`: the registration pair is `generate(seed)`
+    /// and the PUID is an independent draw for an offset seed.
+    #[must_use]
+    pub fn generate(seed: u32) -> Self {
+        ClientIdentity {
+            registration: RegistrationCode::generate(seed),
+            puid: Puid::generate(seed.wrapping_add(PUID_SEED_OFFSET)),
+        }
+    }
+}
+
+impl Default for ClientIdentity {
+    fn default() -> Self {
+        // OpenPalace's `OPENPALACE_GUEST` and `OPENPALACE_GUEST_PUID` are both
+        // `generate(0)`; the guest identity keeps a config-less client
+        // legitimate instead of putting captured constants on the wire.
+        let registration = RegistrationCode::generate(0);
+        ClientIdentity {
+            registration,
+            puid: registration.into(),
+        }
+    }
+}
+
 /// The registration values six independent reference clients agree on
 /// (OpenPalace's `OPENPALACE_GUEST`, Taj's logged-in defaults, pserver's
 /// tolerated range) **as actually written by `palace_walker.py`**, which is
@@ -222,16 +313,45 @@ impl Default for ReferenceProfile {
 }
 
 impl ReferenceProfile {
-    /// Build an [`AuxRegistrationRec`] for `user_name` entering `desired_room`.
+    /// Build an [`AuxRegistrationRec`] for `user_name` entering `desired_room`,
+    /// carrying this profile's own captured identity.
     pub fn to_record(self, user_name: &str, desired_room: i16) -> AuxRegistrationRec {
+        self.to_record_with_identity(
+            user_name,
+            desired_room,
+            ClientIdentity {
+                registration: RegistrationCode {
+                    crc: self.crc,
+                    counter: self.counter,
+                },
+                puid: Puid {
+                    ctr: self.puid_ctr,
+                    crc: self.puid_crc,
+                },
+            },
+        )
+    }
+
+    /// Build an [`AuxRegistrationRec`] for `user_name` entering `desired_room`
+    /// with the supplied `identity` instead of this profile's captured one.
+    ///
+    /// Both the registration pair (`crc`/`counter`) and the PUID are replaced:
+    /// the server keys a session on either pair, so leaving the captured
+    /// registration behind still lets it mistake this install for the capture.
+    pub fn to_record_with_identity(
+        self,
+        user_name: &str,
+        desired_room: i16,
+        identity: ClientIdentity,
+    ) -> AuxRegistrationRec {
         AuxRegistrationRec {
-            crc: self.crc,
-            counter: self.counter,
+            crc: identity.registration.crc,
+            counter: identity.registration.counter,
             user_name: user_name.to_string(),
             wiz_password: String::new(),
             aux_flags: self.aux_flags,
-            puid_ctr: self.puid_ctr,
-            puid_crc: self.puid_crc,
+            puid_ctr: identity.puid.ctr,
+            puid_crc: identity.puid.crc,
             demo_elapsed: self.demo_elapsed,
             total_elapsed: self.total_elapsed,
             demo_limit: self.demo_limit,
@@ -279,6 +399,18 @@ impl ClientProfile {
     pub fn to_record(self, user_name: &str, desired_room: i16) -> AuxRegistrationRec {
         self.0.to_record(user_name, desired_room)
     }
+
+    /// Build an [`AuxRegistrationRec`] with the supplied `identity` instead of
+    /// the profile's captured one.
+    pub fn to_record_with_identity(
+        self,
+        user_name: &str,
+        desired_room: i16,
+        identity: ClientIdentity,
+    ) -> AuxRegistrationRec {
+        self.0
+            .to_record_with_identity(user_name, desired_room, identity)
+    }
 }
 
 /// Build the logon record this client sends for `user_name` without a
@@ -291,6 +423,16 @@ pub fn client_logon_record(user_name: &str, desired_room: i16) -> AuxRegistratio
     ClientProfile::default().to_record(user_name, desired_room)
 }
 
+/// Build the logon record this client sends for `user_name` without a
+/// credential, carrying the supplied `identity`.
+pub fn client_logon_record_with_identity(
+    user_name: &str,
+    desired_room: i16,
+    identity: ClientIdentity,
+) -> AuxRegistrationRec {
+    ClientProfile::default().to_record_with_identity(user_name, desired_room, identity)
+}
+
 /// Build the logon record this client sends for `user_name` when it can answer
 /// an authentication challenge.
 ///
@@ -299,6 +441,15 @@ pub fn client_logon_record(user_name: &str, desired_room: i16) -> AuxRegistratio
 /// [`authresponse_frame`] supplies the reply that bit promises.
 pub fn authenticating_logon_record(user_name: &str, desired_room: i16) -> AuxRegistrationRec {
     ReferenceProfile::default().to_record(user_name, desired_room)
+}
+
+/// Like [`authenticating_logon_record`] but carrying the supplied `identity`.
+pub fn authenticating_logon_record_with_identity(
+    user_name: &str,
+    desired_room: i16,
+    identity: ClientIdentity,
+) -> AuxRegistrationRec {
+    ReferenceProfile::default().to_record_with_identity(user_name, desired_room, identity)
 }
 
 /// Build the `MSG_AUTHRESPONSE` (`autr`) frame that answers a server's
@@ -500,5 +651,100 @@ mod tests {
         let body = record.encode_to_vec(ByteOrder::Little);
         assert_eq!(body.len(), AUX_REGISTRATION_REC_LEN);
         assert_eq!(body[8], 31);
+    }
+
+    #[test]
+    fn a_supplied_identity_replaces_only_the_identity_fields() {
+        let identity = ClientIdentity {
+            registration: RegistrationCode {
+                crc: 0x1357_2468,
+                counter: 0x90ab_cdef,
+            },
+            puid: Puid {
+                ctr: 0x1122_3344,
+                crc: 0x5566_7788,
+            },
+        };
+        let record = client_logon_record_with_identity("Rico", 0, identity);
+
+        assert_eq!(record.crc, identity.registration.crc);
+        assert_eq!(record.counter, identity.registration.counter);
+        assert_eq!(record.puid_ctr, identity.puid.ctr);
+        assert_eq!(record.puid_crc, identity.puid.crc);
+        assert_eq!(
+            record.aux_flags,
+            client_logon_record("Rico", 0).aux_flags,
+            "supplying an identity must not disturb the rest of the client profile"
+        );
+    }
+
+    #[test]
+    fn a_generated_identity_replaces_both_captured_pairs() {
+        let captured = ReferenceProfile::default();
+        let record =
+            client_logon_record_with_identity("Rico", 0, ClientIdentity::generate(0x0bad_f00d));
+
+        assert_ne!(record.crc, captured.crc);
+        assert_ne!(record.counter, captured.counter);
+        assert_ne!(record.puid_ctr, captured.puid_ctr);
+        assert_ne!(record.puid_crc, captured.puid_crc);
+    }
+
+    #[test]
+    fn the_default_identity_is_the_generated_guest_not_the_capture() {
+        let guest = RegistrationCode::generate(0);
+        let identity = ClientIdentity::default();
+        assert_eq!(identity.registration, guest);
+        assert_eq!(identity.puid, Puid::from(guest));
+        let record = client_logon_record_with_identity("Rico", 0, identity);
+        assert_eq!(record.crc, 0x5905_f923);
+        assert_eq!(record.counter, 0xcf07_309c);
+        assert_ne!(record.crc, ReferenceProfile::default().crc);
+        assert_ne!(record.puid_ctr, ReferenceProfile::default().puid_ctr);
+    }
+
+    #[test]
+    fn a_generated_identity_draws_two_distinct_pairs() {
+        let identity = ClientIdentity::generate(0x0ee1_f3d9);
+        assert_eq!(
+            identity.registration,
+            RegistrationCode::generate(0x0ee1_f3d9)
+        );
+        assert_ne!(identity.puid.ctr, identity.registration.counter);
+        assert_ne!(identity.puid.crc, identity.registration.crc);
+    }
+
+    #[test]
+    fn an_authenticating_logon_with_an_identity_keeps_the_authenticate_bit() {
+        let identity = ClientIdentity {
+            registration: RegistrationCode {
+                crc: 0x0102_0304,
+                counter: 0x0506_0708,
+            },
+            puid: Puid {
+                ctr: 0x1122_3344,
+                crc: 0x5566_7788,
+            },
+        };
+        let record = authenticating_logon_record_with_identity("Rico", 0, identity);
+        assert_eq!(record.crc, identity.registration.crc);
+        assert_eq!(record.counter, identity.registration.counter);
+        assert_eq!(record.puid_ctr, identity.puid.ctr);
+        assert_eq!(record.puid_crc, identity.puid.crc);
+        assert_eq!(
+            record.aux_flags & aux_flags::AUTHENTICATE,
+            aux_flags::AUTHENTICATE
+        );
+    }
+
+    #[test]
+    fn a_registration_code_maps_to_a_puid_the_way_the_reference_writes_it() {
+        let code = RegistrationCode {
+            crc: 0xaaaa_bbbb,
+            counter: 0xcccc_dddd,
+        };
+        let puid = Puid::from(code);
+        assert_eq!(puid.crc, code.crc);
+        assert_eq!(puid.ctr, code.counter);
     }
 }

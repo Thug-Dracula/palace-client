@@ -23,10 +23,11 @@ mod user;
 pub use asset::PropUpload;
 pub use chat::{Talk, Whisper};
 pub use draw::Draw;
-pub use lists::{RoomList, RoomListRec, UserList, UserListRec};
+pub use lists::{RoomList, RoomListRec, RoomUserList, UserList, UserListRec};
 pub use logon::{
-    authenticating_logon_record, authresponse_frame, aux_flags, client_logon_record,
-    reference_logon_record, Authenticate, AuxRegistrationRec, ClientProfile, ReferenceProfile,
+    authenticating_logon_record, authenticating_logon_record_with_identity, authresponse_frame,
+    aux_flags, client_logon_record, client_logon_record_with_identity, reference_logon_record,
+    Authenticate, AuxRegistrationRec, ClientIdentity, ClientProfile, Puid, ReferenceProfile,
 };
 pub use pictures::PictMove;
 pub use props::{PropDel, PropMove, PropNew};
@@ -69,8 +70,8 @@ pub enum Message {
     RoomList(RoomList),
     /// `uLst` — the server-wide user list.
     UserList(UserList),
-    /// `rprs` — users in the current room.
-    RoomUsers(UserList),
+    /// `rprs` — users in the current room, as full `UserRec` records.
+    RoomUsers(RoomUserList),
     /// `nprs` — a user entered the current room.
     UserNew(UserNew),
     /// `eprs` — a user left the current room.
@@ -171,7 +172,7 @@ impl Message {
             opcode::USERLOG => Message::UserLog(UserLog::decode(ref_num, r)?),
             opcode::LISTOFALLROOMS => Message::RoomList(RoomList::decode(ref_num, r)?),
             opcode::LISTOFALLUSERS => Message::UserList(UserList::decode(ref_num, r)?),
-            opcode::USERLIST => Message::RoomUsers(UserList::decode(ref_num, r)?),
+            opcode::USERLIST => Message::RoomUsers(RoomUserList::decode(ref_num, r)?),
             opcode::USERNEW => Message::UserNew(UserNew::decode(ref_num, r)?),
             opcode::USEREXIT => Message::UserExit(UserExit::from_ref_num(ref_num)),
             opcode::USERMOVE => Message::UserMove(UserMove::decode(ref_num, r)?),

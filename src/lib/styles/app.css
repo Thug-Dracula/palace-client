@@ -778,6 +778,16 @@ input[type="range"]::-webkit-slider-thumb {
   outline: none;
 }
 
+.ctx-item:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.ctx-item:disabled:hover {
+  background: none;
+  color: var(--text-1);
+}
+
 .ctx-check {
   flex: none;
   width: 1em;

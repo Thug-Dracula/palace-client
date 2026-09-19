@@ -64,6 +64,9 @@ pub struct DrawList {
     back: Vec<DrawCmd>,
     front: Vec<DrawCmd>,
     history: Vec<DrawLayer>,
+    /// Bumped on every mutation, so a caller caching a rasterized base can tell
+    /// whether the paint has changed without comparing commands.
+    revision: u64,
 }
 
 impl DrawList {
@@ -89,6 +92,7 @@ impl DrawList {
     /// added to; a `DC_Detonate` clears everything; anything else is appended to
     /// the back or front list according to its layer flag.
     pub fn apply(&mut self, cmd: DrawCmd) {
+        self.revision = self.revision.wrapping_add(1);
         match cmd.command {
             draw_cmd::DELETE => {
                 self.undo();
@@ -107,6 +111,7 @@ impl DrawList {
 
     /// Undo the most recent command, if any, returning it.
     pub fn undo(&mut self) -> Option<DrawCmd> {
+        self.revision = self.revision.wrapping_add(1);
         match self.history.pop()? {
             DrawLayer::Back => self.back.pop(),
             DrawLayer::Front => self.front.pop(),
@@ -115,6 +120,7 @@ impl DrawList {
 
     /// Delete every draw command.
     pub fn detonate(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.back.clear();
         self.front.clear();
         self.history.clear();
@@ -142,6 +148,12 @@ impl DrawList {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.back.is_empty() && self.front.is_empty()
+    }
+
+    /// A counter that changes whenever a command is applied, undone or cleared.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 }
 

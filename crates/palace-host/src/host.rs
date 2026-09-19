@@ -125,6 +125,22 @@ impl ScriptHost {
         Ok(stub_values(pushes, push))
     }
 
+    /// Record an explicit, traced refusal and answer with neutral values.
+    ///
+    /// Unlike [`ScriptHost::unimplemented`] this is not a gap: the command is
+    /// recognised, its operands are consumed and the reason is reported, so the
+    /// corpus "reached but not implemented" tally stays at zero.
+    fn refuse(&mut self, name: &str, reason: &str) -> Result<Vec<Value>> {
+        let spec = command_spec(name);
+        let pushes = spec.map_or(0, |s| usize::from(s.pushes));
+        let push = spec.map_or(Push::None, |s| s.push);
+        self.effects.push(Effect::Refused {
+            command: name.to_owned(),
+            reason: reason.to_owned(),
+        });
+        Ok(stub_values(pushes, push))
+    }
+
     fn next_u64(&mut self) -> u64 {
         self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.rng;
@@ -287,6 +303,131 @@ fn as_int(value: &Value, quoted_numbers: bool) -> Option<i64> {
     }
 }
 
+/// A flat `[x y x y …]` operand as `(x, y)` pairs.
+fn flat_points(args: &[Value], index: usize) -> Vec<(i32, i32)> {
+    point_list_arg(args, index)
+        .chunks_exact(2)
+        .map(|pair| (pair[0] as i32, pair[1] as i32))
+        .collect()
+}
+
+/// The local UTC offset in whole hours for `GETTIMEZONE`.
+///
+/// The Sparky reference pushes the IANA zone name, but the corpus template
+/// (`113_hs0.txt`) feeds the result straight into `tz dst + 3600 *`, so the
+/// host answers the numeric offset those scripts consume. The offset comes
+/// from the TZif database at `/etc/localtime`; a `TZ` fixed offset is the
+/// fallback, and `0` (UTC) is the last resort.
+fn local_utc_offset_hours() -> i32 {
+    if let Some(seconds) = std::fs::read("/etc/localtime")
+        .ok()
+        .and_then(|data| tzif_offset_seconds(&data))
+    {
+        return (seconds / 3600) as i32;
+    }
+    if let Ok(tz) = std::env::var("TZ") {
+        if let Some(hours) = fixed_tz_offset_hours(&tz) {
+            return hours;
+        }
+    }
+    0
+}
+
+/// The current UTC offset in seconds from a TZif (`/etc/localtime`) blob.
+fn tzif_offset_seconds(data: &[u8]) -> Option<i64> {
+    if data.len() < 44 || &data[..4] != b"TZif" {
+        return None;
+    }
+    let version = data[4];
+    let counts = |at: usize| -> Option<[usize; 6]> {
+        let mut out = [0usize; 6];
+        for (index, slot) in out.iter_mut().enumerate() {
+            let start = at + index * 4;
+            let bytes: [u8; 4] = data.get(start..start + 4)?.try_into().ok()?;
+            *slot = i32::from_be_bytes(bytes) as usize;
+        }
+        Some(out)
+    };
+    let first = counts(20)?;
+    let first_block =
+        first[3] * 4 + first[3] + first[4] * 6 + first[5] + first[2] * 8 + first[1] + first[0];
+    if matches!(version, b'2' | b'3' | b'4') {
+        let second = 44 + first_block;
+        let wide = counts(second + 20)?;
+        parse_tzif_block(data, second + 44, &wide, true)
+    } else {
+        parse_tzif_block(data, 44, &first, false)
+    }
+}
+
+/// The offset of the transition active now in one TZif data block.
+fn parse_tzif_block(data: &[u8], pos: usize, counts: &[usize; 6], wide: bool) -> Option<i64> {
+    let (timecnt, typecnt, charcnt, leapcnt, isstdcnt, isutcnt) = (
+        counts[3], counts[4], counts[5], counts[2], counts[1], counts[0],
+    );
+    let time_size = if wide { 8 } else { 4 };
+    let transitions = pos;
+    let indices = transitions + timecnt * time_size;
+    let types = indices + timecnt;
+    let end =
+        types + typecnt * 6 + charcnt + leapcnt * (if wide { 12 } else { 8 }) + isstdcnt + isutcnt;
+    if end > data.len() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let mut chosen = 0usize;
+    let mut found = false;
+    for index in 0..timecnt {
+        let at = transitions + index * time_size;
+        let time = if wide {
+            i64::from_be_bytes(data.get(at..at + 8)?.try_into().ok()?)
+        } else {
+            i64::from(i32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?))
+        };
+        if time <= now {
+            chosen = usize::from(*data.get(indices + index)?);
+            found = true;
+        }
+    }
+    if !found || chosen >= typecnt {
+        chosen = (0..typecnt)
+            .find(|&index| data[types + index * 6 + 4] == 0)
+            .unwrap_or(0);
+    }
+    let offset: [u8; 4] = data
+        .get(types + chosen * 6..types + chosen * 6 + 4)?
+        .try_into()
+        .ok()?;
+    Some(i64::from(i32::from_be_bytes(offset)))
+}
+
+/// A POSIX-style fixed-offset `TZ` value, in whole hours.
+fn fixed_tz_offset_hours(tz: &str) -> Option<i32> {
+    let tz = tz.trim();
+    for prefix in ["UTC", "GMT"] {
+        if let Some(rest) = tz.strip_prefix(prefix) {
+            if rest.is_empty() {
+                return Some(0);
+            }
+            let sign = match rest.as_bytes().first()? {
+                b'+' => -1,
+                b'-' => 1,
+                _ => continue,
+            };
+            let digits: String = rest[1..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ':')
+                .collect();
+            let hours = digits.split(':').next()?.parse::<i32>().ok()?;
+            return Some(sign * hours);
+        }
+    }
+    None
+}
+
 impl Host for ScriptHost {
     fn random(&mut self, bound: i64) -> i64 {
         if bound <= 0 {
@@ -334,10 +475,16 @@ impl Host for ScriptHost {
     }
 
     fn initial_variables(&self) -> Vec<(String, Value)> {
-        vec![(
-            "CHATSTR".to_owned(),
-            Value::str(self.view.chat_string.as_str()),
-        )]
+        // `ERRORMSG` is a host-bound string variable, not a command: the GS
+        // variable table binds it to the HTTP error text (`sparky/index.js`),
+        // and corpus `ON HTTPERROR { ERRORMSG LOGMSG }` handlers read it.
+        vec![
+            (
+                "CHATSTR".to_owned(),
+                Value::str(self.view.chat_string.as_str()),
+            ),
+            ("ERRORMSG".to_owned(), Value::str("")),
+        ]
     }
 
     fn command_pops(&self, name: &str) -> usize {
@@ -377,8 +524,13 @@ impl Host for ScriptHost {
             // arena rooms navigate with `ME DEST GOTOROOM`, so collapsing it into
             // `USERID` sent them to the destination of a spot id that does not
             // exist, and left the user id on the stack.
-            "ME" => Ok(vec![Value::Int(self.current_spot)]),
-            "ID" | "USERID" | "WHOME" => Ok(vec![Value::Int(self.get_self_user_id() as i32)]),
+            //
+            // `ID` is the same hotspot id: `PalaceIptscraeCommands.as:29` maps
+            // `ID` to `MECommand`, and the guide documents it as "spotID/doorID
+            // executing script or 0 for Cyborg" — so it must not answer with the
+            // user id the way `USERID`/`WHOME` do.
+            "ME" | "ID" => Ok(vec![Value::Int(self.current_spot)]),
+            "USERID" | "WHOME" => Ok(vec![Value::Int(self.get_self_user_id() as i32)]),
             "USERNAME" => Ok(vec![Value::str(self.get_self_user_name())]),
             "SERVERNAME" => Ok(vec![Value::str(self.get_server_name())]),
             "ROOMID" => Ok(vec![Value::Int(self.get_room_id() as i32)]),
@@ -411,7 +563,6 @@ impl Host for ScriptHost {
             "NBRROOMUSERS" => Ok(vec![Value::Int(self.get_num_room_users() as i32)]),
             "NBRUSERPROPS" => Ok(vec![Value::Int(self.get_num_user_props() as i32)]),
             "TOPPROP" => Ok(vec![Value::Int(self.get_top_prop() as i32)]),
-            "LASTNAME" => Ok(vec![Value::str(String::new())]),
 
             // ------------------------------------------------------ lookups
             "GETSPOTLOC" => {
@@ -454,9 +605,17 @@ impl Host for ScriptHost {
             "USERPROP" => Ok(vec![Value::Int(
                 self.get_user_prop(int_arg(args, 0)?) as i32
             )]),
-            "HASPROP" => Ok(vec![Value::Int(i32::from(
-                self.has_prop_by_id(int_arg(args, 0)?),
-            ))]),
+            // `HASPROP` accepts a prop id or a prop name
+            // (`HASPROPCommand.as:20-22`); a string routes to the by-name
+            // resolver, a number to the id check.
+            "HASPROP" => match args.first() {
+                Some(Value::Str(name)) => {
+                    Ok(vec![Value::Int(i32::from(self.has_prop_by_name(name)))])
+                }
+                _ => Ok(vec![Value::Int(i32::from(
+                    self.has_prop_by_id(int_arg(args, 0)?),
+                ))]),
+            },
             "LOOSEPROP" => Ok(vec![Value::Int(
                 self.get_loose_prop_id_by_index(int_arg(args, 0)?) as i32,
             )]),
@@ -501,14 +660,9 @@ impl Host for ScriptHost {
                 self.effects.push(effect);
                 Ok(Vec::new())
             }
-            "SETSPOTNAMELOCAL" => {
-                let text = text_arg(args, 0)?;
-                let spot = int_arg(args, 1)?;
-                self.effects.push(Effect::Unsupported {
-                    command: format!("SETSPOTNAMELOCAL({spot},{text})"),
-                });
-                Ok(Vec::new())
-            }
+            "SETSPOTNAMELOCAL" => self
+                .set_spot_name_local(int_arg(args, 1)?, &text_arg(args, 0)?)
+                .map(|_| Vec::new()),
             "SETLOC" | "SETLOCLOCAL" => {
                 let x = int_arg(args, 0)?;
                 let y = int_arg(args, 1)?;
@@ -555,8 +709,25 @@ impl Host for ScriptHost {
                 });
                 Ok(Vec::new())
             }
-            "SETPICBRIGHTNESS" | "SETPICSATURATION" | "SETPICDIM" => {
-                self.unimplemented(name, pushes, push)
+            // Operand order matches `SETPICOPACITY`: value, then state, then
+            // spot id. OpenPalace's `SETPICBRIGHTNESSCommand.as:9-13` pops all
+            // three and discards them; Sparky's `setPicFilter` is the reference
+            // mutation this records.
+            "SETPICBRIGHTNESS" => {
+                self.effects.push(Effect::SetPicBrightness {
+                    spot: int_arg(args, 2)? as i32,
+                    state: int_arg(args, 1)? as i32,
+                    value: int_arg(args, 0)? as i32,
+                });
+                Ok(Vec::new())
+            }
+            "SETPICSATURATION" => {
+                self.effects.push(Effect::SetPicSaturation {
+                    spot: int_arg(args, 2)? as i32,
+                    state: int_arg(args, 1)? as i32,
+                    value: int_arg(args, 0)? as i32,
+                });
+                Ok(Vec::new())
             }
             "ADDSPOT" => {
                 let flat = point_list_arg(args, 0);
@@ -658,22 +829,24 @@ impl Host for ScriptHost {
 
             // ------------------------------------------------------ props
             "DONPROP" => {
-                self.effects.push(Effect::DonProp {
-                    prop: loose_int(args, 0)?,
-                });
+                match args.first() {
+                    Some(Value::Str(name)) => self.don_prop_by_name(name)?,
+                    _ => self.don_prop_by_id(loose_int(args, 0)?)?,
+                }
                 Ok(Vec::new())
             }
             "REMOVEPROP" => {
-                self.effects.push(Effect::RemoveProp {
-                    prop: loose_int(args, 0)?,
-                });
+                match args.first() {
+                    Some(Value::Str(name)) => self.doff_prop_by_name(name)?,
+                    _ => self.doff_prop_by_id(loose_int(args, 0)?)?,
+                }
                 Ok(Vec::new())
             }
             "DOFFPROP" => {
                 self.effects.push(Effect::DoffProp);
                 Ok(Vec::new())
             }
-            "NAKED" | "CLEARPROPS" => {
+            "NAKED" | "CLEARPROPS" | "CLRPROPS" => {
                 self.effects.push(Effect::Naked);
                 Ok(Vec::new())
             }
@@ -703,7 +876,15 @@ impl Host for ScriptHost {
                         "Only Prop IDs are allowed to be specified for LOADPROPS.",
                     ));
                 }
-                Ok(Vec::new())
+                let props: Vec<i64> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Value::Int(n) => Some(i64::from(*n)),
+                        _ => None,
+                    })
+                    .collect();
+                drop(items);
+                self.load_props(&props).map(|_| Vec::new())
             }
 
             // ------------------------------------------------------ movement
@@ -765,7 +946,12 @@ impl Host for ScriptHost {
                 });
                 Ok(Vec::new())
             }
-            "KILLUSER" => self.unimplemented(name, pushes, push),
+            // `PalaceController.as:632-635` whispers the literal `` `kill `` to
+            // the target user id.
+            "KILLUSER" => {
+                let user = int_arg(args, 0)?;
+                self.send_private_message(user, "`kill").map(|_| Vec::new())
+            }
             "HIDEAVATARS" => {
                 self.effects.push(Effect::HideAvatars);
                 Ok(Vec::new())
@@ -786,8 +972,39 @@ impl Host for ScriptHost {
                 });
                 Ok(Vec::new())
             }
-            "GOTOURLFRAME" | "LAUNCHEVENT" | "LAUNCHPPA" | "LOADJAVA" | "TALKPPA" => {
-                self.unimplemented(name, pushes, push)
+            "GOTOURLFRAME" => {
+                let url = text_arg(args, 0)?;
+                let frame = text_arg(args, 1)?;
+                self.effects.push(Effect::GotoUrlFrame { url, frame });
+                Ok(Vec::new())
+            }
+            // OpenPalace maps these to `UnsupportedCommand` (pop one value, trace
+            // `"Unsupported Iptscrae Command"`); the Sparky host pops one string
+            // and does nothing. Recording a named effect keeps the call out of
+            // the silent catch-all and lets the runtime report it.
+            "LAUNCHEVENT" => {
+                self.effects.push(Effect::LaunchEvent {
+                    event: text_arg(args, 0)?,
+                });
+                Ok(Vec::new())
+            }
+            "LAUNCHPPA" => {
+                self.effects.push(Effect::LaunchPpa {
+                    ppa: text_arg(args, 0)?,
+                });
+                Ok(Vec::new())
+            }
+            "LOADJAVA" => {
+                self.effects.push(Effect::LoadJava {
+                    url: text_arg(args, 0)?,
+                });
+                Ok(Vec::new())
+            }
+            "TALKPPA" => {
+                self.effects.push(Effect::TalkPpa {
+                    text: text_arg(args, 0)?,
+                });
+                Ok(Vec::new())
             }
 
             // ------------------------------------------------------ sound
@@ -853,7 +1070,7 @@ impl Host for ScriptHost {
                 });
                 Ok(Vec::new())
             }
-            "SHOWLOOSEPROPS" => self.unimplemented(name, pushes, push),
+            "SHOWLOOSEPROPS" => self.show_loose_props().map(|_| Vec::new()),
 
             // ------------------------------------------------------ paint
             "LINE" => {
@@ -894,13 +1111,449 @@ impl Host for ScriptHost {
                 _ => String::new(),
             })]),
             "ENCODEURL" => Ok(vec![Value::str(encode_url(&text_arg(args, 0)?))]),
-            "HIDESMILEYS" | "LOCKUSERPROPS" | "AUTOUSERLAYER" | "REMOVEPIC" | "DELPIC"
-            | "ROOMZOOM" | "ROOMUNZOOM" | "CIRCLE" | "FILL" | "PAINT" | "TEXT" | "PING"
-            | "CLRPROPS" | "SHOWALLPROPS" | "HIDEPROPS" | "SHOWPROPS" | "SETPROPSLOCAL"
-            | "ADDPROP" | "PURGE" | "ROOMDESC" | "OFFLINE" | "ONLINE" | "NBRUSERS"
-            | "GETWHOTALKING" | "MSGTO" | "FLUSH" | "SETSPOTSTATEALL" | "AWAY" | "TOGGLECTRL"
-            | "SETDESC" | "BAN" | "KICK" => self.unimplemented(name, pushes, push),
+            "SHELLCMD" => {
+                self.effects.push(Effect::ShellCommand {
+                    command: text_arg(args, 0)?,
+                });
+                Ok(Vec::new())
+            }
+            "HIDESMILEYS" => {
+                self.effects.push(Effect::HideSmileys);
+                Ok(Vec::new())
+            }
+            "LOCKUSERPROPS" => {
+                self.effects.push(Effect::LockUserProps);
+                Ok(Vec::new())
+            }
+            "AUTOUSERLAYER" => {
+                self.effects.push(Effect::AutoUserLayer {
+                    on: int_arg(args, 0)? > 0,
+                });
+                Ok(Vec::new())
+            }
+            "REMOVEPIC" => {
+                self.effects.push(Effect::RemovePic {
+                    spot: int_arg(args, 1)? as i32,
+                    picture: int_arg(args, 0)? as i32,
+                });
+                Ok(Vec::new())
+            }
+            // OpenPalace has no BAN/KICK; Sparky gates both on operator status
+            // and whispers `` `ban ``/`` `kick `` to user 0 (the server). The
+            // server enforces the privilege, so `is_wizard` is the local gate.
+            "BAN" => {
+                let name = text_arg(args, 0)?;
+                if self.is_wizard() {
+                    self.send_private_message(0, &format!("`ban {name}"))?;
+                }
+                Ok(Vec::new())
+            }
+            "KICK" => {
+                let name = text_arg(args, 0)?;
+                if self.is_wizard() {
+                    self.send_private_message(0, &format!("`kick {name}"))?;
+                }
+                Ok(Vec::new())
+            }
+            "CONFIRMBOX" => {
+                self.effects.push(Effect::Confirm {
+                    text: text_arg(args, 0)?,
+                });
+                Ok(vec![Value::Int(0)])
+            }
 
+            // -------------------------------------------- Sparky GS: pen/draw
+            "DRAWTEXT" => {
+                let text = text_arg(args, 0)?;
+                let x = int_arg(args, 1)? as i32;
+                let y = int_arg(args, 2)? as i32;
+                self.effects.push(Effect::DrawText { text, x, y });
+                Ok(Vec::new())
+            }
+            "OVAL" => {
+                let h = int_arg(args, 0)? as i32;
+                let w = int_arg(args, 1)? as i32;
+                let y = int_arg(args, 2)? as i32;
+                let x = int_arg(args, 3)? as i32;
+                self.effects.push(Effect::DrawOval { x, y, w, h });
+                Ok(Vec::new())
+            }
+            "POLYGON" => {
+                let points = flat_points(args, 0);
+                self.effects.push(Effect::DrawPolygon { points });
+                Ok(Vec::new())
+            }
+            "PENFONT" => {
+                self.effects.push(Effect::SetPenFont {
+                    name: text_arg(args, 0)?,
+                });
+                Ok(Vec::new())
+            }
+            "PENBOLD" => {
+                self.effects.push(Effect::SetPenBold {
+                    on: int_arg(args, 0)? != 0,
+                });
+                Ok(Vec::new())
+            }
+            "PENITALIC" => {
+                self.effects.push(Effect::SetPenItalic {
+                    on: int_arg(args, 0)? != 0,
+                });
+                Ok(Vec::new())
+            }
+            "PENUNDERLINE" => {
+                self.effects.push(Effect::SetPenUnderline {
+                    on: int_arg(args, 0)? != 0,
+                });
+                Ok(Vec::new())
+            }
+            "PENSHADOW" => {
+                self.effects.push(Effect::SetPenShadow {
+                    on: loose_int(args, 0)? != 0,
+                });
+                Ok(Vec::new())
+            }
+            "PENOPACITY" => {
+                self.effects.push(Effect::SetPenOpacity {
+                    value: int_arg(args, 0)? as i32,
+                });
+                Ok(Vec::new())
+            }
+            "PENFILLCOLOR" => {
+                self.effects.push(Effect::SetPenFillColor {
+                    r: int_arg(args, 0)? as i32,
+                    g: int_arg(args, 1)? as i32,
+                    b: int_arg(args, 2)? as i32,
+                });
+                Ok(Vec::new())
+            }
+            "PENFILLOPACITY" => {
+                self.effects.push(Effect::SetPenFillOpacity {
+                    value: int_arg(args, 0)? as i32,
+                });
+                Ok(Vec::new())
+            }
+
+            // ----------------------------------------- Sparky GS: spot geometry
+            "SETSPOTLOC" => {
+                let x = int_arg(args, 0)? as i32;
+                let y = int_arg(args, 1)? as i32;
+                let spot = int_arg(args, 2)? as i32;
+                self.effects.push(Effect::SetSpotLoc { spot, x, y });
+                Ok(Vec::new())
+            }
+            "SETSPOTDEST" => {
+                let spot = int_arg(args, 0)? as i32;
+                let dest = int_arg(args, 1)? as i32;
+                self.effects.push(Effect::SetSpotDest { spot, dest });
+                Ok(Vec::new())
+            }
+            "SETSPOTPOINTS" => {
+                let points = flat_points(args, 0);
+                let x = int_arg(args, 1)? as i32;
+                let y = int_arg(args, 2)? as i32;
+                let spot = int_arg(args, 3)? as i32;
+                self.effects
+                    .push(Effect::SetSpotPoints { spot, x, y, points });
+                Ok(Vec::new())
+            }
+            "SETSPOTPICMODE" => {
+                let mode = int_arg(args, 0)? as i32;
+                let spot = int_arg(args, 1)? as i32;
+                self.effects.push(Effect::SetSpotPicMode { spot, mode });
+                Ok(Vec::new())
+            }
+            "SETSPOTSTYLE" => {
+                let color = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    Some(Value::Int(n)) => n.to_string(),
+                    _ => String::new(),
+                };
+                let border = int_arg(args, 1)? as i32;
+                let size = int_arg(args, 2)? as i32;
+                let spot = int_arg(args, 3)? as i32;
+                self.effects.push(Effect::SetSpotStyle {
+                    spot,
+                    color,
+                    border,
+                    size,
+                });
+                Ok(Vec::new())
+            }
+            "REMOVESPOT" => {
+                self.effects.push(Effect::RemoveSpot {
+                    spot: int_arg(args, 0)? as i32,
+                });
+                Ok(Vec::new())
+            }
+            "ADDPICNAME" => {
+                let name = text_arg(args, 0)?;
+                let spot = int_arg(args, 2)? as i32;
+                self.effects.push(Effect::AddPic { spot, name });
+                Ok(Vec::new())
+            }
+            "GETSPOTTYPE" => {
+                let kind = self
+                    .view
+                    .spot(int_arg(args, 0)? as i32)
+                    .map_or(0, |s| s.kind);
+                Ok(vec![Value::Int(kind)])
+            }
+            "GETSPOTOPTIONS" => {
+                let spot = self.view.spot(int_arg(args, 0)? as i32);
+                let kind = spot.map_or(0, |s| s.kind);
+                let flags = spot.map_or(0, |s| s.flags);
+                Ok(vec![Value::Int(kind), Value::Int(0), Value::Int(flags)])
+            }
+            "GETSPOTPOINTS" => {
+                let flat = self.view.spot(int_arg(args, 0)? as i32).map(|s| {
+                    s.points
+                        .iter()
+                        .flat_map(|(x, y)| [Value::Int(*x), Value::Int(*y)])
+                        .collect::<Vec<Value>>()
+                });
+                Ok(vec![Value::array(flat.unwrap_or_default())])
+            }
+            "GETROOMOPTIONS" => Ok(vec![Value::Int(0)]),
+            "LOCINSPOT" => {
+                let x = int_arg(args, 0)? as i32;
+                let y = int_arg(args, 1)? as i32;
+                let spot = self.view.spot_at(x, y).map_or(0, |s| s.id);
+                Ok(vec![Value::Int(spot)])
+            }
+            // Sparky's `BS` handler pops three operands and answers four zeros
+            // (the browser build has no text metrics).
+            "GETSPOTTEXTSIZE" => Ok(vec![
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+            ]),
+
+            // ----------------------------------------------- Sparky GS: pictures
+            "GETPICNAME" => {
+                let _ = int_arg(args, 0)?;
+                let _ = int_arg(args, 1)?;
+                Ok(vec![Value::str("")])
+            }
+            "GETPICBRIGHTNESS" | "GETPICSATURATION" | "GETPICOPACITY" | "GETPICANGLE" => {
+                let _ = int_arg(args, 0)?;
+                let _ = int_arg(args, 1)?;
+                Ok(vec![Value::Int(0)])
+            }
+            "GETPICPIXEL" => {
+                for index in 0..4 {
+                    let _ = int_arg(args, index)?;
+                }
+                Ok(vec![Value::Int(0)])
+            }
+            "NBRPICFRAMES" => {
+                let _ = int_arg(args, 0)?;
+                let _ = int_arg(args, 1)?;
+                Ok(vec![Value::Int(0)])
+            }
+
+            // -------------------------------------------------- Sparky GS: sound
+            "SOUNDPLAY" | "SOUNDPLAYFROM" | "SOUNDOPEN" => {
+                self.effects.push(Effect::PlaySound {
+                    name: text_arg(args, 0)?,
+                });
+                Ok(Vec::new())
+            }
+            "SOUNDGETPOSITION" | "SOUNDLENGTH" => {
+                let _ = args.first();
+                Ok(vec![Value::Int(0)])
+            }
+            "ISSOUNDPLAYING" | "SOUNDISPLAYING" => {
+                let _ = text_arg(args, 0)?;
+                Ok(vec![Value::Int(0)])
+            }
+
+            // ---------------------------------------------------- Sparky GS: web
+            "WEBEMBED" => {
+                let url = text_arg(args, 0)?;
+                let spot = int_arg(args, 1)? as i32;
+                self.effects.push(Effect::WebEmbed { spot, url });
+                Ok(Vec::new())
+            }
+            "WEBSCRIPT" => {
+                let script = text_arg(args, 0)?;
+                let spot = int_arg(args, 1)? as i32;
+                self.effects.push(Effect::WebScript { spot, script });
+                Ok(Vec::new())
+            }
+            "WEBLOCATION" | "WEBTITLE" => {
+                let _ = int_arg(args, 0)?;
+                Ok(vec![Value::str("")])
+            }
+            "LOADWEBSITE" => {
+                self.effects.push(Effect::GotoUrl {
+                    url: text_arg(args, 0)?,
+                });
+                Ok(Vec::new())
+            }
+
+            // --------------------------------------------------- Sparky GS: HTTP
+            "HTTPCANCEL" => {
+                self.effects.push(Effect::HttpCancel);
+                Ok(Vec::new())
+            }
+
+            // --------------------------------------------------- Sparky GS: files
+            // Sparky resolves a file name against the room's picture list; this
+            // host keeps picture ids but not names, so the honest answer is
+            // "not found".
+            "FILEEXISTS" => {
+                let _ = text_arg(args, 0)?;
+                Ok(vec![Value::Int(0)])
+            }
+            "FILEDATE" => {
+                let _ = text_arg(args, 0)?;
+                Ok(vec![Value::str("")])
+            }
+            "SELECTFILE" => {
+                let _ = text_arg(args, 0)?;
+                Ok(vec![Value::Int(0)])
+            }
+
+            // ------------------------------------------ Sparky GS: alerts/prompt
+            "ALERTBOX" => {
+                self.effects.push(Effect::Alert {
+                    text: text_arg(args, 0)?,
+                });
+                Ok(Vec::new())
+            }
+            "PROMPT" => {
+                let label = text_arg(args, 0)?;
+                let default = text_arg(args, 1)?;
+                self.effects.push(Effect::Prompt {
+                    label,
+                    default: default.clone(),
+                });
+                Ok(vec![Value::str(default)])
+            }
+            "SETCURSOR" => {
+                self.effects.push(Effect::SetCursor {
+                    index: int_arg(args, 0)? as i32,
+                });
+                Ok(Vec::new())
+            }
+            "SETCURSORPIC" => {
+                let name = text_arg(args, 2)?;
+                let x = int_arg(args, 0)? as i32;
+                let y = int_arg(args, 1)? as i32;
+                self.effects.push(Effect::SetCursorPic { name, x, y });
+                Ok(Vec::new())
+            }
+            "SETHELPTAG" => self.set_tooltip(&text_arg(args, 0)?).map(|()| Vec::new()),
+            "CLEARHELPTAG" => self.clear_tooltip().map(|()| Vec::new()),
+
+            // ---------------------------------------- Sparky GS: alarms/identity
+            "TIMEREXEC" => {
+                let body = chunk_arg(args, 0)?.clone();
+                let ticks = int_arg(args, 1)?.max(0);
+                self.alarms.push(PendingAlarm {
+                    ticks,
+                    kind: AlarmKind::Body(body),
+                    spot: self.current_spot,
+                });
+                Ok(Vec::new())
+            }
+            "STOPALARM" => {
+                let spot = int_arg(args, 0)? as i32;
+                self.alarms.retain(|alarm| alarm.spot != spot);
+                Ok(Vec::new())
+            }
+            "STOPALARMS" => self.clear_alarms().map(|()| Vec::new()),
+            "CLIENTID" => Ok(vec![Value::Int(self.get_self_user_id() as i32)]),
+            "GETTIMEZONE" => Ok(vec![Value::Int(local_utc_offset_hours())]),
+
+            // --------------------------------------------- Sparky GS: other reads
+            "MEDIAADDRESS" => Ok(vec![Value::str("")]),
+            "NBRSERVERUSERS" => Ok(vec![Value::Int(self.view.users.len() as i32)]),
+            "NBRROOMPICS" => Ok(vec![Value::Int(0)]),
+            "ROOMPICNAME" => Ok(vec![Value::str("")]),
+            "ISKEYDOWN" => {
+                let _ = int_arg(args, 0)?;
+                Ok(vec![Value::Int(0)])
+            }
+            "WHEREPROP" => Ok(vec![Value::Int(0), Value::Int(0)]),
+            "WHOCOLOR" => {
+                let user = int_arg(args, 0)?;
+                let color = if user == i64::from(self.view.self_id) {
+                    self.view.color
+                } else {
+                    0
+                };
+                Ok(vec![Value::Int(color)])
+            }
+            "WHOFACE" => {
+                let user = int_arg(args, 0)?;
+                let face = if user == i64::from(self.view.self_id) {
+                    self.view.face
+                } else {
+                    0
+                };
+                Ok(vec![Value::Int(face)])
+            }
+            "MUTE" | "UNMUTE" => {
+                let target = text_arg(args, 0)?;
+                if self.is_wizard() {
+                    let verb = if name == "MUTE" { "mute" } else { "unmute" };
+                    self.send_private_message(0, &format!("`{verb} {target}"))?;
+                }
+                Ok(Vec::new())
+            }
+
+            // ------------------------------- Sparky GS: explicit, traced refusals
+            "SETSPOTCLIP"
+            | "SETSPOTCURVE"
+            | "SETSPOTGRADIENT"
+            | "SETSPOTPATHGRADIENT"
+            | "SETSPOTFONT" => self.refuse(
+                name,
+                "hotspot gradient, curve, clip and font rendering is not wired into this client",
+            ),
+            "INSERTPIC" => self.refuse(
+                name,
+                "inserting a picture at an index is not wired into this client",
+            ),
+            "SETPICCONTRAST" | "SETPICHUE" | "SETPICANGLE" | "SETPICBLUR" | "SETPICFRAME"
+            | "PAUSEPIC" | "RESUMEPIC" => self.refuse(
+                name,
+                "picture filter and frame animation is not wired into this client",
+            ),
+            "SOUNDLOOP" | "SOUNDSTOP" | "SOUNDPAUSE" | "SOUNDSEEK" => self.refuse(
+                name,
+                "sound looping, stopping and seeking is not tracked by this client",
+            ),
+            "WEBCLICKTHRU" => self.refuse(
+                name,
+                "click-through control for embedded web views is not available",
+            ),
+            "ADDHEADER" | "REMOVEHEADER" | "RESETHEADERS" | "HTTPPOST" => self.refuse(
+                name,
+                "HTTP headers and POST are not exposed to scripts by this client",
+            ),
+            "FILEDELETE" => self.refuse(name, "scripts may not delete files on this client"),
+            "ISFUNCTION" => self.refuse(
+                name,
+                "the command dictionary is not exposed to scripts at runtime",
+            ),
+            "CACHESCRIPT" => self.refuse(
+                name,
+                "script caching is internal to the engine and not script-driven",
+            ),
+            "IMAGETOPROP" => self.refuse(name, "converting an image to a prop is not available"),
+            "TEXTSPEECH" => self.refuse(name, "text-to-speech output is not available"),
+            "UPDATELATER" | "UPDATENOW" => self.refuse(
+                name,
+                "the reference handler is a no-op; this client reports it",
+            ),
+
+            // The legacy Palace commands below have no implementation in any
+            // reference in the corpus (OpenPalace, Sparky's GS table, or the
+            // guide), so they stay explicit, traced refusals via the catch-all.
             _ => self.unimplemented(name, pushes, push),
         }
     }
@@ -930,16 +1583,20 @@ impl PalaceHost for ScriptHost {
         self.view.is_guest
     }
 
+    /// `PalaceController.as:210-213`: `isWizard()` returns
+    /// `currentUser.isWizard || currentUser.isGod`, so a server owner answers
+    /// `ISWIZARD` true here too.
     fn is_wizard(&self) -> bool {
-        self.view.is_wizard
+        self.view.is_wizard || self.view.is_god
     }
 
     fn is_god(&self) -> bool {
         self.view.is_god
     }
 
+    /// `CLIENTTYPECommand.as:10` pushes the literal `"WINDOWS32"`.
     fn client_type(&self) -> String {
-        "OPENPALACE".to_owned()
+        "WINDOWS32".to_owned()
     }
 
     fn get_room_id(&self) -> i64 {
@@ -1119,8 +1776,9 @@ impl PalaceHost for ScriptHost {
     }
 
     fn set_spot_name_local(&mut self, spot: i64, name: &str) -> Result<()> {
-        self.effects.push(Effect::Unsupported {
-            command: format!("SETSPOTNAMELOCAL({spot},{name})"),
+        self.effects.push(Effect::SetSpotNameLocal {
+            spot: spot as i32,
+            name: name.to_owned(),
         });
         Ok(())
     }
@@ -1241,16 +1899,19 @@ impl PalaceHost for ScriptHost {
         self.view.self_props.len() as i64
     }
 
-    fn get_prop_id_by_name(&self, _name: &str) -> i64 {
-        0
+    /// A numeric string names a prop id directly; the Palace prop format stores
+    /// no name, so any other spelling resolves to `0` (not worn).
+    fn get_prop_id_by_name(&self, name: &str) -> i64 {
+        name.trim().parse::<i64>().unwrap_or(0)
     }
 
     fn has_prop_by_id(&self, prop: i64) -> bool {
         self.view.self_props.contains(&prop)
     }
 
-    fn has_prop_by_name(&self, _name: &str) -> bool {
-        false
+    fn has_prop_by_name(&self, name: &str) -> bool {
+        let prop = self.get_prop_id_by_name(name);
+        prop != 0 && self.has_prop_by_id(prop)
     }
 
     fn don_prop_by_id(&mut self, prop: i64) -> Result<()> {
@@ -1259,10 +1920,11 @@ impl PalaceHost for ScriptHost {
     }
 
     fn don_prop_by_name(&mut self, name: &str) -> Result<()> {
-        self.effects.push(Effect::Unsupported {
-            command: format!("DONPROP({name:?})"),
-        });
-        Ok(())
+        let prop = self.get_prop_id_by_name(name);
+        if prop == 0 {
+            return Ok(());
+        }
+        self.don_prop_by_id(prop)
     }
 
     fn set_props(&mut self, props: &[i64]) -> Result<()> {
@@ -1283,10 +1945,11 @@ impl PalaceHost for ScriptHost {
     }
 
     fn doff_prop_by_name(&mut self, name: &str) -> Result<()> {
-        self.effects.push(Effect::Unsupported {
-            command: format!("REMOVEPROP({name:?})"),
-        });
-        Ok(())
+        let prop = self.get_prop_id_by_name(name);
+        if prop == 0 {
+            return Ok(());
+        }
+        self.doff_prop_by_id(prop)
     }
 
     fn naked(&mut self) -> Result<()> {
@@ -1294,7 +1957,10 @@ impl PalaceHost for ScriptHost {
         Ok(())
     }
 
-    fn load_props(&mut self, _props: &[i64]) -> Result<()> {
+    fn load_props(&mut self, props: &[i64]) -> Result<()> {
+        self.effects.push(Effect::LoadProps {
+            props: props.to_vec(),
+        });
         Ok(())
     }
 
@@ -1358,7 +2024,16 @@ impl PalaceHost for ScriptHost {
         Ok(())
     }
 
+    /// `PalaceController.as:697-706` appends `id x y ADDLOOSEPROP` per loose
+    /// prop and logs the buffer once, only when it is non-empty.
     fn show_loose_props(&mut self) -> Result<()> {
+        let mut text = String::new();
+        for prop in &self.view.loose_props {
+            text.push_str(&format!("{} {} {} ADDLOOSEPROP\n", prop.id, prop.x, prop.y));
+        }
+        if !text.is_empty() {
+            self.effects.push(Effect::LogMessage { text });
+        }
         Ok(())
     }
 
@@ -1601,5 +2276,346 @@ impl ScriptHost {
             y: y as i32,
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view::LoosePropView;
+
+    fn view() -> HostView {
+        HostView {
+            self_id: 42,
+            self_name: "Self".to_owned(),
+            self_props: vec![7, 9],
+            loose_props: vec![LoosePropView {
+                id: 100,
+                x: 5,
+                y: 6,
+            }],
+            ..HostView::default()
+        }
+    }
+
+    fn run(host: &mut ScriptHost, name: &str, args: &[Value]) -> Vec<Value> {
+        Host::command(host, name, args).expect("command runs")
+    }
+
+    fn one_effect(host: &ScriptHost) -> &Effect {
+        assert_eq!(host.effects.len(), 1, "effects: {:?}", host.effects);
+        &host.effects[0]
+    }
+
+    #[test]
+    fn id_and_me_answer_the_hotspot_id() {
+        let mut host = ScriptHost::new(view());
+        host.current_spot = 7;
+        assert_eq!(run(&mut host, "ME", &[]), vec![Value::Int(7)]);
+        assert_eq!(run(&mut host, "ID", &[]), vec![Value::Int(7)]);
+        assert_eq!(run(&mut host, "USERID", &[]), vec![Value::Int(42)]);
+        assert_eq!(run(&mut host, "WHOME", &[]), vec![Value::Int(42)]);
+    }
+
+    #[test]
+    fn clienttype_answers_windows32() {
+        let mut host = ScriptHost::new(view());
+        assert_eq!(
+            run(&mut host, "CLIENTTYPE", &[]),
+            vec![Value::str("WINDOWS32")]
+        );
+    }
+
+    #[test]
+    fn iswizard_is_true_for_a_god() {
+        let mut god = ScriptHost::new(HostView {
+            is_god: true,
+            ..view()
+        });
+        assert_eq!(run(&mut god, "ISWIZARD", &[]), vec![Value::Int(1)]);
+        let mut wizard = ScriptHost::new(HostView {
+            is_wizard: true,
+            ..view()
+        });
+        assert_eq!(run(&mut wizard, "ISWIZARD", &[]), vec![Value::Int(1)]);
+        let mut plain = ScriptHost::new(view());
+        assert_eq!(run(&mut plain, "ISWIZARD", &[]), vec![Value::Int(0)]);
+    }
+
+    #[test]
+    fn the_revived_names_are_reachable() {
+        let mut host = ScriptHost::new(HostView {
+            mouse: (11, 22),
+            right_click: true,
+            ..view()
+        });
+        assert_eq!(run(&mut host, "MOUSEX", &[]), vec![Value::Int(11)]);
+        assert_eq!(run(&mut host, "MOUSEY", &[]), vec![Value::Int(22)]);
+        assert_eq!(run(&mut host, "ISRIGHTCLICK", &[]), vec![Value::Int(1)]);
+        assert_eq!(run(&mut host, "HTTPRECEIVED", &[]), vec![Value::Int(0)]);
+        assert_eq!(
+            run(&mut host, "STR", &[Value::Int(5)]),
+            vec![Value::str("5")]
+        );
+        assert!(command_spec("STR").is_none(), "STR is a corpus variable");
+        assert!(command_spec("LASTNAME").is_none());
+    }
+
+    #[test]
+    fn props_resolve_by_numeric_name() {
+        let mut host = ScriptHost::new(view());
+        assert_eq!(
+            run(&mut host, "HASPROP", &[Value::str("9")]),
+            vec![Value::Int(1)]
+        );
+        assert_eq!(
+            run(&mut host, "HASPROP", &[Value::str("404")]),
+            vec![Value::Int(0)]
+        );
+        assert_eq!(
+            run(&mut host, "HASPROP", &[Value::str("nope")]),
+            vec![Value::Int(0)]
+        );
+        host.take_effects();
+        run(&mut host, "DONPROP", &[Value::str("9")]);
+        assert_eq!(one_effect(&host), &Effect::DonProp { prop: 9 });
+        host.take_effects();
+        run(&mut host, "REMOVEPROP", &[Value::str("7")]);
+        assert_eq!(one_effect(&host), &Effect::RemoveProp { prop: 7 });
+    }
+
+    #[test]
+    fn setspotnamelocal_renames_locally() {
+        let mut host = ScriptHost::new(view());
+        run(
+            &mut host,
+            "SETSPOTNAMELOCAL",
+            &[Value::str("Gate"), Value::Int(5)],
+        );
+        assert_eq!(
+            one_effect(&host),
+            &Effect::SetSpotNameLocal {
+                spot: 5,
+                name: "Gate".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn loadprops_queues_a_preload() {
+        let mut host = ScriptHost::new(view());
+        run(
+            &mut host,
+            "LOADPROPS",
+            &[Value::array(vec![Value::Int(7), Value::Int(9)])],
+        );
+        assert_eq!(one_effect(&host), &Effect::LoadProps { props: vec![7, 9] });
+    }
+
+    #[test]
+    fn killuser_whispers_the_kill_command() {
+        let mut host = ScriptHost::new(view());
+        run(&mut host, "KILLUSER", &[Value::Int(3)]);
+        assert_eq!(
+            one_effect(&host),
+            &Effect::PrivateMessage {
+                user: 3,
+                text: "`kill".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn showlooseprops_logs_one_addlooseprop_line_each() {
+        let mut host = ScriptHost::new(view());
+        run(&mut host, "SHOWLOOSEPROPS", &[]);
+        match one_effect(&host) {
+            Effect::LogMessage { text } => assert_eq!(text, "100 5 6 ADDLOOSEPROP\n"),
+            other => panic!("expected a log message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pic_brightness_and_saturation_record_their_filters() {
+        let mut host = ScriptHost::new(view());
+        run(
+            &mut host,
+            "SETPICBRIGHTNESS",
+            &[Value::Int(50), Value::Int(1), Value::Int(2)],
+        );
+        assert_eq!(
+            one_effect(&host),
+            &Effect::SetPicBrightness {
+                spot: 2,
+                state: 1,
+                value: 50
+            }
+        );
+        host.take_effects();
+        run(
+            &mut host,
+            "SETPICSATURATION",
+            &[Value::Int(-20), Value::Int(3), Value::Int(4)],
+        );
+        assert_eq!(
+            one_effect(&host),
+            &Effect::SetPicSaturation {
+                spot: 4,
+                state: 3,
+                value: -20
+            }
+        );
+    }
+
+    #[test]
+    fn removepic_takes_the_index_pushed_first() {
+        let mut host = ScriptHost::new(view());
+        run(&mut host, "REMOVEPIC", &[Value::Int(1), Value::Int(2)]);
+        assert_eq!(
+            one_effect(&host),
+            &Effect::RemovePic {
+                spot: 2,
+                picture: 1
+            }
+        );
+    }
+
+    #[test]
+    fn gotourlframe_keeps_the_url_and_frame() {
+        let mut host = ScriptHost::new(view());
+        run(
+            &mut host,
+            "GOTOURLFRAME",
+            &[Value::str("http://x"), Value::str("body")],
+        );
+        assert_eq!(
+            one_effect(&host),
+            &Effect::GotoUrlFrame {
+                url: "http://x".to_owned(),
+                frame: "body".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn the_launch_family_records_named_effects() {
+        let mut host = ScriptHost::new(view());
+        run(&mut host, "LAUNCHEVENT", &[Value::str("Go")]);
+        assert_eq!(
+            one_effect(&host),
+            &Effect::LaunchEvent {
+                event: "Go".to_owned()
+            }
+        );
+        host.take_effects();
+        run(&mut host, "LAUNCHPPA", &[Value::str("plugin")]);
+        assert_eq!(
+            one_effect(&host),
+            &Effect::LaunchPpa {
+                ppa: "plugin".to_owned()
+            }
+        );
+        host.take_effects();
+        run(&mut host, "LOADJAVA", &[Value::str("mod")]);
+        assert_eq!(
+            one_effect(&host),
+            &Effect::LoadJava {
+                url: "mod".to_owned()
+            }
+        );
+        host.take_effects();
+        run(&mut host, "TALKPPA", &[Value::str("hi")]);
+        assert_eq!(
+            one_effect(&host),
+            &Effect::TalkPpa {
+                text: "hi".to_owned()
+            }
+        );
+        host.take_effects();
+        run(&mut host, "SHELLCMD", &[Value::str("rm -rf /")]);
+        assert_eq!(
+            one_effect(&host),
+            &Effect::ShellCommand {
+                command: "rm -rf /".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn the_local_flags_record_their_effects() {
+        let mut host = ScriptHost::new(view());
+        run(&mut host, "HIDESMILEYS", &[]);
+        assert_eq!(one_effect(&host), &Effect::HideSmileys);
+        host.take_effects();
+        run(&mut host, "LOCKUSERPROPS", &[]);
+        assert_eq!(one_effect(&host), &Effect::LockUserProps);
+        host.take_effects();
+        run(&mut host, "AUTOUSERLAYER", &[Value::Int(1)]);
+        assert_eq!(one_effect(&host), &Effect::AutoUserLayer { on: true });
+        host.take_effects();
+        run(&mut host, "AUTOUSERLAYER", &[Value::Int(0)]);
+        assert_eq!(one_effect(&host), &Effect::AutoUserLayer { on: false });
+    }
+
+    #[test]
+    fn confirmbox_asks_and_answers_declined() {
+        let mut host = ScriptHost::new(view());
+        let pushed = run(&mut host, "CONFIRMBOX", &[Value::str("sure?")]);
+        assert_eq!(pushed, vec![Value::Int(0)]);
+        assert_eq!(
+            one_effect(&host),
+            &Effect::Confirm {
+                text: "sure?".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn clrprops_clears_props_like_clearprops() {
+        let mut host = ScriptHost::new(view());
+        run(&mut host, "CLRPROPS", &[]);
+        assert_eq!(one_effect(&host), &Effect::Naked);
+    }
+
+    #[test]
+    fn ban_and_kick_are_gated_on_operator_status() {
+        let mut wizard = ScriptHost::new(HostView {
+            is_god: true,
+            ..view()
+        });
+        run(&mut wizard, "BAN", &[Value::str("bob")]);
+        assert_eq!(
+            one_effect(&wizard),
+            &Effect::PrivateMessage {
+                user: 0,
+                text: "`ban bob".to_owned()
+            }
+        );
+        wizard.take_effects();
+        run(&mut wizard, "KICK", &[Value::str("bob")]);
+        assert_eq!(
+            one_effect(&wizard),
+            &Effect::PrivateMessage {
+                user: 0,
+                text: "`kick bob".to_owned()
+            }
+        );
+
+        let mut plain = ScriptHost::new(view());
+        run(&mut plain, "BAN", &[Value::str("bob")]);
+        assert!(plain.effects.is_empty(), "a guest cannot ban");
+    }
+
+    #[test]
+    fn the_legacy_words_are_explicit_refusals() {
+        let mut host = ScriptHost::new(view());
+        run(&mut host, "ADDPROP", &[]);
+        assert_eq!(
+            one_effect(&host),
+            &Effect::Unsupported {
+                command: "ADDPROP".to_owned()
+            }
+        );
+        assert_eq!(host.unsupported.get("ADDPROP"), Some(&1));
     }
 }

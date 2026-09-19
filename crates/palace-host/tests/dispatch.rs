@@ -180,12 +180,12 @@ fn a_faulting_handler_is_reported_not_swallowed() {
         "division by zero is defined"
     );
 
-    let mut engine = engine_for(&[(1, "ON SELECT { 1 \"x\" & }")]);
+    let mut engine = engine_for(&[(1, "ON SELECT { 1 2 & }")]);
     let report = engine.fire(ScriptEvent::Select);
     assert_eq!(
         report.errors().len(),
         1,
-        "ampersand on mixed types must fault: {:?}",
+        "ampersand on two numbers must fault: {:?}",
         report.runs
     );
     assert!(report.errors()[0].error.is_some());
@@ -202,13 +202,13 @@ fn an_unparseable_script_is_reported() {
 
 #[test]
 fn unimplemented_commands_are_recorded_not_dropped() {
-    let mut engine = engine_for(&[(1, "ON SELECT { 1 KILLUSER }")]);
+    let mut engine = engine_for(&[(1, "ON SELECT { PING }")]);
     let report = engine.fire(ScriptEvent::Select);
     assert!(report.fired());
     assert!(
         report.effects.iter().any(|effect| matches!(
             effect,
-            Effect::Unsupported { command } if command == "KILLUSER"
+            Effect::Unsupported { command } if command == "PING"
         )),
         "{:?}",
         report.effects

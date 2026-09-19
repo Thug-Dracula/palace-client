@@ -1,6 +1,7 @@
 //! `MSG_LISTOFALLROOMS` (`rLst`) and `MSG_LISTOFALLUSERS` (`uLst`), plus the
-//! in-room user list `MSG_USERLIST` (`rprs`), which shares the `uLst` shape.
+//! in-room user list `MSG_USERLIST` (`rprs`), which carries full [`UserRec`]s.
 
+use super::user::UserRec;
 use crate::byteorder::Reader;
 use crate::error::{Result, WireError};
 
@@ -62,7 +63,7 @@ pub struct UserListRec {
     pub name: String,
 }
 
-/// `MSG_LISTOFALLUSERS` / `MSG_USERLIST` body. `refNum` carries the user count.
+/// `MSG_LISTOFALLUSERS` body. `refNum` carries the user count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserList {
     /// Users, in the order the server sent them.
@@ -86,6 +87,30 @@ impl UserList {
     }
 }
 
+/// `MSG_USERLIST` (`rprs`) body: the users currently in the room.
+///
+/// The frame's `refNum` is the user count and the body is that many full
+/// [`UserRec`] records, the same 124-byte record `nprs` carries (protocol
+/// reference §3.49). It is **not** the shorter `UserListRec` shape used by
+/// `uLst`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomUserList {
+    /// Users, in the order the server sent them.
+    pub users: Vec<UserRec>,
+}
+
+impl RoomUserList {
+    /// Decode `count` full user records (the frame's `refNum`).
+    pub fn decode(count: i32, r: &mut Reader<'_>) -> Result<Self> {
+        let count = require_count(count)?;
+        let mut users = Vec::with_capacity(count);
+        for _ in 0..count {
+            users.push(UserRec::decode(r)?);
+        }
+        Ok(RoomUserList { users })
+    }
+}
+
 fn require_count(count: i32) -> Result<usize> {
     if count < 0 {
         return Err(WireError::ImplausibleLength {
@@ -100,6 +125,7 @@ fn require_count(count: i32) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::byteorder::{ByteOrder, Writer};
+    use crate::messages::user::{AssetSpec, Point};
 
     fn write_room(w: &mut Writer, id: i32, flags: u16, users: u16, name: &str) {
         w.write_i32(id);
@@ -163,10 +189,48 @@ mod tests {
     }
 
     #[test]
+    fn room_user_list_decodes_a_full_user_record() {
+        // `rprs` carries full `UserRec`s (124 bytes each), not the short
+        // `UserListRec` used by `uLst`. The record here is the captured live
+        // one: user 10 "Queen Kat" at (185, 332) in room 901, face 5, colour 14.
+        let rec = UserRec {
+            user_id: 10,
+            room_pos: Point::new(185, 332),
+            prop_spec: [AssetSpec::default(); AssetSpec::USER_PROP_SLOTS],
+            room_id: 901,
+            face_nbr: 5,
+            color_nbr: 14,
+            away_flag: 0,
+            open_to_msgs: 0,
+            nbr_props: 0,
+            name: "Queen Kat".to_string(),
+        };
+        let mut w = Writer::new(ByteOrder::Little);
+        rec.encode(&mut w);
+        assert_eq!(w.len(), UserRec::LEN, "a full user record is 124 bytes");
+
+        let bytes = w.into_vec();
+        let mut r = Reader::new(&bytes, ByteOrder::Little);
+        let list = RoomUserList::decode(1, &mut r).unwrap();
+        assert!(r.is_empty());
+        assert_eq!(list.users, vec![rec]);
+    }
+
+    #[test]
+    fn truncated_room_user_list_is_an_error_not_a_panic() {
+        let mut r = Reader::new(&[0u8; 62], ByteOrder::Little);
+        assert!(matches!(
+            RoomUserList::decode(1, &mut r),
+            Err(WireError::UnexpectedEof { .. })
+        ));
+    }
+
+    #[test]
     fn negative_counts_are_rejected() {
         let mut r = Reader::new(&[], ByteOrder::Little);
         assert!(RoomList::decode(-1, &mut r).is_err());
         assert!(UserList::decode(-1, &mut r).is_err());
+        assert!(RoomUserList::decode(-1, &mut r).is_err());
     }
 
     #[test]

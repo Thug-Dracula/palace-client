@@ -139,7 +139,26 @@ pub fn render(scene: &Scene, options: RenderOptions) -> Canvas {
 ///
 /// Exposed separately from [`render`] so a caller can reuse a buffer across
 /// frames.
-pub fn draw_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationClock) {
+pub fn draw_into(canvas: &mut Canvas, scene: &Scene, clock: AnimationClock) {
+    draw_base_into(canvas, scene);
+    draw_above_into(canvas, scene, clock);
+}
+
+/// Render only the layers below the avatars: backdrop, background, the
+/// "above nothing" overlays, the room dim, the back paint layer and the loose
+/// props.
+///
+/// These are the layers a client can hold still when only an avatar moves.
+#[must_use]
+pub fn render_base(scene: &Scene, options: RenderOptions) -> Canvas {
+    let (width, height) = scene.logical_size();
+    let mut canvas = Canvas::for_room(width, height, options.dpr);
+    draw_base_into(&mut canvas, scene);
+    canvas
+}
+
+/// Draw the below-avatar layers of `scene` onto `canvas`.
+pub fn draw_base_into(canvas: &mut Canvas, scene: &Scene) {
     canvas.fill(scene.backdrop);
     if let Some(background) = &scene.background {
         canvas.blit(background, 0.0, 0.0, 1.0);
@@ -149,7 +168,11 @@ pub fn draw_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationClock) {
     canvas.apply_dim(scene.dim_level);
     crate::draw::rasterize_back(canvas, &scene.draw);
     blit_layer(canvas, &scene.loose_props);
+}
 
+/// Draw the avatars and every layer above them onto a canvas that already holds
+/// the base layers from [`draw_base_into`] or [`render_base`].
+pub fn draw_above_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationClock) {
     let mut avatars = scene.avatars.clone();
     sort_avatars(&mut avatars);
     for avatar in &avatars {

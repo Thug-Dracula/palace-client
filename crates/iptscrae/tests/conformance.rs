@@ -142,7 +142,17 @@ fn integers_wrap_at_32_bits() {
 fn concatenation() {
     assert_eq!(text("\"a\" \"b\" &"), "ab");
     assert_eq!(text("\"a\" \"b\" +"), "ab", "+ concatenates two strings");
-    assert_eq!(fails("1 \"b\" &").category(), "type");
+    assert_eq!(
+        text("1 \"b\" &"),
+        "1b",
+        "`&` stringifies a number when the other operand is a string"
+    );
+    assert_eq!(text("\"b\" 1 &"), "b1");
+    assert_eq!(
+        fails("1 2 &").category(),
+        "type",
+        "`&` still rejects two non-strings"
+    );
     assert_eq!(fails("1 \"b\" +").category(), "type");
 }
 
@@ -369,6 +379,76 @@ fn grepstr_drives_a_branch_and_grepsub_substitutes() {
         text("\"a1b\" \"[0-9]+\" GREPSTR POP \"<$0>\" GREPSUB"),
         "<1>"
     );
+}
+
+#[test]
+fn grepstr_returns_capture_groups_for_grepsub() {
+    let add = "\"2 plus 3\" \"^(.*) plus (.*)$\" GREPSTR POP";
+    assert_eq!(text(&format!("{add} \"$1\" GREPSUB")), "2");
+    assert_eq!(text(&format!("{add} \"$2\" GREPSUB")), "3");
+    assert_eq!(
+        text(&format!("{add} \"$1 plus $2\" GREPSUB")),
+        "2 plus 3",
+        "the guide's Adding Machine example"
+    );
+    assert_eq!(
+        text(&format!("{add} \"$0\" GREPSUB")),
+        "2 plus 3",
+        "group 0 is still the whole match"
+    );
+}
+
+#[test]
+fn grepstr_skipped_optional_group_substitutes_the_empty_string() {
+    assert_eq!(text("\"b\" \"^(a)?b$\" GREPSTR POP \"[$1]\" GREPSUB"), "[]");
+    assert_eq!(
+        text("\"ab\" \"^(a)?b$\" GREPSTR POP \"[$1]\" GREPSUB"),
+        "[a]"
+    );
+}
+
+#[test]
+fn grepstr_captures_the_real_corpus_patterns() {
+    assert_eq!(
+        text("\";cldt fire\" \"^;cldt (.*)$\" GREPSTR POP \"$1\" GREPSUB"),
+        "fire"
+    );
+    assert_eq!(
+        text("\"1 3\" \"^1 ([1-5])$\" GREPSTR POP \"$1\" GREPSUB"),
+        "3"
+    );
+    assert_eq!(
+        text("\";yhit 5 4 3 2\" \"^;yhit (.*) (.*) (.*) (.*)$\" GREPSTR POP \"$3\" GREPSUB"),
+        "3"
+    );
+    assert_eq!(
+        int("\"^hello\" \"^^\" GREPSTR"),
+        1,
+        "the reference rewrites a leading ^^ to a literal caret"
+    );
+    assert_eq!(int("\"hello\" \"^^\" GREPSTR"), 0);
+}
+
+#[test]
+fn grepstr_understands_the_ecmascript_dialect_shorthands() {
+    assert_eq!(int("\"123\" \"^\\\\d+$\" GREPSTR"), 1);
+    assert_eq!(int("\"12a\" \"^\\\\d+$\" GREPSTR"), 0);
+    assert_eq!(int("\"ab_9\" \"^\\\\w+$\" GREPSTR"), 1);
+    assert_eq!(int("\"a-b\" \"^\\\\w+$\" GREPSTR"), 0);
+    assert_eq!(int("\"a cat!\" \"\\\\bcat\\\\b\" GREPSTR"), 1);
+    assert_eq!(int("\"scatter\" \"\\\\bcat\\\\b\" GREPSTR"), 0);
+}
+
+#[test]
+fn grepstr_understands_counted_repetition_and_case_control() {
+    assert_eq!(int("\"aaa\" \"^a{2,3}$\" GREPSTR"), 1);
+    assert_eq!(int("\"a\" \"^a{2,3}$\" GREPSTR"), 0);
+    assert_eq!(
+        int("\"ABC\" \"^abc$\" GREPSTR"),
+        0,
+        "case-sensitive by default"
+    );
+    assert_eq!(int("\"ABC\" \"(?i)^abc$\" GREPSTR"), 1);
 }
 
 // ------------------------------------------------------- host-backed commands

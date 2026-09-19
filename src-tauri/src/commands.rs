@@ -5,6 +5,7 @@
 use palace_client::ClientHandle;
 use tauri::{AppHandle, LogicalSize, Manager, State};
 
+use crate::logging::{self, Level};
 use crate::settings;
 use crate::{start_client, AppState, Settings};
 
@@ -321,10 +322,15 @@ fn update_settings(
 /// more than the write.
 fn persist_best_effort(app: &AppHandle, settings: &Settings) {
     let Some(path) = settings::config_path(app) else {
+        logging::log(
+            Level::Warn,
+            "no config directory is available; settings will not persist",
+        );
         eprintln!("palace: no config directory is available; settings will not persist");
         return;
     };
     if let Err(error) = settings::save(&path, settings) {
+        logging::log(Level::Warn, format!("could not save settings: {error}"));
         eprintln!("palace: could not save settings: {error}");
     }
 }

@@ -48,7 +48,10 @@ fn host_primitives_are_seeded_bounded_and_deterministic() {
 
     assert_eq!(
         host.initial_variables(),
-        vec![("CHATSTR".to_owned(), Value::str("hi"))]
+        vec![
+            ("CHATSTR".to_owned(), Value::str("hi")),
+            ("ERRORMSG".to_owned(), Value::str("")),
+        ]
     );
 
     assert_eq!(host.command_pops("SAY"), 1);
@@ -116,8 +119,9 @@ fn room_spot_and_picture_actions_record_effects() {
             Effect::MoveUserRel { dx: 3, dy: 4 },
             Effect::SetSpotState { spot: 5, state: 1 },
             Effect::SetSpotStateLocal { spot: 5, state: 1 },
-            Effect::Unsupported {
-                command: "SETSPOTNAMELOCAL(5,New)".to_owned()
+            Effect::SetSpotNameLocal {
+                spot: 5,
+                name: "New".to_owned()
             },
             Effect::MoveSpot {
                 spot: 5,
@@ -162,13 +166,13 @@ fn prop_loose_prop_and_avatar_actions_record_effects() {
     host.doff_prop_by_id(7).unwrap();
     host.doff_prop_by_name("hat").unwrap();
     host.naked().unwrap();
-    host.load_props(&[7]).unwrap(); // cache warm-up: no effect
+    host.load_props(&[7]).unwrap();
     host.add_loose_prop(7, 10, 20).unwrap();
     host.remove_loose_prop(3).unwrap();
     host.move_loose_prop(3, 10, 20).unwrap();
     host.drop_prop(10, 20).unwrap();
     host.clear_loose_props().unwrap();
-    host.show_loose_props().unwrap(); // log-only: no effect
+    host.show_loose_props().unwrap();
     host.log_message("hello").unwrap();
     host.log_error("bad").unwrap();
     host.change_color(3).unwrap();
@@ -180,16 +184,11 @@ fn prop_loose_prop_and_avatar_actions_record_effects() {
         host.take_effects(),
         vec![
             Effect::DonProp { prop: 7 },
-            Effect::Unsupported {
-                command: "DONPROP(\"hat\")".to_owned()
-            },
             Effect::SetProps { props: vec![7, 9] },
             Effect::DoffProp,
             Effect::RemoveProp { prop: 7 },
-            Effect::Unsupported {
-                command: "REMOVEPROP(\"hat\")".to_owned()
-            },
             Effect::Naked,
+            Effect::LoadProps { props: vec![7] },
             Effect::AddLooseProp {
                 prop: 7,
                 x: 10,
@@ -203,6 +202,9 @@ fn prop_loose_prop_and_avatar_actions_record_effects() {
             },
             Effect::DropProp { x: 10, y: 20 },
             Effect::ClearLooseProps,
+            Effect::LogMessage {
+                text: "1073741825 10 20 ADDLOOSEPROP\n99 30 40 ADDLOOSEPROP\n".to_owned()
+            },
             Effect::LogMessage {
                 text: "hello".to_owned()
             },

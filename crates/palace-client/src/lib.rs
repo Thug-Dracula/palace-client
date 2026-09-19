@@ -35,6 +35,8 @@ pub mod xtlk;
 
 pub use error::{ClientError, Result};
 pub use frame::{FrameStore, ScreenState, ViewGeometry};
+pub use palace_wire::messages::{ClientIdentity, Puid};
+pub use palace_wire::registration::RegistrationCode;
 pub use runtime::{
     ClientCommand, ClientConfig, ClientEvent, ClientEventStream, ClientHandle, ClientRuntime,
 };

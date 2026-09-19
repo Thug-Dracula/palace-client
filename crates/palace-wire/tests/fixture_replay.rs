@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use palace_wire::byteorder::{ByteOrder, Writer};
 use palace_wire::fixture::{Direction, Fixture, FIXTURE_FORMAT};
-use palace_wire::messages::{reference_logon_record, Message};
+use palace_wire::messages::{reference_logon_record, Message, Point, UserRec};
 use palace_wire::opcode::{self, Opcode};
 
 fn fixture_dir(name: &str) -> PathBuf {
@@ -133,6 +133,40 @@ fn user_list_decodes_with_a_matching_count() {
     assert_eq!(list.users.len(), frame.ref_num as usize);
     assert!(!list.users.is_empty(), "we are logged on, so a user exists");
     assert!(list.users.iter().any(|u| u.room_id > 0));
+}
+
+#[test]
+fn room_user_list_decodes_the_captured_rprs_record() {
+    // The captured `rprs` body is one full 124-byte UserRec, not the short
+    // `uLst` record; decoding it as the short form desynchronised and produced
+    // the live "unexpected end of data" error.
+    let fixture = Fixture::load(&fixture_dir("logon-run1")).unwrap();
+    let frame = fixture
+        .server_frames()
+        .map(|f| &f.frame)
+        .find(|f| f.opcode == opcode::USERLIST)
+        .expect("room user list frame");
+    let list = match Message::decode(
+        frame.opcode,
+        frame.ref_num,
+        &frame.payload,
+        fixture.byte_order,
+    )
+    .unwrap()
+    {
+        Message::RoomUsers(list) => list,
+        other => panic!("expected a room user list, got {other:?}"),
+    };
+    assert_eq!(list.users.len(), frame.ref_num as usize);
+    assert_eq!(frame.payload.len(), list.users.len() * UserRec::LEN);
+    let user = &list.users[0];
+    assert_eq!(user.user_id, 10);
+    assert_eq!(user.name, "Queen Kat");
+    assert_eq!(user.room_id, 901);
+    assert_eq!(user.face_nbr, 5);
+    assert_eq!(user.color_nbr, 14);
+    assert_eq!(user.room_pos, Point::new(185, 332));
+    assert_eq!(user.nbr_props, 0);
 }
 
 #[test]
