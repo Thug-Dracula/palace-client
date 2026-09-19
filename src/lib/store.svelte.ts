@@ -31,9 +31,16 @@ export interface LocalChatLine extends ChatLine {
   pending?: boolean;
 }
 
+export interface TogglePropResult {
+  ok: boolean;
+  error?: string;
+}
+
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 3;
 const CHAT_LIMIT = 500;
+
+export const MAX_PROPS = 9;
 
 class PalaceStore {
   status = $state<ConnectionStatus>("connecting");
@@ -91,7 +98,35 @@ class PalaceStore {
     void api.setProps(props).catch(() => {});
   }
 
+  toggleProp(id: number): TogglePropResult {
+    const self = this.self;
+    if (!self) {
+      return { ok: false, error: "You are not in a room yet, so there is nothing to wear." };
+    }
+    const worn = self.props.includes(id);
+    if (worn) {
+      const next = self.props.filter((prop) => prop !== id);
+      self.props = next;
+      this.setProps(next);
+      return { ok: true };
+    }
+    if (self.props.length >= MAX_PROPS) {
+      return {
+        ok: false,
+        error: `You can wear at most ${MAX_PROPS} props at once — take one off first.`,
+      };
+    }
+    const next = [...self.props, id];
+    self.props = next;
+    this.setProps(next);
+    return { ok: true };
+  }
+
   takeOffAvatar(): void {
+    const self = this.self;
+    if (self) {
+      self.props = [];
+    }
     this.setProps([]);
   }
 

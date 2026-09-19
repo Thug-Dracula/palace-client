@@ -1046,3 +1046,75 @@ input[type="range"]::-webkit-slider-thumb {
   margin: var(--sp-3) 0 0;
 }
 
+/* ---------- Prop Bag dialog ---------- */
+
+.prop-dialog {
+  width: min(560px, calc(100vw - 32px));
+}
+
+.prop-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+}
+
+.prop-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, 44px);
+  gap: 2px;
+  justify-content: start;
+  padding: var(--sp-2);
+  max-height: min(46vh, 360px);
+  overflow: auto;
+  background: var(--bg-void);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+
+.prop-tile {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background-color: var(--bg-void);
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  image-rendering: pixelated;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+}
+
+.prop-tile:hover,
+.prop-tile:focus-visible {
+  border-color: var(--line-strong);
+  outline: none;
+}
+
+.prop-tile.worn {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 1px var(--amber), 0 0 10px var(--line-glow);
+}
+
+.prop-thumb {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  image-rendering: pixelated;
+}
+
+.prop-count {
+  margin-right: auto;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
+.prop-dialog .dialog-error {
+  max-width: none;
+}
+

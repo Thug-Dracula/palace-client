@@ -7,11 +7,13 @@
     y,
     onclose,
     onchooseavatar,
+    onprops,
   }: {
     x: number;
     y: number;
     onclose: () => void;
     onchooseavatar: () => void;
+    onprops: () => void;
   } = $props();
 
   const MARGIN = 8;
@@ -118,6 +120,19 @@
   >
     <span class="ctx-check" aria-hidden="true"></span>
     <span>Choose an Avatar…</span>
+  </button>
+
+  <button
+    class="ctx-item"
+    type="button"
+    role="menuitem"
+    onclick={() => {
+      onclose();
+      onprops();
+    }}
+  >
+    <span class="ctx-check" aria-hidden="true"></span>
+    <span>Props…</span>
   </button>
 
   <button

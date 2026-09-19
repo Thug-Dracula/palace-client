@@ -137,6 +137,32 @@ export const facesGrid = async (): Promise<FaceGrid> => {
   return (await response.json()) as FaceGrid;
 };
 
+export interface PropEntry {
+  id: number;
+  crc: number;
+  name?: string | null;
+  w: number;
+  h: number;
+  flags: number;
+  fav: boolean;
+  trash: boolean;
+}
+
+export interface PropsCatalog {
+  props: PropEntry[];
+}
+
+export const propsCatalog = async (): Promise<PropEntry[]> => {
+  const response = await fetch("palace://localhost/props.json");
+  if (!response.ok) {
+    throw new Error(`prop catalog: HTTP ${response.status}`);
+  }
+  const catalog = (await response.json()) as PropsCatalog;
+  return Array.isArray(catalog.props) ? catalog.props : [];
+};
+
+export const propThumbUrl = (id: number): string => `palace://localhost/prop/${id}`;
+
 export const getSettings = (): Promise<Settings> => invoke("get_settings");
 
 export const connect = (settings: Settings): Promise<void> =>

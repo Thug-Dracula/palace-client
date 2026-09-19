@@ -4,12 +4,14 @@
   import { store } from "../store.svelte";
   import RoomMenu from "./RoomMenu.svelte";
   import AvatarDialog from "./AvatarDialog.svelte";
+  import PropBagDialog from "./PropBagDialog.svelte";
 
   let element: HTMLDivElement | undefined = $state();
   const last = { width: 0, height: 0, dpr: 0, native: false };
 
   let menu = $state<{ x: number; y: number } | null>(null);
   let avatarOpen = $state(false);
+  let propsOpen = $state(false);
   let pointer = $state<{ x: number; y: number } | null>(null);
 
   // The webview fires mousemove far faster than the runtime needs it. Coalesce
@@ -213,10 +215,15 @@
       y={menu.y}
       onclose={() => (menu = null)}
       onchooseavatar={() => (avatarOpen = true)}
+      onprops={() => (propsOpen = true)}
     />
   {/if}
 
   {#if avatarOpen}
     <AvatarDialog onclose={() => (avatarOpen = false)} />
+  {/if}
+
+  {#if propsOpen}
+    <PropBagDialog onclose={() => (propsOpen = false)} />
   {/if}
 </div>
