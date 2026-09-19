@@ -7,10 +7,19 @@
 //!
 //! # Where it goes
 //!
-//! `$XDG_DATA_HOME/org.palace.client/logs/palace-client.log` (on this system
-//! `~/.local/share/org.palace.client/logs/palace-client.log`), or
-//! `$HOME/.local/share/...` when `XDG_DATA_HOME` is unset. `PALACE_LOG_DIR`
-//! overrides the directory, which is what the tests use.
+//! `PALACE_LOG_DIR` overrides the directory, which is what the tests use.
+//! Otherwise the platform's data directory is used, under `org.palace.client`:
+//!
+//! * Unix: `$XDG_DATA_HOME/org.palace.client/logs/palace-client.log` (on this
+//!   system `~/.local/share/org.palace.client/logs/palace-client.log`), or
+//!   `$HOME/.local/share/...` when `XDG_DATA_HOME` is unset.
+//! * Windows: `%LOCALAPPDATA%\org.palace.client\logs\palace-client.log`, or
+//!   `%APPDATA%\...` when `LOCALAPPDATA` is unset.
+//!
+//! The Windows variables are checked before the `$HOME` fallback: a Git for
+//! Windows or MSYS shell sets `HOME`, and with the Unix path checked first it
+//! won on Windows, dropping the log in a stray `.local` directory. The temp
+//! directory is the last resort.
 //!
 //! # Verbosity
 //!
@@ -303,26 +312,47 @@ fn default_log_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(ENV_LOG_DIR).filter(|value| !value.is_empty()) {
         return PathBuf::from(dir);
     }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .map(|home| PathBuf::from(home).join(".local").join("share"))
-        })
-        .or_else(|| {
-            std::env::var_os("LOCALAPPDATA")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-        .or_else(|| {
-            std::env::var_os("APPDATA")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(std::env::temp_dir);
-    base.join(APP_ID).join("logs")
+    log_dir_from(
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        std::env::var_os("APPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+        std::env::temp_dir(),
+    )
+}
+
+/// `XDG_DATA_HOME`, then `LOCALAPPDATA`, then `APPDATA`, then
+/// `$HOME/.local/share`, then the temp dir.
+///
+/// `XDG_DATA_HOME` stays first because when it is set it is an explicit
+/// choice. The Windows variables come before `HOME` so the native location
+/// wins on Windows — Git for Windows and MSYS shells do set `HOME`, and with
+/// the Unix path first it shadowed `LOCALAPPDATA`. The candidates are passed
+/// in rather than read, so the Windows rungs are testable from Linux — a
+/// Windows-only `cfg` would leave the precedence unverified on the machine
+/// this is developed on.
+fn log_dir_from(
+    xdg_data_home: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    app_data: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temp: PathBuf,
+) -> PathBuf {
+    xdg_data_home
+        .or(local_app_data)
+        .or(app_data)
+        .or_else(|| home.map(|home| home.join(".local").join("share")))
+        .unwrap_or(temp)
+        .join(APP_ID)
+        .join("logs")
 }
 
 /// Route panics into the log and then run the hook that was installed before.
@@ -442,6 +472,65 @@ mod tests {
     fn the_default_directory_ends_in_the_log_folder() {
         let dir = default_log_dir();
         assert!(dir.ends_with(Path::new(APP_ID).join("logs")), "{dir:?}");
+    }
+
+    #[test]
+    fn the_default_directory_prefers_the_variable_each_platform_sets() {
+        let temp = PathBuf::from("temp-fallback");
+        let local = PathBuf::from("C:/Users/x/AppData/Local");
+        let roaming = PathBuf::from("C:/Users/x/AppData/Roaming");
+        assert_eq!(
+            log_dir_from(
+                None,
+                Some(local.clone()),
+                Some(roaming.clone()),
+                None,
+                temp.clone()
+            ),
+            local.join(APP_ID).join("logs"),
+            "Windows sets LOCALAPPDATA and neither of the Unix variables"
+        );
+
+        // The regression this pins: Git for Windows and MSYS set HOME, so the
+        // home-relative Unix path used to shadow the Windows data directory.
+        let home = PathBuf::from("home");
+        let with_home = log_dir_from(
+            None,
+            Some(local.clone()),
+            Some(roaming.clone()),
+            Some(home.clone()),
+            temp.clone(),
+        );
+        assert_eq!(with_home, local.join(APP_ID).join("logs"));
+        assert!(
+            !with_home.starts_with(&home),
+            "the Unix home must not shadow LOCALAPPDATA"
+        );
+
+        assert_eq!(
+            log_dir_from(None, None, Some(roaming.clone()), None, temp.clone()),
+            roaming.join(APP_ID).join("logs"),
+            "APPDATA is the fallback when LOCALAPPDATA is unset"
+        );
+
+        let xdg = PathBuf::from("/xdg");
+        assert_eq!(
+            log_dir_from(
+                Some(xdg.clone()),
+                Some(local),
+                Some(roaming),
+                None,
+                temp.clone()
+            ),
+            xdg.join(APP_ID).join("logs"),
+            "an explicit XDG_DATA_HOME wins over the platform default"
+        );
+
+        assert_eq!(
+            log_dir_from(None, None, None, None, temp.clone()),
+            temp.join(APP_ID).join("logs"),
+            "the temp dir is the last resort"
+        );
     }
 
     #[test]
