@@ -167,6 +167,45 @@ impl ScriptHost {
         self.next_spot_id = Some(id.saturating_add(1));
         id
     }
+
+    /// Apply a worn-list change to the snapshot now.
+    ///
+    /// `PalaceUser.setProps` (`OpenPalace/PalaceClient/src/net/codecomposer/palace/model/PalaceUser.as:149-164`)
+    /// mutates `currentUser.props` and `propCount` and only then calls
+    /// `updatePropsOnServer`, so a command later in the same handler reads the
+    /// new list. The snapshot is updated the same way; the recorded [`Effect`]
+    /// still carries the raw request so the runtime sends it to the server.
+    fn set_props_now(&mut self, requested: &[i64]) {
+        let mut worn: Vec<i64> = Vec::new();
+        for id in requested {
+            if *id == 0 || u32::try_from(*id).is_err() || worn.contains(id) {
+                continue;
+            }
+            if worn.len() >= MAX_WORN_PROPS {
+                break;
+            }
+            worn.push(*id);
+        }
+        self.view.self_props = worn;
+    }
+
+    /// `PalaceUser.wearProp` (`PalaceUser.as:139-147`): add one prop unless it is
+    /// the empty slot, already worn, or the list is full.
+    fn wear_prop_now(&mut self, prop: i64) {
+        if u32::try_from(prop).is_err() || self.view.self_props.contains(&prop) {
+            return;
+        }
+        if self.view.self_props.len() < MAX_WORN_PROPS {
+            self.view.self_props.push(prop);
+        }
+    }
+
+    /// `PalaceUser.removeProp` (`PalaceUser.as:166-174`): drop the first match.
+    fn remove_prop_now(&mut self, prop: i64) {
+        if let Some(index) = self.view.self_props.iter().position(|worn| *worn == prop) {
+            self.view.self_props.remove(index);
+        }
+    }
 }
 
 fn stub_values(pushes: usize, push: Push) -> Vec<Value> {
@@ -211,6 +250,9 @@ fn text_arg(args: &[Value], index: usize) -> Result<String> {
 /// Sparky's `PALACECHAT` pushes the constant 50_000, which clears every
 /// threshold the harvested corpus tests, so gated branches take the modern path.
 pub const PALACECHAT_VERSION: i32 = 50_000;
+
+/// How many props a user may wear at once (`PalaceUser.wearProp`).
+const MAX_WORN_PROPS: usize = 9;
 
 /// Percent-encode a string the way the reference's `ENCODEURL` does.
 ///
@@ -842,20 +884,9 @@ impl Host for ScriptHost {
                 }
                 Ok(Vec::new())
             }
-            "DOFFPROP" => {
-                self.effects.push(Effect::DoffProp);
-                Ok(Vec::new())
-            }
-            "NAKED" | "CLEARPROPS" | "CLRPROPS" => {
-                self.effects.push(Effect::Naked);
-                Ok(Vec::new())
-            }
-            "SETPROPS" => {
-                self.effects.push(Effect::SetProps {
-                    props: props_arg(args, 0),
-                });
-                Ok(Vec::new())
-            }
+            "DOFFPROP" => self.doff_prop().map(|_| Vec::new()),
+            "NAKED" | "CLEARPROPS" | "CLRPROPS" => self.naked().map(|_| Vec::new()),
+            "SETPROPS" => self.set_props(&props_arg(args, 0)).map(|_| Vec::new()),
             "LOADPROPS" => {
                 let Some(Value::Array(items)) = args.first() else {
                     return Err(IptError::TypeMismatch {
@@ -1915,6 +1946,7 @@ impl PalaceHost for ScriptHost {
     }
 
     fn don_prop_by_id(&mut self, prop: i64) -> Result<()> {
+        self.wear_prop_now(prop);
         self.effects.push(Effect::DonProp { prop });
         Ok(())
     }
@@ -1928,6 +1960,7 @@ impl PalaceHost for ScriptHost {
     }
 
     fn set_props(&mut self, props: &[i64]) -> Result<()> {
+        self.set_props_now(props);
         self.effects.push(Effect::SetProps {
             props: props.to_vec(),
         });
@@ -1935,11 +1968,13 @@ impl PalaceHost for ScriptHost {
     }
 
     fn doff_prop(&mut self) -> Result<()> {
+        self.view.self_props.pop();
         self.effects.push(Effect::DoffProp);
         Ok(())
     }
 
     fn doff_prop_by_id(&mut self, prop: i64) -> Result<()> {
+        self.remove_prop_now(prop);
         self.effects.push(Effect::RemoveProp { prop });
         Ok(())
     }
@@ -1953,6 +1988,7 @@ impl PalaceHost for ScriptHost {
     }
 
     fn naked(&mut self) -> Result<()> {
+        self.view.self_props.clear();
         self.effects.push(Effect::Naked);
         Ok(())
     }
@@ -2382,6 +2418,91 @@ mod tests {
         host.take_effects();
         run(&mut host, "REMOVEPROP", &[Value::str("7")]);
         assert_eq!(one_effect(&host), &Effect::RemoveProp { prop: 7 });
+    }
+
+    #[test]
+    fn a_worn_prop_change_is_read_back_in_the_same_handler() {
+        // `PalaceUser.setProps`/`wearProp`/`removeProp`/`naked`
+        // (`OpenPalace/PalaceClient/src/net/codecomposer/palace/model/PalaceUser.as:139-185`)
+        // mutate `currentUser.props` and `propCount` before calling
+        // `updatePropsOnServer`. `NBRUSERPROPS` reads `propCount` and `HASPROP`/
+        // `USERPROP`/`TOPPROP` read `currentUser.props`
+        // (`PalaceClient-iptscrae/PalaceController.as:222-272,474-481,522-525`),
+        // so each command below must be visible to the read that follows it,
+        // while the `Effect` for the server is still recorded.
+        let mut host = ScriptHost::new(HostView::default());
+        assert_eq!(run(&mut host, "NBRUSERPROPS", &[]), vec![Value::Int(0)]);
+
+        run(
+            &mut host,
+            "SETPROPS",
+            &[Value::array(vec![Value::Int(5), Value::Int(6)])],
+        );
+        assert_eq!(run(&mut host, "NBRUSERPROPS", &[]), vec![Value::Int(2)]);
+        assert_eq!(
+            run(&mut host, "HASPROP", &[Value::Int(5)]),
+            vec![Value::Int(1)]
+        );
+        assert_eq!(run(&mut host, "TOPPROP", &[]), vec![Value::Int(6)]);
+        assert_eq!(
+            run(&mut host, "USERPROP", &[Value::Int(1)]),
+            vec![Value::Int(6)]
+        );
+        assert_eq!(one_effect(&host), &Effect::SetProps { props: vec![5, 6] });
+        host.take_effects();
+
+        run(&mut host, "DONPROP", &[Value::Int(7)]);
+        assert_eq!(run(&mut host, "NBRUSERPROPS", &[]), vec![Value::Int(3)]);
+        assert_eq!(one_effect(&host), &Effect::DonProp { prop: 7 });
+        host.take_effects();
+
+        run(&mut host, "REMOVEPROP", &[Value::Int(5)]);
+        assert_eq!(run(&mut host, "NBRUSERPROPS", &[]), vec![Value::Int(2)]);
+        assert_eq!(
+            run(&mut host, "HASPROP", &[Value::Int(5)]),
+            vec![Value::Int(0)]
+        );
+        assert_eq!(one_effect(&host), &Effect::RemoveProp { prop: 5 });
+        host.take_effects();
+
+        run(&mut host, "DOFFPROP", &[]);
+        assert_eq!(run(&mut host, "NBRUSERPROPS", &[]), vec![Value::Int(1)]);
+        assert_eq!(one_effect(&host), &Effect::DoffProp);
+        host.take_effects();
+
+        run(&mut host, "NAKED", &[]);
+        assert_eq!(run(&mut host, "NBRUSERPROPS", &[]), vec![Value::Int(0)]);
+        assert_eq!(one_effect(&host), &Effect::Naked);
+    }
+
+    #[test]
+    fn setprops_skips_the_empty_slot_duplicates_and_the_cap_like_the_model() {
+        let mut host = ScriptHost::new(HostView::default());
+        run(
+            &mut host,
+            "SETPROPS",
+            &[Value::array((0..12).map(Value::Int).collect::<Vec<_>>())],
+        );
+        assert_eq!(
+            run(&mut host, "NBRUSERPROPS", &[]),
+            vec![Value::Int(9)],
+            "the empty slot is skipped and the list stops at nine"
+        );
+        assert_eq!(
+            run(&mut host, "HASPROP", &[Value::Int(9)]),
+            vec![Value::Int(1)]
+        );
+        assert_eq!(
+            run(&mut host, "HASPROP", &[Value::Int(10)]),
+            vec![Value::Int(0)]
+        );
+
+        run(&mut host, "DONPROP", &[Value::Int(99)]);
+        assert_eq!(
+            run(&mut host, "NBRUSERPROPS", &[]),
+            vec![Value::Int(9)],
+            "a tenth DONPROP is refused, not appended"
+        );
     }
 
     #[test]

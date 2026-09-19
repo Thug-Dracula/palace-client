@@ -919,10 +919,17 @@ impl SessionState {
     /// omitted, so this assigns rather than merges. Asset ids are stored as the
     /// bit pattern's unsigned value, the namespace the prop store uses.
     fn set_user_props(&mut self, user_id: i32, props: &[AssetSpec]) -> bool {
+        let self_id = self.banner.user_id;
         let Some(user) = self.known_user_mut(user_id) else {
             return false;
         };
         let worn: Vec<u32> = props.iter().map(|spec| spec.id as u32).collect();
+        // Same rule as `user_info_from_record`: a worn list we authored outranks
+        // a stale server snapshot, so an empty `usrP`/`usrD` echo must not
+        // undress us after a room script's `SETPROPS`.
+        if user_id == self_id && !user.props.is_empty() && worn.is_empty() {
+            return false;
+        }
         if user.props == worn {
             return false;
         }

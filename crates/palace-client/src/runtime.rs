@@ -4552,10 +4552,7 @@ mod tests {
     fn a_room_setprops_is_not_wiped_by_the_servers_own_user_record() {
         use palace_wire::messages::UserRec;
 
-        let room = scripted_room(&[(
-            16,
-            "ON ENTER { [ 976933367 ] SETPROPS CLEARLOOSEPROPS }",
-        )]);
+        let room = scripted_room(&[(16, "ON ENTER { [ 976933367 ] SETPROPS CLEARLOOSEPROPS }")]);
         let mut scripts = ScriptEngine::with_palace_limits();
         let mut state = state_in(&room);
         let mut harness = harness();
@@ -6667,6 +6664,43 @@ mod tests {
             effects,
             vec!["GOTOROOM 31747".to_string()],
             "the self exit the server sends on a room change must not blank cname"
+        );
+    }
+
+    /// A mutating script command takes effect before the next command in the
+    /// same handler reads it, matching the reference.
+    ///
+    /// `PalaceController.setProps` (`PalaceClient-iptscrae/PalaceController.as:464-472`)
+    /// calls `client.currentUser.setProps`, and `PalaceUser.setProps`
+    /// (`OpenPalace/PalaceClient/src/net/codecomposer/palace/model/PalaceUser.as:149-164`)
+    /// mutates `currentUser.props` and `propCount` *before* it calls
+    /// `updatePropsOnServer()`. `NBRUSERPROPS` reads `propCount`
+    /// (`PalaceController.as:522-525`) and `HASPROP` reads `currentUser.props`
+    /// (`PalaceController.as:474-481`), so a read later in the same handler sees
+    /// the prop that was just worn.
+    #[test]
+    fn setprops_is_visible_to_a_read_in_the_same_handler() {
+        let room = scripted_room(&[(
+            7,
+            "ON ENTER { [ 976933367 ] SETPROPS \
+             NBRUSERPROPS ITOA SAY 976933367 HASPROP ITOA SAY }",
+        )]);
+        let mut scripts = ScriptEngine::with_palace_limits();
+        let state = state_in(&room);
+        let harness = harness();
+        scripts.load_room(&room);
+        scripts.set_view(host_view(&state, &harness.shared));
+
+        let report = scripts.fire_spot(ScriptEvent::Enter, 7);
+        let effects: Vec<String> = report.effects.iter().map(Effect::to_string).collect();
+        assert_eq!(
+            effects,
+            vec![
+                "SETPROPS [976933367]".to_string(),
+                "SAY \"1\"".to_string(),
+                "SAY \"1\"".to_string(),
+            ],
+            "the prop read back as worn inside the handler that set it"
         );
     }
 }
