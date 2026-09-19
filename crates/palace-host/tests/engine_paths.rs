@@ -23,8 +23,8 @@ fn run_source_returns_effects_and_reports_syntax_errors() {
     assert!(!error.is_empty());
 
     let fault = engine
-        .run_source("1 2 &")
-        .expect_err("two non-strings fault at run time");
+        .run_source("1 2 3 GET")
+        .expect_err("GET on a number faults at run time");
     assert!(!fault.is_empty());
 }
 

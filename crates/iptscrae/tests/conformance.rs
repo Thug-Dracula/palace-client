@@ -14,7 +14,7 @@
 use iptscrae::testing::{eval, eval_int, eval_text, TestHost};
 use iptscrae::{Engine, Value};
 
-fn int(source: &str) -> i32 {
+fn int(source: &str) -> i64 {
     eval_int(source).unwrap_or_else(|e| panic!("{source:?} -> {e}"))
 }
 
@@ -133,9 +133,14 @@ fn modulo_sign_follows_the_dividend() {
 }
 
 #[test]
-fn integers_wrap_at_32_bits() {
-    assert_eq!(int("2147483647 1 +"), i32::MIN);
-    assert_eq!(int("-2147483648 1 - "), i32::MAX);
+fn integers_are_64_bit_like_palacechat() {
+    assert_eq!(
+        int("2147483647 1 +"),
+        2_147_483_648,
+        "the reference line IPT|over|2147483647+1|2147483648"
+    );
+    assert_eq!(int("-2147483648 1 - "), -2_147_483_649);
+    assert_eq!(int("4294967296"), 4_294_967_296);
 }
 
 #[test]
@@ -149,11 +154,18 @@ fn concatenation() {
     );
     assert_eq!(text("\"b\" 1 &"), "b1");
     assert_eq!(
-        fails("1 2 &").category(),
-        "type",
-        "`&` still rejects two non-strings"
+        text("5 6 &"),
+        "56",
+        "reference line IPT|&|two ints|56: `&` stringifies both operands"
     );
     assert_eq!(fails("1 \"b\" +").category(), "type");
+}
+
+#[test]
+fn modulo_coerces_string_operands() {
+    assert_eq!(int("\"5\" \"7\" %"), 5, "reference line IPT|%|strings|5");
+    assert_eq!(int("\"12\" \"10\" %"), 2);
+    assert_eq!(int("\"abc\" \"7\" %"), 0, "an unparseable string is 0");
 }
 
 #[test]
@@ -208,6 +220,25 @@ fn substring_rejects_a_negative_offset() {
     assert_eq!(fails("\"abc\" -1 2 SUBSTRING").category(), "type");
 }
 
+#[test]
+fn the_reference_edge_cases_raise_script_errors() {
+    assert_eq!(
+        fails("5 - ").category(),
+        "stack",
+        "nothing to subtract from"
+    );
+    assert_eq!(
+        fails("0 1 - ARRAY LENGTH").category(),
+        "type",
+        "a negative ARRAY size yields an integer, which LENGTH rejects"
+    );
+    assert_eq!(
+        fails("\"hello\" 0 1 - 2 SUBSTRING").category(),
+        "type",
+        "a negative SUBSTRING offset"
+    );
+}
+
 // -------------------------------------------------------------- comparisons
 
 #[test]
@@ -219,10 +250,16 @@ fn equality_is_case_insensitive_for_strings() {
 }
 
 #[test]
-fn inequality_is_case_sensitive_for_strings() {
-    assert_eq!(int("\"abc\" \"ABC\" !="), 1, "the reference's asymmetry");
-    assert_eq!(int("\"abc\" \"ABC\" <>"), 1);
+fn inequality_is_the_negation_of_equality() {
+    assert_eq!(
+        int("\"abc\" \"ABC\" !="),
+        0,
+        "reference line IPT|!=|ABC abc|0: != is case-insensitive like =="
+    );
+    assert_eq!(int("\"abc\" \"ABC\" <>"), 0, "<> shares != semantics");
     assert_eq!(int("\"abc\" \"abc\" !="), 0);
+    assert_eq!(int("\"abc\" \"abd\" !="), 1);
+    assert_eq!(int("2 2 !="), 0);
     assert_eq!(int("\"2\" 2 !="), 1, "mixed types are not equal");
 }
 
@@ -236,8 +273,12 @@ fn ordering_operators() {
 }
 
 #[test]
-fn ordering_a_string_against_a_number_is_an_error() {
-    assert_eq!(fails("\"a\" 1 <").category(), "type");
+fn ordering_mixed_types_is_false_not_an_error() {
+    assert_eq!(int("1 \"abc\" <"), 0, "reference line IPT|<|mixed 1 abc|0");
+    assert_eq!(int("\"abc\" 1 <"), 0);
+    assert_eq!(int("1 \"abc\" >"), 0);
+    assert_eq!(int("1 \"abc\" <="), 0);
+    assert_eq!(int("1 \"abc\" >="), 0);
 }
 
 #[test]

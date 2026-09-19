@@ -118,7 +118,7 @@ pub fn eval(source: &str) -> Result<Vec<Value>> {
 }
 
 /// Like [`eval`], expecting a single integer on top of the stack.
-pub fn eval_int(source: &str) -> Result<i32> {
+pub fn eval_int(source: &str) -> Result<i64> {
     match eval(source)?.last() {
         Some(Value::Int(n)) => Ok(*n),
         Some(other) => Err(IptError::TypeMismatch {

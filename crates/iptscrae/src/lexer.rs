@@ -493,7 +493,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn lex_number(&mut self) -> i32 {
+    fn lex_number(&mut self) -> i64 {
         let negative = self.peek() == Some('-');
         if negative {
             self.bump();
@@ -507,11 +507,10 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-        let narrowed = value as i32;
         if negative {
-            narrowed.wrapping_neg()
+            value.wrapping_neg()
         } else {
-            narrowed
+            value
         }
     }
 
@@ -686,7 +685,7 @@ mod tests {
     #[test]
     fn comma_separator_inside_an_array() {
         let ops = body("[1000,0 537,0]");
-        let ints: Vec<i32> = ops
+        let ints: Vec<i64> = ops
             .iter()
             .filter_map(|op| match op {
                 Op::Int(n) => Some(*n),
@@ -711,7 +710,7 @@ mod tests {
         .ops()
         .to_vec();
 
-        let ints: Vec<i32> = ops
+        let ints: Vec<i64> = ops
             .iter()
             .filter_map(|op| match op {
                 Op::Int(n) => Some(*n),

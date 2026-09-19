@@ -430,7 +430,7 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 let n = self.pop_int()?;
                 if n < 0 {
                     return Err(IptError::IndexOutOfRange {
-                        index: n as i64,
+                        index: n,
                         len: self.stack.depth(),
                     });
                 }
@@ -448,7 +448,7 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 self.stack.push(b)
             }
             Builtin::StackDepth => {
-                let n = self.stack.depth() as i32;
+                let n = self.stack.depth() as i64;
                 self.stack.push(Value::Int(n))
             }
             Builtin::TopType => {
@@ -456,7 +456,7 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                     return self.stack.push(Value::Int(0));
                 }
                 let code = self.stack.peek(0)?.type_code();
-                self.stack.push(Value::Int(code))
+                self.stack.push(Value::Int(i64::from(code)))
             }
             Builtin::VarType => {
                 if self.stack.is_empty() {
@@ -465,7 +465,7 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 let top = self.stack.peek(0)?.clone();
                 let resolved = self.deref(&top)?;
                 let code = resolved.type_code();
-                self.stack.push(Value::Int(code))
+                self.stack.push(Value::Int(i64::from(code)))
             }
             Builtin::Add => {
                 let b = self.pop_deref()?;
@@ -488,24 +488,24 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 }
             }
             Builtin::Sub => {
-                let b = self.pop_int()?;
-                let a = self.pop_int()?;
+                let b = self.pop_arith_int()?;
+                let a = self.pop_arith_int()?;
                 self.stack.push(Value::Int(a.wrapping_sub(b)))
             }
             Builtin::Mul => {
-                let b = self.pop_int()?;
-                let a = self.pop_int()?;
+                let b = self.pop_arith_int()?;
+                let a = self.pop_arith_int()?;
                 self.stack.push(Value::Int(a.wrapping_mul(b)))
             }
             Builtin::Div => {
-                let b = self.pop_int()?;
-                let a = self.pop_int()?;
+                let b = self.pop_arith_int()?;
+                let a = self.pop_arith_int()?;
                 let r = if b == 0 { 0 } else { a.wrapping_div(b) };
                 self.stack.push(Value::Int(r))
             }
             Builtin::Mod => {
-                let b = self.pop_int()?;
-                let a = self.pop_int()?;
+                let b = self.pop_arith_int()?;
+                let a = self.pop_arith_int()?;
                 let r = if b == 0 { 0 } else { a.wrapping_rem(b) };
                 self.stack.push(Value::Int(r))
             }
@@ -554,20 +554,20 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
             }
             Builtin::SubAssign => {
                 let name = self.pop_var_name()?;
-                let argument = self.pop_int()?;
-                let current = self.pop_var_int(&name)?;
+                let argument = self.pop_arith_int()?;
+                let current = self.pop_var_arith(&name)?;
                 self.var_set(&name, Value::Int(current.wrapping_sub(argument)))
             }
             Builtin::MulAssign => {
                 let name = self.pop_var_name()?;
-                let argument = self.pop_int()?;
-                let current = self.pop_var_int(&name)?;
+                let argument = self.pop_arith_int()?;
+                let current = self.pop_var_arith(&name)?;
                 self.var_set(&name, Value::Int(current.wrapping_mul(argument)))
             }
             Builtin::DivAssign => {
                 let name = self.pop_var_name()?;
-                let argument = self.pop_int()?;
-                let current = self.pop_var_int(&name)?;
+                let argument = self.pop_arith_int()?;
+                let current = self.pop_var_arith(&name)?;
                 let r = if argument == 0 {
                     0
                 } else {
@@ -577,8 +577,8 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
             }
             Builtin::ModAssign => {
                 let name = self.pop_var_name()?;
-                let argument = self.pop_int()?;
-                let current = self.pop_var_int(&name)?;
+                let argument = self.pop_arith_int()?;
+                let current = self.pop_var_arith(&name)?;
                 let r = if argument == 0 {
                     0
                 } else {
@@ -591,8 +591,8 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 let value = if n <= 0 {
                     0
                 } else {
-                    let r = self.host.random(n as i64);
-                    r.clamp(0, n as i64 - 1) as i32
+                    let r = self.host.random(n);
+                    r.clamp(0, n - 1)
                 };
                 self.stack.push(Value::Int(value))
             }
@@ -601,10 +601,10 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
             Builtin::Tangent => self.trig(Trig::Tangent),
             Builtin::SquareRoot => {
                 // PalaceChat `iptService.js:478` is `Math.floor(Math.sqrt(n))`;
-                // a negative `n` is NaN there, which `to_int32` maps to 0.
+                // a negative `n` is NaN there, which `to_int64` maps to 0.
                 let n = self.pop_int()?;
                 self.stack
-                    .push(Value::Int(to_int32(f64::from(n).sqrt().floor())))
+                    .push(Value::Int(to_int64((n as f64).sqrt().floor())))
             }
             Builtin::Atoi => {
                 let s = self.pop_str()?;
@@ -615,26 +615,19 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 self.stack.push(Value::str(n.to_string()))
             }
             Builtin::DateTime => {
-                let v = self.host.datetime() as i32;
+                let v = self.host.datetime();
                 self.stack.push(Value::Int(v))
             }
             Builtin::Ticks => {
-                let v = self.host.ticks() as i32;
+                let v = self.host.ticks();
                 self.stack.push(Value::Int(v))
             }
             Builtin::IptVersion => self.stack.push(Value::Int(1)),
             Builtin::Concat => {
                 let b = self.pop_deref()?;
                 let a = self.pop_deref()?;
-                // PalaceChat `iptService.js:2716` — `&` needs at least one string
-                // operand; when the other is a number it is stringified (JS `+`).
-                // Two non-strings are still a type error.
-                if !matches!(a, Value::Str(_)) && !matches!(b, Value::Str(_)) {
-                    return Err(IptError::TypeMismatch {
-                        expected: "at least one string",
-                        found: b.type_name(),
-                    });
-                }
+                // `ConcatOperator` stringifies every operand (`toStr`): two
+                // numbers become their decimal text, `5 6 &` -> "56".
                 let a = concat_operand(&a)?;
                 let b = concat_operand(&b)?;
                 let mut s = String::with_capacity(a.len() + b.len());
@@ -667,7 +660,7 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 let found = whole
                     .to_lowercase()
                     .contains(fragment.to_lowercase().as_str());
-                self.stack.push(Value::Int(i32::from(found)))
+                self.stack.push(Value::Int(i64::from(found)))
             }
             Builtin::Substring => {
                 let length = self.pop_int()?;
@@ -691,14 +684,14 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 let needle = self.pop_str()?;
                 let haystack = self.pop_str()?;
                 let index = match haystack.find(needle.as_ref()) {
-                    Some(byte) => haystack[..byte].encode_utf16().count() as i32,
+                    Some(byte) => haystack[..byte].encode_utf16().count() as i64,
                     None => -1,
                 };
                 self.stack.push(Value::Int(index))
             }
             Builtin::StrLen => {
                 let s = self.pop_str()?;
-                let n = s.encode_utf16().count() as i32;
+                let n = s.encode_utf16().count() as i64;
                 self.stack.push(Value::Int(n))
             }
             Builtin::Lowercase => {
@@ -722,7 +715,7 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 let captures = self.host.grep_match(&pattern, &text)?;
                 let matched = captures.is_some();
                 self.grep_captures = captures;
-                self.stack.push(Value::Int(i32::from(matched)))
+                self.stack.push(Value::Int(i64::from(matched)))
             }
             Builtin::GrepSub => {
                 let source = self.pop_str()?;
@@ -739,38 +732,30 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 let b = self.pop_deref()?;
                 let a = self.pop_deref()?;
                 let r = a.is_truthy() && b.is_truthy();
-                self.stack.push(Value::Int(i32::from(r)))
+                self.stack.push(Value::Int(i64::from(r)))
             }
             Builtin::Or => {
                 let b = self.pop_deref()?;
                 let a = self.pop_deref()?;
                 let r = a.is_truthy() || b.is_truthy();
-                self.stack.push(Value::Int(i32::from(r)))
+                self.stack.push(Value::Int(i64::from(r)))
             }
             Builtin::Not => {
                 let a = self.pop_deref()?;
                 let r = !a.is_truthy();
-                self.stack.push(Value::Int(i32::from(r)))
+                self.stack.push(Value::Int(i64::from(r)))
             }
             Builtin::Eq => {
                 let b = self.pop_deref()?;
                 let a = self.pop_deref()?;
-                let r = match (&a, &b) {
-                    (Value::Int(x), Value::Int(y)) => x == y,
-                    (Value::Str(x), Value::Str(y)) => x.to_uppercase() == y.to_uppercase(),
-                    _ => false,
-                };
-                self.stack.push(Value::Int(i32::from(r)))
+                let r = values_equal(&a, &b);
+                self.stack.push(Value::Int(i64::from(r)))
             }
             Builtin::Ne => {
                 let b = self.pop_deref()?;
                 let a = self.pop_deref()?;
-                let r = match (&a, &b) {
-                    (Value::Int(x), Value::Int(y)) => x != y,
-                    (Value::Str(x), Value::Str(y)) => x != y,
-                    _ => true,
-                };
-                self.stack.push(Value::Int(i32::from(r)))
+                let r = !values_equal(&a, &b);
+                self.stack.push(Value::Int(i64::from(r)))
             }
             Builtin::Lt => self.compare(Ordering::Lt),
             Builtin::Le => self.compare(Ordering::Le),
@@ -844,7 +829,7 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                 let ticks = self.pop_int()?;
                 let body = self.pop_chunk()?;
                 let spot = self.spot;
-                self.host.schedule_alarm(ticks as i64, body, spot)
+                self.host.schedule_alarm(ticks, body, spot)
             }
             Builtin::Assign => {
                 let name = self.pop_var_name()?;
@@ -877,7 +862,7 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                     .map_err(|_| IptError::BadArgument("array is already borrowed"))?;
                 if index < 0 || index as usize >= cell.len() {
                     return Err(IptError::IndexOutOfRange {
-                        index: index as i64,
+                        index,
                         len: cell.len(),
                     });
                 }
@@ -894,7 +879,7 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                     .map_err(|_| IptError::BadArgument("array is already borrowed"))?;
                 if index < 0 || index as usize >= cell.len() {
                     return Err(IptError::IndexOutOfRange {
-                        index: index as i64,
+                        index,
                         len: cell.len(),
                     });
                 }
@@ -904,7 +889,7 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
             Builtin::Length => {
                 let array = self.pop_array()?;
                 let len = array.try_borrow().map(|v| v.len()).unwrap_or(0);
-                self.stack.push(Value::Int(len as i32))
+                self.stack.push(Value::Int(len as i64))
             }
             Builtin::Trace => {
                 let s = self.pop_str()?;
@@ -932,13 +917,13 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
 
     fn trig(&mut self, which: Trig) -> Result<()> {
         let degrees = self.pop_int()?;
-        let radians = f64::from(degrees) * std::f64::consts::PI / 180.0;
+        let radians = degrees as f64 * std::f64::consts::PI / 180.0;
         let scaled = match which {
             Trig::Sine => radians.sin(),
             Trig::Cosine => radians.cos(),
             Trig::Tangent => radians.tan(),
         } * 1000.0;
-        self.stack.push(Value::Int(to_int32(scaled.round())))
+        self.stack.push(Value::Int(to_int64(scaled.round())))
     }
 
     fn compare(&mut self, ordering: Ordering) -> Result<()> {
@@ -961,14 +946,12 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
                     Ordering::Ge => x >= y,
                 }
             }
-            (_, b) => {
-                return Err(IptError::TypeMismatch {
-                    expected: "two numbers or two strings",
-                    found: b.type_name(),
-                })
-            }
+            // Unlike kinds are never ordered. PalaceChat answers 0 for
+            // `1 "abc" <` rather than raising (reference line
+            // `IPT|<|mixed 1 abc|0`).
+            _ => false,
         };
-        self.stack.push(Value::Int(i32::from(result)))
+        self.stack.push(Value::Int(i64::from(result)))
     }
 
     fn make_string(&self, s: String) -> Result<Value> {
@@ -1051,11 +1034,24 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
         self.deref(&value)
     }
 
-    fn pop_int(&mut self) -> Result<i32> {
+    fn pop_int(&mut self) -> Result<i64> {
         match self.pop_deref()? {
             Value::Int(n) => Ok(n),
             other => Err(IptError::TypeMismatch {
                 expected: "number",
+                found: other.type_name(),
+            }),
+        }
+    }
+
+    /// A numeric operand as the arithmetic operators coerce it: an integer, or a
+    /// string parsed the way `ATOI` parses one (`toInteger` in the reference).
+    fn pop_arith_int(&mut self) -> Result<i64> {
+        match self.pop_deref()? {
+            Value::Int(n) => Ok(n),
+            Value::Str(s) => Ok(parse_int_js(&s)),
+            other => Err(IptError::TypeMismatch {
+                expected: "number or numeric string",
                 found: other.type_name(),
             }),
         }
@@ -1101,9 +1097,10 @@ impl<'a, H: Host + ?Sized> Vm<'a, H> {
         }
     }
 
-    fn pop_var_int(&mut self, name: &Rc<str>) -> Result<i32> {
+    fn pop_var_arith(&mut self, name: &Rc<str>) -> Result<i64> {
         match self.var_get(name)? {
             Value::Int(n) => Ok(n),
+            Value::Str(s) => Ok(parse_int_js(&s)),
             other => Err(IptError::TypeMismatch {
                 expected: "a number stored in the variable",
                 found: other.type_name(),
@@ -1127,6 +1124,20 @@ enum Ordering {
     Ge,
 }
 
+/// `==` equality, shared by `==` and its exact negation `!=`/`<>`.
+///
+/// Strings compare case-insensitively (the guide: "case-insensitive when
+/// comparing strings"), and unlike kinds are never equal. `!=` must be the
+/// precise negation of this for every pair, or `a != b` and `not (a == b)`
+/// disagree.
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => x.to_uppercase() == y.to_uppercase(),
+        _ => false,
+    }
+}
+
 /// The text form `&` gives an operand: strings pass through, numbers become
 /// decimal text (`iptService.js:2716`, JS `+`); any other kind is a type error.
 fn concat_operand(value: &Value) -> Result<Rc<str>> {
@@ -1140,16 +1151,22 @@ fn concat_operand(value: &Value) -> Result<Rc<str>> {
     }
 }
 
-/// ECMAScript `ToInt32`: truncate, wrap modulo 2³², and map non-finite to 0.
+/// The reference clients' `int(...)` coercion for a float result: truncate
+/// toward zero and map non-finite to 0.
 ///
-/// This is the reference clients' `int(...)` coercion. It is why `1/0` is `0`
-/// and why `2289043901 TANGENT` wraps instead of saturating.
-pub fn to_int32(value: f64) -> i32 {
+/// PalaceChat stores integers in an 8-byte `IntegerToken` (`IntegerToken` is
+/// constructed from and compared through `%i8`), so a negative result such as
+/// `180 COSINE` stays negative instead of wrapping at 32 bits like a JS `|0`.
+pub fn to_int64(value: f64) -> i64 {
     if !value.is_finite() {
         return 0;
     }
-    let truncated = value.trunc().rem_euclid(4294967296.0);
-    truncated as u32 as i32
+    let truncated = value.trunc();
+    if truncated >= -(2f64.powi(63)) && truncated < 2f64.powi(63) {
+        truncated as i64
+    } else {
+        truncated.rem_euclid(18446744073709551616.0) as u64 as i64
+    }
 }
 
 /// `parseInt(text)` as the reference clients implement it.
@@ -1157,7 +1174,7 @@ pub fn to_int32(value: f64) -> i32 {
 /// Skips leading whitespace, takes an optional sign, auto-detects `0x`/`0X` as
 /// hexadecimal, consumes the longest valid prefix and ignores the rest. An
 /// empty or invalid prefix is 0, matching `int(NaN)`.
-pub fn parse_int_js(text: &str) -> i32 {
+pub fn parse_int_js(text: &str) -> i64 {
     let trimmed = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
     let (negative, rest) = if let Some(rest) = trimmed.strip_prefix('-') {
         (true, rest)
@@ -1166,17 +1183,17 @@ pub fn parse_int_js(text: &str) -> i32 {
     } else {
         (false, trimmed)
     };
-    let (radix, digits) = if rest.len() >= 2 && (rest.starts_with("0x") || rest.starts_with("0X")) {
-        (16u32, &rest[2..])
-    } else {
-        (10u32, rest)
-    };
-    let mut accumulator = 0.0f64;
+    let hexadecimal = rest.len() >= 2 && (rest.starts_with("0x") || rest.starts_with("0X"));
+    let radix = if hexadecimal { 16 } else { 10 };
+    let digits = if hexadecimal { &rest[2..] } else { rest };
+    let mut accumulator = 0i64;
     let mut any = false;
     for c in digits.chars() {
         match c.to_digit(radix) {
             Some(digit) => {
-                accumulator = accumulator * f64::from(radix) + f64::from(digit);
+                accumulator = accumulator
+                    .wrapping_mul(i64::from(radix))
+                    .wrapping_add(i64::from(digit));
                 any = true;
             }
             None => break,
@@ -1185,7 +1202,11 @@ pub fn parse_int_js(text: &str) -> i32 {
     if !any {
         return 0;
     }
-    to_int32(if negative { -accumulator } else { accumulator })
+    if negative {
+        accumulator.wrapping_neg()
+    } else {
+        accumulator
+    }
 }
 
 /// Owns the host, the global variables and the command set.
@@ -1362,7 +1383,7 @@ mod tests {
         Engine::new(NullHost).run_source_resolved(source)
     }
 
-    fn int(source: &str) -> i32 {
+    fn int(source: &str) -> i64 {
         match run(source) {
             Ok(stack) => match stack.last() {
                 Some(Value::Int(n)) => *n,
@@ -1390,7 +1411,11 @@ mod tests {
         assert_eq!(int("3 2 /"), 1);
         assert_eq!(int("3 2 %"), 1);
         assert_eq!(int("-3 2 /"), -1, "truncates toward zero");
-        assert_eq!(int("2147483647 1 +"), i32::MIN, "wraps");
+        assert_eq!(
+            int("2147483647 1 +"),
+            2_147_483_648,
+            "the VM is 64-bit, matching PalaceChat's 8-byte IntegerToken"
+        );
     }
 
     #[test]
@@ -1409,15 +1434,15 @@ mod tests {
             "1cd",
             "& stringifies the number when the other operand is a string"
         );
-        assert!(run("1 2 &").is_err(), "& still rejects two non-strings");
+        assert_eq!(text("1 2 &"), "12", "& stringifies both numbers");
         assert!(run("1 \"cd\" +").is_err(), "+ needs matching kinds");
     }
 
     #[test]
-    fn comparisons_and_the_case_sensitivity_asymmetry() {
+    fn comparisons_are_case_insensitive_and_inequality_negates_equality() {
         assert_eq!(int("\"ABC\" \"abc\" =="), 1, "== is case-insensitive");
-        assert_eq!(int("\"ABC\" \"abc\" !="), 1, "!= is case-sensitive");
-        assert_eq!(int("\"abc\" \"ABC\" <>"), 1);
+        assert_eq!(int("\"ABC\" \"abc\" !="), 0, "!= negates ==");
+        assert_eq!(int("\"abc\" \"ABC\" <>"), 0, "<> is != ");
         assert_eq!(int("2 3 <"), 1);
         assert_eq!(int("2 3 >="), 0);
         assert_eq!(int("1 1 == 2 2 == AND"), 1);
@@ -1696,15 +1721,14 @@ mod tests {
     }
 
     #[test]
-    fn to_int32_matches_ecmascript() {
-        assert_eq!(to_int32(0.0), 0);
-        assert_eq!(to_int32(-0.5), 0);
-        assert_eq!(to_int32(1.9), 1);
-        assert_eq!(to_int32(f64::NAN), 0);
-        assert_eq!(to_int32(f64::INFINITY), 0);
-        assert_eq!(to_int32(4294967296.0), 0);
-        assert_eq!(to_int32(4294967297.0), 1);
-        assert_eq!(to_int32(-4294967295.0), 1);
+    fn to_int64_truncates_toward_zero() {
+        assert_eq!(to_int64(0.0), 0);
+        assert_eq!(to_int64(-0.5), 0);
+        assert_eq!(to_int64(1.9), 1);
+        assert_eq!(to_int64(-1000.0), -1000);
+        assert_eq!(to_int64(f64::NAN), 0);
+        assert_eq!(to_int64(f64::INFINITY), 0);
+        assert_eq!(to_int64(4294967296.0), 4_294_967_296);
     }
 
     #[test]

@@ -1168,15 +1168,23 @@ impl SessionState {
     }
 
     /// The users currently in the entered room, in a stable order.
+    ///
+    /// The signed-in user is always present, mirroring PalaceChat's
+    /// `currentRoom.users`: a room change clears the room-scoped list before the
+    /// destination's list arrives, and `WHONAME`/`USERNAME` must still resolve
+    /// from `ON ENTER`.
     #[must_use]
     pub fn users_in_room(&self) -> Vec<UserInfo> {
         let room_id = self.current_room.as_ref().map(|r| r.id as i16);
         let mut out: Vec<UserInfo> = self
             .users
             .values()
-            .filter(|u| match room_id {
-                Some(id) => u.room_id == id || self.room_users.contains(&u.id),
-                None => true,
+            .filter(|u| {
+                u.id == self.banner.user_id
+                    || match room_id {
+                        Some(id) => u.room_id == id || self.room_users.contains(&u.id),
+                        None => true,
+                    }
             })
             .cloned()
             .collect();
@@ -2036,6 +2044,31 @@ mod tests {
         assert!(
             !state.room_users.contains(&SELF),
             "the room-scoped list still drops us"
+        );
+    }
+
+    /// PalaceChat answers `WHONAME` from `currentRoom.getUserById`
+    /// (`PalaceController.as:379`), and that room keeps the signed-in user even
+    /// while its user list is being replaced on a room change. A room change in
+    /// this client clears the room-scoped list and leaves our own record naming
+    /// the old room, so `users_in_room` dropped us and `WHONAME(self)` answered
+    /// an empty string during the destination's `ON ENTER`.
+    #[test]
+    fn the_signed_in_user_stays_in_the_room_across_a_room_change() {
+        let mut state = room_state();
+        add_user(&mut state, SELF);
+        state.room_users.clear();
+        state.current_room = Some(RoomInfo {
+            id: 32009,
+            name: "TEST - ipt palace".to_string(),
+            users: 0,
+            flags: 0,
+        });
+
+        let ids: Vec<i32> = state.users_in_room().iter().map(|user| user.id).collect();
+        assert!(
+            ids.contains(&SELF),
+            "the signed-in user is always in the current room: {ids:?}"
         );
     }
 

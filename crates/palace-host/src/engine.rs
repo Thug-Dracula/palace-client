@@ -178,14 +178,22 @@ impl ScriptEngine {
     }
 
     /// Parse the room's hotspot scripts, replacing any previous room.
+    ///
+    /// A repeated description of the room we are already in is not a room
+    /// change: the server re-sends a description whenever the room's state
+    /// changes, the lifecycle does not run again for it, and the reference
+    /// keeps already-armed timers across it. Only a *different* room makes the
+    /// old room's pending alarms meaningless, so only then are they cleared.
     pub fn load_room(&mut self, room: &RoomDesc) {
         let limits = self.engine.limits;
         let commands = self.engine.commands.clone();
         let (scripts, problems) = scripts_from_room(room, &commands, &limits);
         self.scripts = scripts;
         self.problems = problems;
-        self.alarms.clear();
-        self.engine.host.alarms.clear();
+        if self.engine.host.view.room_id != i32::from(room.header.room_id) {
+            self.alarms.clear();
+            self.engine.host.alarms.clear();
+        }
         self.engine.host.view.chat_string.clear();
         self.engine.host.view.apply_room(room);
     }
@@ -380,20 +388,23 @@ impl ScriptEngine {
         report
     }
 
-    /// The order handlers run in: hotspots last to first, then the cyborg.
+    /// The order handlers run in: hotspots first to last, then the cyborg.
     ///
+    /// The PalaceChat client walks its hotspot collection forwards, index `0` up
+    /// to `UBound` (disassembled from the shipped Xojo binary:
+    /// `PalaceController.triggerHotspotEvents%b%o<PalaceController>s`), and fills
+    /// that collection in room-description order. OpenPalace's
     /// `PalaceController.triggerHotspotEvents`
     /// (`OpenPalace/PalaceClient/.../iptscrae/PalaceController.as:81-93`) walks
-    /// `currentRoom.hotSpots` from `length-1` down to `0` and only then
-    /// triggers `cyborgHotspot`. Hotspot scripts are loaded in room order
-    /// (`scripts_from_room` follows `room.hotspots`) and the cyborg is appended
-    /// (`load_cyborg`), so reversing the hotspot run and leaving spot `0` last
-    /// reproduces the reference.
+    /// it backwards instead; copying that walk was wrong, because a later
+    /// hotspot's handler then ran before an earlier one had set the state it
+    /// reads (room 31741's team gate must run before spot 69's audience check).
+    /// Scripts load in room order (`scripts_from_room`) with the cyborg appended
+    /// (`load_cyborg`), so load order plus cyborg last matches PalaceChat.
     fn dispatch_order(scripts: &[LoadedScript]) -> Vec<usize> {
         let mut order: Vec<usize> = (0..scripts.len())
             .filter(|&index| scripts[index].spot != 0)
             .collect();
-        order.reverse();
         order.extend((0..scripts.len()).filter(|&index| scripts[index].spot == 0));
         order
     }

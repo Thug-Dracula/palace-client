@@ -121,7 +121,7 @@ impl Eq for Chunk {}
 #[derive(Clone, Debug, PartialEq)]
 pub enum Op {
     /// Integer literal.
-    Int(i32),
+    Int(i64),
     /// String literal (source bytes already decoded to `char`s).
     Str(Rc<str>),
     /// A symbol that is not a registered command: a variable reference.
@@ -145,8 +145,9 @@ pub type ArrayRef = Rc<RefCell<Vec<Value>>>;
 /// A value on the data stack.
 #[derive(Clone)]
 pub enum Value {
-    /// 32-bit signed integer. There are no floats.
-    Int(i32),
+    /// Signed 64-bit integer, matching PalaceChat's `IntegerToken` (an 8-byte
+    /// `IntegerToken.toInteger%i8` in the client binary). There are no floats.
+    Int(i64),
     /// Immutable string.
     Str(Rc<str>),
     /// Atomlist (subroutine).

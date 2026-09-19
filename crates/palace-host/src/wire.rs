@@ -179,26 +179,31 @@ pub fn effect_frame(effect: &Effect, ctx: &WireContext) -> Option<Frame> {
 #[must_use]
 pub fn move_target(effect: &Effect, ctx: &WireContext) -> Option<(i32, i32)> {
     match effect {
-        Effect::MoveUserAbs { x, y } => Some(clamp_position(*x, *y, ctx)),
+        Effect::MoveUserAbs { x, y } => {
+            Some(clamp_position(*x, *y, ctx.room_width, ctx.room_height))
+        }
         Effect::MoveUserRel { dx, dy } => Some(clamp_position(
             ctx.self_pos.0 + *dx,
             ctx.self_pos.1 + *dy,
-            ctx,
+            ctx.room_width,
+            ctx.room_height,
         )),
         _ => None,
     }
 }
 
-fn clamp_position(x: i32, y: i32, ctx: &WireContext) -> (i32, i32) {
-    let max_x = if ctx.room_width > 44 {
-        ctx.room_width - 22
+/// The room position a scripted move comes to rest at, shared by the frame
+/// encoder and the eager in-handler snapshot so the two cannot drift.
+pub(crate) fn clamp_position(x: i32, y: i32, room_width: i32, room_height: i32) -> (i32, i32) {
+    let max_x = if room_width > 44 {
+        room_width - 22
     } else {
-        ctx.room_width
+        room_width
     };
-    let max_y = if ctx.room_height > 44 {
-        ctx.room_height - 22
+    let max_y = if room_height > 44 {
+        room_height - 22
     } else {
-        ctx.room_height
+        room_height
     };
     (x.clamp(22.min(max_x), max_x), y.clamp(22.min(max_y), max_y))
 }

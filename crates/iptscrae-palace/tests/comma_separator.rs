@@ -19,7 +19,7 @@ fn parse_body_accepts_the_arena_lines() {
         .ops()
         .to_vec();
 
-    let ints: Vec<i32> = ops
+    let ints: Vec<i64> = ops
         .iter()
         .filter_map(|op| match op {
             Op::Int(n) => Some(*n),

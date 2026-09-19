@@ -33,6 +33,12 @@ fn room_with(scripts: &[(i16, &str)]) -> RoomDesc {
     }
 }
 
+fn room_with_id(id: i16, scripts: &[(i16, &str)]) -> RoomDesc {
+    let mut room = room_with(scripts);
+    room.header.room_id = id;
+    room
+}
+
 fn engine_for(scripts: &[(i16, &str)]) -> ScriptEngine {
     let mut engine = ScriptEngine::with_palace_limits();
     engine.set_view(HostView {
@@ -170,6 +176,52 @@ fn setalarm_fires_the_named_spots_alarm_handler() {
     );
 }
 
+/// The server re-sends a room description whenever the room's state changes.
+/// That is not a room change: the lifecycle does not run again, so nothing
+/// re-arms the room's timers, and a description must not silently drop them.
+#[test]
+fn a_repeated_room_description_keeps_the_alarms_it_armed() {
+    const SOURCE: &str = "ON ENTER { { \"later\" SAY } 30 ALARMEXEC }";
+    let mut engine = engine_for(&[]);
+    engine.load_room(&room_with_id(32000, &[(1, SOURCE)]));
+    engine.fire(ScriptEvent::Enter);
+    assert_eq!(engine.pending_alarms(), 1, "entering armed the alarm");
+
+    engine.load_room(&room_with_id(32000, &[(1, SOURCE)]));
+    assert_eq!(
+        engine.pending_alarms(),
+        1,
+        "a repeated description must not drop the armed alarm"
+    );
+
+    assert_eq!(
+        engine.advance(30),
+        vec![Effect::Say {
+            text: "later".to_string()
+        }],
+        "the alarm the room armed still runs"
+    );
+}
+
+#[test]
+fn a_different_room_drops_alarms_armed_in_the_old_one() {
+    let mut engine = engine_for(&[]);
+    engine.load_room(&room_with_id(
+        32000,
+        &[(1, "ON ENTER { { \"later\" SAY } 30 ALARMEXEC }")],
+    ));
+    engine.fire(ScriptEvent::Enter);
+    assert_eq!(engine.pending_alarms(), 1);
+
+    engine.load_room(&room_with_id(400, &[]));
+    assert_eq!(
+        engine.pending_alarms(),
+        0,
+        "an alarm armed in the room we left must not fire in the new room"
+    );
+    assert!(engine.advance(30).is_empty());
+}
+
 #[test]
 fn a_faulting_handler_is_reported_not_swallowed() {
     let mut engine = engine_for(&[(1, "ON SELECT { 1 0 / POP }")]);
@@ -180,12 +232,12 @@ fn a_faulting_handler_is_reported_not_swallowed() {
         "division by zero is defined"
     );
 
-    let mut engine = engine_for(&[(1, "ON SELECT { 1 2 & }")]);
+    let mut engine = engine_for(&[(1, "ON SELECT { 1 2 3 GET }")]);
     let report = engine.fire(ScriptEvent::Select);
     assert_eq!(
         report.errors().len(),
         1,
-        "ampersand on two numbers must fault: {:?}",
+        "GET on a number must fault: {:?}",
         report.runs
     );
     assert!(report.errors()[0].error.is_some());

@@ -544,7 +544,7 @@ impl<H: PalaceHost> Host for PalaceCommands<H> {
                 Ok(Vec::new())
             }
             "USERNAME" => Ok(vec![Value::str(self.inner.get_self_user_name())]),
-            "USERID" | "WHOME" => Ok(vec![Value::Int(self.inner.get_self_user_id() as i32)]),
+            "USERID" | "WHOME" => Ok(vec![Value::Int(self.inner.get_self_user_id())]),
             other => Err(IptError::CommandUnavailable {
                 command: other.to_owned(),
             }),
@@ -554,7 +554,7 @@ impl<H: PalaceHost> Host for PalaceCommands<H> {
 
 fn int_arg(args: &[Value], index: usize) -> Result<i64> {
     match args.get(index) {
-        Some(Value::Int(n)) => Ok(i64::from(*n)),
+        Some(Value::Int(n)) => Ok(*n),
         Some(other) => Err(IptError::TypeMismatch {
             expected: "number operand",
             found: other.type_name(),

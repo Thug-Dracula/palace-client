@@ -18,6 +18,7 @@ use iptscrae_palace::PalaceHost;
 
 use crate::effect::Effect;
 use crate::view::HostView;
+use crate::wire::clamp_position;
 
 /// A delay a script asked for (`ALARMEXEC` / `SETALARM`).
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +207,36 @@ impl ScriptHost {
             self.view.self_props.remove(index);
         }
     }
+
+    /// Apply a scripted move to the snapshot now.
+    ///
+    /// `PalaceClient.move`
+    /// (`OpenPalace/PalaceClient/src/net/codecomposer/palace/rpc/PalaceClient.as:548-568`)
+    /// clamps to the room and records the result on `currentUser` before it
+    /// returns, so a read later in the same handler sees the new coordinates.
+    /// The snapshot is updated through the same [`clamp_position`] the frame
+    /// encoder uses; the recorded [`Effect`] still carries the raw request so
+    /// the wire path is unchanged.
+    fn move_user_abs_now(&mut self, x: i64, y: i64) {
+        let (cx, cy) = clamp_position(
+            x as i32,
+            y as i32,
+            self.view.room_width,
+            self.view.room_height,
+        );
+        self.view.self_x = cx;
+        self.view.self_y = cy;
+    }
+
+    /// `PalaceController.moveUserRel`
+    /// (`PalaceClient-iptscrae/PalaceController.as:286-289`) computes the target
+    /// from `currentUser.x/y`, so the delta lands on the eager snapshot, not the
+    /// pre-handler position.
+    fn move_user_rel_now(&mut self, dx: i64, dy: i64) {
+        let x = i64::from(self.view.self_x).saturating_add(dx);
+        let y = i64::from(self.view.self_y).saturating_add(dy);
+        self.move_user_abs_now(x, y);
+    }
 }
 
 fn stub_values(pushes: usize, push: Push) -> Vec<Value> {
@@ -219,7 +250,7 @@ fn stub_values(pushes: usize, push: Push) -> Vec<Value> {
 
 fn int_arg(args: &[Value], index: usize) -> Result<i64> {
     match args.get(index) {
-        Some(Value::Int(n)) => Ok(i64::from(*n)),
+        Some(Value::Int(n)) => Ok(*n),
         Some(other) => Err(IptError::TypeMismatch {
             expected: "number operand",
             found: other.type_name(),
@@ -307,7 +338,7 @@ fn chunk_arg(args: &[Value], index: usize) -> Result<&Chunk> {
 /// Read an operand that may be either a number or a string (prop ids, colours).
 fn loose_int(args: &[Value], index: usize) -> Result<i64> {
     match args.get(index) {
-        Some(Value::Int(n)) => Ok(i64::from(*n)),
+        Some(Value::Int(n)) => Ok(*n),
         Some(Value::Str(s)) => Ok(s.trim().parse::<i64>().unwrap_or(0)),
         _ => Ok(0),
     }
@@ -339,7 +370,7 @@ fn int_list(args: &[Value], index: usize, quoted_numbers: bool) -> Vec<i64> {
 
 fn as_int(value: &Value, quoted_numbers: bool) -> Option<i64> {
     match value {
-        Value::Int(n) => Some(i64::from(*n)),
+        Value::Int(n) => Some(*n),
         Value::Str(s) if quoted_numbers => s.trim().parse::<i64>().ok(),
         _ => None,
     }
@@ -600,135 +631,128 @@ impl Host for ScriptHost {
             // `ID` to `MECommand`, and the guide documents it as "spotID/doorID
             // executing script or 0 for Cyborg" — so it must not answer with the
             // user id the way `USERID`/`WHOME` do.
-            "ME" | "ID" => Ok(vec![Value::Int(self.current_spot)]),
-            "USERID" | "WHOME" => Ok(vec![Value::Int(self.get_self_user_id() as i32)]),
+            "ME" | "ID" => Ok(vec![Value::Int(i64::from(self.current_spot))]),
+            "USERID" | "WHOME" => Ok(vec![Value::Int(self.get_self_user_id())]),
             "USERNAME" => Ok(vec![Value::str(self.get_self_user_name())]),
             "SERVERNAME" => Ok(vec![Value::str(self.get_server_name())]),
-            "ROOMID" => Ok(vec![Value::Int(self.get_room_id() as i32)]),
+            "ROOMID" => Ok(vec![Value::Int(self.get_room_id())]),
             "ROOMNAME" => Ok(vec![Value::str(self.get_room_name())]),
-            "ROOMWIDTH" => Ok(vec![Value::Int(self.get_room_width() as i32)]),
-            "ROOMHEIGHT" => Ok(vec![Value::Int(self.get_room_height() as i32)]),
-            "POSX" => Ok(vec![Value::Int(self.get_self_pos_x() as i32)]),
-            "POSY" => Ok(vec![Value::Int(self.get_self_pos_y() as i32)]),
+            "ROOMWIDTH" => Ok(vec![Value::Int(self.get_room_width())]),
+            "ROOMHEIGHT" => Ok(vec![Value::Int(self.get_room_height())]),
+            "POSX" => Ok(vec![Value::Int(self.get_self_pos_x())]),
+            "POSY" => Ok(vec![Value::Int(self.get_self_pos_y())]),
             "MOUSEPOS" => Ok(vec![
-                Value::Int(self.get_mouse_x() as i32),
-                Value::Int(self.get_mouse_y() as i32),
+                Value::Int(self.get_mouse_x()),
+                Value::Int(self.get_mouse_y()),
             ]),
             "CLIENTTYPE" => Ok(vec![Value::str(self.client_type())]),
             "OPENPALACE" => Ok(vec![Value::Int(1)]),
-            "PALACECHAT" => Ok(vec![Value::Int(PALACECHAT_VERSION)]),
+            "PALACECHAT" => Ok(vec![Value::Int(i64::from(PALACECHAT_VERSION))]),
             "IPTVERSION" => Ok(vec![Value::Int(2)]),
-            "ISGOD" => Ok(vec![Value::Int(i32::from(self.is_god()))]),
-            "ISGUEST" => Ok(vec![Value::Int(i32::from(self.is_guest()))]),
-            "ISWIZARD" => Ok(vec![Value::Int(i32::from(self.is_wizard()))]),
-            "ISRIGHTCLICK" => Ok(vec![Value::Int(i32::from(self.view.right_click))]),
-            "WHOCHAT" => Ok(vec![Value::Int(self.get_who_chat() as i32)]),
-            "WHOTARGET" => Ok(vec![Value::Int(self.get_who_target() as i32)]),
+            "ISGOD" => Ok(vec![Value::Int(i64::from(self.is_god()))]),
+            "ISGUEST" => Ok(vec![Value::Int(i64::from(self.is_guest()))]),
+            "ISWIZARD" => Ok(vec![Value::Int(i64::from(self.is_wizard()))]),
+            "ISRIGHTCLICK" => Ok(vec![Value::Int(i64::from(self.view.right_click))]),
+            "WHOCHAT" => Ok(vec![Value::Int(self.get_who_chat())]),
+            "WHOTARGET" => Ok(vec![Value::Int(self.get_who_target())]),
             "DEST" => Ok(vec![Value::Int(
-                self.get_spot_dest(i64::from(self.current_spot)) as i32,
+                self.get_spot_dest(i64::from(self.current_spot)),
             )]),
             "NBRDOORS" => Ok(vec![Value::Int(
-                self.view.spots.iter().filter(|s| s.kind == 1).count() as i32,
+                self.view.spots.iter().filter(|s| s.kind == 1).count() as i64,
             )]),
-            "NBRSPOTS" => Ok(vec![Value::Int(self.view.spots.len() as i32)]),
-            "NBRROOMUSERS" => Ok(vec![Value::Int(self.get_num_room_users() as i32)]),
-            "NBRUSERPROPS" => Ok(vec![Value::Int(self.get_num_user_props() as i32)]),
-            "TOPPROP" => Ok(vec![Value::Int(self.get_top_prop() as i32)]),
+            "NBRSPOTS" => Ok(vec![Value::Int(self.view.spots.len() as i64)]),
+            "NBRROOMUSERS" => Ok(vec![Value::Int(self.get_num_room_users())]),
+            "NBRUSERPROPS" => Ok(vec![Value::Int(self.get_num_user_props())]),
+            "TOPPROP" => Ok(vec![Value::Int(self.get_top_prop())]),
 
             // ------------------------------------------------------ lookups
             "GETSPOTLOC" => {
                 let (x, y) = self.get_spot_location(int_arg(args, 0)?);
-                Ok(vec![Value::Int(x as i32), Value::Int(y as i32)])
+                Ok(vec![Value::Int(x), Value::Int(y)])
             }
             "GETSPOTSTATE" => Ok(vec![Value::Int(
-                self.get_spot_state(int_arg(args, 0)?) as i32
+                self.get_spot_state(int_arg(args, 0)?) as i64
             )]),
             "GETPICLOC" => {
                 let (x, y) = self.get_pic_offset(int_arg(args, 0)?, int_arg(args, 1)?);
-                Ok(vec![Value::Int(x as i32), Value::Int(y as i32)])
+                Ok(vec![Value::Int(x), Value::Int(y)])
             }
             "GETPICDIMENSIONS" => {
                 let (w, h) = self.get_pic_dimensions(int_arg(args, 0)?, int_arg(args, 1)?);
-                Ok(vec![Value::Int(w as i32), Value::Int(h as i32)])
+                Ok(vec![Value::Int(w), Value::Int(h)])
             }
             "SPOTDEST" => Ok(vec![Value::Int(
-                self.get_spot_dest(int_arg(args, 0)?) as i32
+                self.get_spot_dest(int_arg(args, 0)?) as i64
             )]),
             "SPOTIDX" => Ok(vec![Value::Int(
-                self.get_spot_id_by_index(int_arg(args, 0)?) as i32,
+                self.get_spot_id_by_index(int_arg(args, 0)?) as i64,
             )]),
             "SPOTNAME" => Ok(vec![Value::str(self.get_spot_name(int_arg(args, 0)?))]),
-            "ISLOCKED" => Ok(vec![Value::Int(i32::from(
+            "ISLOCKED" => Ok(vec![Value::Int(i64::from(
                 self.is_locked(int_arg(args, 0)?),
             ))]),
-            "INSPOT" => Ok(vec![Value::Int(i32::from(self.in_spot(int_arg(args, 0)?)))]),
+            "INSPOT" => Ok(vec![Value::Int(i64::from(self.in_spot(int_arg(args, 0)?)))]),
             "ROOMUSER" => Ok(vec![Value::Int(
-                self.get_room_user_id_by_index(int_arg(args, 0)?) as i32,
+                self.get_room_user_id_by_index(int_arg(args, 0)?) as i64,
             )]),
             "WHONAME" => Ok(vec![Value::str(self.get_user_name(int_arg(args, 0)?))]),
             "WHOPOS" => {
                 let user = int_arg(args, 0)?;
                 Ok(vec![
-                    Value::Int(self.get_pos_x(user) as i32),
-                    Value::Int(self.get_pos_y(user) as i32),
+                    Value::Int(self.get_pos_x(user) as i64),
+                    Value::Int(self.get_pos_y(user) as i64),
                 ])
             }
             "USERPROP" => Ok(vec![Value::Int(
-                self.get_user_prop(int_arg(args, 0)?) as i32
+                self.get_user_prop(int_arg(args, 0)?) as i64
             )]),
             // `HASPROP` accepts a prop id or a prop name
             // (`HASPROPCommand.as:20-22`); a string routes to the by-name
             // resolver, a number to the id check.
             "HASPROP" => match args.first() {
                 Some(Value::Str(name)) => {
-                    Ok(vec![Value::Int(i32::from(self.has_prop_by_name(name)))])
+                    Ok(vec![Value::Int(i64::from(self.has_prop_by_name(name)))])
                 }
-                _ => Ok(vec![Value::Int(i32::from(
+                _ => Ok(vec![Value::Int(i64::from(
                     self.has_prop_by_id(int_arg(args, 0)?),
                 ))]),
             },
             "LOOSEPROP" => Ok(vec![Value::Int(
-                self.get_loose_prop_id_by_index(int_arg(args, 0)?) as i32,
+                self.get_loose_prop_id_by_index(int_arg(args, 0)?) as i64,
             )]),
             "LOOSEPROPIDX" => Ok(vec![Value::Int(
-                self.get_loose_prop_index_by_id(int_arg(args, 0)?) as i32,
+                self.get_loose_prop_index_by_id(int_arg(args, 0)?) as i64,
             )]),
             "LOOSEPROPPOS" => {
                 let (x, y) = self.get_loose_prop_pos(int_arg(args, 0)?);
-                Ok(vec![Value::Int(x as i32), Value::Int(y as i32)])
+                Ok(vec![Value::Int(x), Value::Int(y)])
             }
-            "NBRLOOSEPROPS" => Ok(vec![Value::Int(self.get_num_loose_props() as i32)]),
-            "MOUSEX" => Ok(vec![Value::Int(self.get_mouse_x() as i32)]),
-            "MOUSEY" => Ok(vec![Value::Int(self.get_mouse_y() as i32)]),
+            "NBRLOOSEPROPS" => Ok(vec![Value::Int(self.get_num_loose_props())]),
+            "MOUSEX" => Ok(vec![Value::Int(self.get_mouse_x())]),
+            "MOUSEY" => Ok(vec![Value::Int(self.get_mouse_y())]),
             "PROPDIMENSIONS" => {
                 let (w, h) = self.get_prop_dimensions(int_arg(args, 0)?);
-                Ok(vec![Value::Int(w as i32), Value::Int(h as i32)])
+                Ok(vec![Value::Int(w), Value::Int(h)])
             }
             "PROPOFFSETS" => {
                 let (x, y) = self.get_prop_offsets(int_arg(args, 0)?);
-                Ok(vec![Value::Int(x as i32), Value::Int(y as i32)])
+                Ok(vec![Value::Int(x), Value::Int(y)])
             }
             "HTTPRECEIVED" => Ok(vec![Value::Int(0)]),
             "DOORIDX" => Ok(vec![Value::Int(
-                self.get_door_id_by_index(int_arg(args, 0)?) as i32,
+                self.get_door_id_by_index(int_arg(args, 0)?) as i64,
             )]),
 
             // ------------------------------------------------------ spot state
             "SETSPOTSTATE" | "SETSPOTSTATELOCAL" => {
                 let state = int_arg(args, 0)?;
                 let spot = int_arg(args, 1)?;
-                let effect = if name == "SETSPOTSTATE" {
-                    Effect::SetSpotState {
-                        spot: spot as i32,
-                        state: state as i32,
-                    }
+                if name == "SETSPOTSTATE" {
+                    self.set_spot_state(spot, state)?;
                 } else {
-                    Effect::SetSpotStateLocal {
-                        spot: spot as i32,
-                        state: state as i32,
-                    }
-                };
-                self.effects.push(effect);
+                    self.set_spot_state_local(spot, state)?;
+                }
                 Ok(Vec::new())
             }
             "SETSPOTNAMELOCAL" => self
@@ -815,7 +839,7 @@ impl Host for ScriptHost {
                     x: x as i32,
                     y: y as i32,
                 });
-                Ok(vec![Value::Int(id)])
+                Ok(vec![Value::Int(i64::from(id))])
             }
             "ADDPIC" => {
                 let name = text_arg(args, 0)?;
@@ -939,7 +963,7 @@ impl Host for ScriptHost {
                 let props: Vec<i64> = items
                     .iter()
                     .filter_map(|item| match item {
-                        Value::Int(n) => Some(i64::from(*n)),
+                        Value::Int(n) => Some(*n),
                         _ => None,
                     })
                     .collect();
@@ -948,20 +972,12 @@ impl Host for ScriptHost {
             }
 
             // ------------------------------------------------------ movement
-            "SETPOS" => {
-                self.effects.push(Effect::MoveUserAbs {
-                    x: int_arg(args, 0)? as i32,
-                    y: int_arg(args, 1)? as i32,
-                });
-                Ok(Vec::new())
-            }
-            "MOVE" => {
-                self.effects.push(Effect::MoveUserRel {
-                    dx: int_arg(args, 0)? as i32,
-                    dy: int_arg(args, 1)? as i32,
-                });
-                Ok(Vec::new())
-            }
+            "SETPOS" => self
+                .move_user_abs(int_arg(args, 0)?, int_arg(args, 1)?)
+                .map(|_| Vec::new()),
+            "MOVE" => self
+                .move_user_rel(int_arg(args, 0)?, int_arg(args, 1)?)
+                .map(|_| Vec::new()),
             "GOTOROOM" | "ROOMGOTO" => {
                 self.effects.push(Effect::GotoRoom {
                     room: int_arg(args, 0)? as i32,
@@ -1357,19 +1373,23 @@ impl Host for ScriptHost {
                     .view
                     .spot(int_arg(args, 0)? as i32)
                     .map_or(0, |s| s.kind);
-                Ok(vec![Value::Int(kind)])
+                Ok(vec![Value::Int(i64::from(kind))])
             }
             "GETSPOTOPTIONS" => {
                 let spot = self.view.spot(int_arg(args, 0)? as i32);
                 let kind = spot.map_or(0, |s| s.kind);
                 let flags = spot.map_or(0, |s| s.flags);
-                Ok(vec![Value::Int(kind), Value::Int(0), Value::Int(flags)])
+                Ok(vec![
+                    Value::Int(i64::from(kind)),
+                    Value::Int(0),
+                    Value::Int(i64::from(flags)),
+                ])
             }
             "GETSPOTPOINTS" => {
                 let flat = self.view.spot(int_arg(args, 0)? as i32).map(|s| {
                     s.points
                         .iter()
-                        .flat_map(|(x, y)| [Value::Int(*x), Value::Int(*y)])
+                        .flat_map(|(x, y)| [Value::Int(i64::from(*x)), Value::Int(i64::from(*y))])
                         .collect::<Vec<Value>>()
                 });
                 Ok(vec![Value::array(flat.unwrap_or_default())])
@@ -1379,7 +1399,7 @@ impl Host for ScriptHost {
                 let x = int_arg(args, 0)? as i32;
                 let y = int_arg(args, 1)? as i32;
                 let spot = self.view.spot_at(x, y).map_or(0, |s| s.id);
-                Ok(vec![Value::Int(spot)])
+                Ok(vec![Value::Int(i64::from(spot))])
             }
             // Sparky's `BS` handler pops three operands and answers four zeros
             // (the browser build has no text metrics).
@@ -1525,12 +1545,12 @@ impl Host for ScriptHost {
                 Ok(Vec::new())
             }
             "STOPALARMS" => self.clear_alarms().map(|()| Vec::new()),
-            "CLIENTID" => Ok(vec![Value::Int(self.get_self_user_id() as i32)]),
-            "GETTIMEZONE" => Ok(vec![Value::Int(local_utc_offset_hours())]),
+            "CLIENTID" => Ok(vec![Value::Int(self.get_self_user_id())]),
+            "GETTIMEZONE" => Ok(vec![Value::Int(i64::from(local_utc_offset_hours()))]),
 
             // --------------------------------------------- Sparky GS: other reads
             "MEDIAADDRESS" => Ok(vec![Value::str("")]),
-            "NBRSERVERUSERS" => Ok(vec![Value::Int(self.view.users.len() as i32)]),
+            "NBRSERVERUSERS" => Ok(vec![Value::Int(self.view.users.len() as i64)]),
             "NBRROOMPICS" => Ok(vec![Value::Int(0)]),
             "ROOMPICNAME" => Ok(vec![Value::str("")]),
             "ISKEYDOWN" => {
@@ -1545,7 +1565,7 @@ impl Host for ScriptHost {
                 } else {
                     0
                 };
-                Ok(vec![Value::Int(color)])
+                Ok(vec![Value::Int(i64::from(color))])
             }
             "WHOFACE" => {
                 let user = int_arg(args, 0)?;
@@ -1554,7 +1574,7 @@ impl Host for ScriptHost {
                 } else {
                     0
                 };
-                Ok(vec![Value::Int(face)])
+                Ok(vec![Value::Int(i64::from(face))])
             }
             "MUTE" | "UNMUTE" => {
                 let target = text_arg(args, 0)?;
@@ -1761,6 +1781,7 @@ impl PalaceHost for ScriptHost {
     }
 
     fn move_user_abs(&mut self, x: i64, y: i64) -> Result<()> {
+        self.move_user_abs_now(x, y);
         self.effects.push(Effect::MoveUserAbs {
             x: x as i32,
             y: y as i32,
@@ -1769,6 +1790,7 @@ impl PalaceHost for ScriptHost {
     }
 
     fn move_user_rel(&mut self, dx: i64, dy: i64) -> Result<()> {
+        self.move_user_rel_now(dx, dy);
         self.effects.push(Effect::MoveUserRel {
             dx: dx as i32,
             dy: dy as i32,
@@ -1828,6 +1850,12 @@ impl PalaceHost for ScriptHost {
     }
 
     fn set_spot_state_local(&mut self, spot: i64, state: i64) -> Result<()> {
+        // `PalaceController.setSpotStateLocal` changes the hotspot at once
+        // (`iptscrae/PalaceController.as:329`), so a `GETSPOTSTATE` later in the
+        // same handler reads the new state.
+        if let Some(target) = self.view.spots.iter_mut().find(|s| i64::from(s.id) == spot) {
+            target.state = state as i32;
+        }
         self.effects.push(Effect::SetSpotStateLocal {
             spot: spot as i32,
             state: state as i32,

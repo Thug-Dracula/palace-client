@@ -179,7 +179,7 @@ pub fn pushed(name: &str, args: &[Value]) -> Vec<Value> {
 
 /// `Value::Int` for each element.
 pub fn ints(ns: &[i32]) -> Vec<Value> {
-    ns.iter().copied().map(Value::Int).collect()
+    ns.iter().map(|n| Value::Int(i64::from(*n))).collect()
 }
 
 /// `Value::str` for each element.

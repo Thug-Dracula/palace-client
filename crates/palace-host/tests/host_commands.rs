@@ -619,7 +619,7 @@ fn prop_commands_record_their_effects() {
 fn loadprops_validates_its_array() {
     let mut host = populated_host();
 
-    let too_many = Value::array((0..501i32).map(Value::Int).collect());
+    let too_many = Value::array((0..501i64).map(Value::Int).collect());
     let error = host
         .command("LOADPROPS", std::slice::from_ref(&too_many))
         .expect_err("501 ids exceed the cap");
