@@ -154,6 +154,19 @@ their click-test predated the click-coordinate fix.
 ```
 The local move is applied *before* the network send.
 
+**Click-to-walk on a LIVE server — PROVEN (2026-09-18, later still).** Run as a
+plain guest against `localhost:9998`, room `#901`:
+```
+[step] click (300,250) = viewport (541.9,351.6)
+[note] script: click at room (300,250) hit no hotspot
+[note] walk: local apply id=13 to=(300,250) changed=true
+[note] walk: redraw requested id=13 to=(300,250)
+[note] walk: sent id=13 to=(300,250)
+```
+The local apply precedes the send, the server accepted the move, and the position
+held at `(140,100)` across subsequent frames with no snap-back and no error. This
+closes the "tested against the mock harness only" caveat for walking.
+
 **Click coordinate mapping — fixed + regression-tested.** Was throwing clicks off
 by the display's doubled resolution (`the_click_inverse_is_a_css_only_map_and_does_not_move_with_dpr`,
 `a_click_at_a_hotspot_resolves_at_dpr_two`).

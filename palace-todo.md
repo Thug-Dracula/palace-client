@@ -199,8 +199,10 @@ dialect. What remains:
 - [ ] **Open the right-click menu and the avatar picker once.** Their numeric
   core is verified (the sheet is exactly `572×704 = 13×44 × 16×44`, and the
   picker addresses the same cell the renderer reads); appearance is unverified.
-- [ ] **Walk somewhere on a live server.** Click-to-walk is tested against the
-  mock harness only.
+- [x] **Walk somewhere on a live server.** Verified against `localhost:9998`
+  (room `#901`, plain guest): the local apply precedes the send
+  (`walk: local apply` then `walk: sent`), the server accepted the move, and the
+  position held with no snap-back.
 - [ ] **Watch a real second user's face change arrive.** The receive path is
   verified against the mock harness only; a busy server has not been available.
 
