@@ -327,7 +327,7 @@ impl MockServer {
     }
 
     fn start_with(frames: Vec<Vec<u8>>, half_close: bool) -> Self {
-        Self::start_inner(frames, half_close, None, Vec::new())
+        Self::start_inner(frames, half_close, Vec::new())
     }
 
     /// Like [`MockServer::start`], but holds back `tail` until the returned flag
@@ -335,16 +335,26 @@ impl MockServer {
     fn start_gated(frames: Vec<Vec<u8>>, tail: Vec<Vec<u8>>) -> (Self, Arc<AtomicBool>) {
         let gate = Arc::new(AtomicBool::new(false));
         (
-            Self::start_inner(frames, false, Some(gate.clone()), tail),
+            Self::start_inner(frames, false, vec![(gate.clone(), tail)]),
             gate,
         )
+    }
+
+    /// Like [`MockServer::start_gated`], but with one flag per batch, so a test
+    /// can release the server's frames one step at a time. Each `(flag, batch)`
+    /// is written, in order, once its flag is set; the client's writes are
+    /// drained while the flags wait.
+    fn start_gated_steps(
+        frames: Vec<Vec<u8>>,
+        steps: Vec<(Arc<AtomicBool>, Vec<Vec<u8>>)>,
+    ) -> Self {
+        Self::start_inner(frames, false, steps)
     }
 
     fn start_inner(
         frames: Vec<Vec<u8>>,
         half_close: bool,
-        gate: Option<Arc<AtomicBool>>,
-        tail: Vec<Vec<u8>>,
+        steps: Vec<(Arc<AtomicBool>, Vec<Vec<u8>>)>,
     ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
@@ -370,10 +380,9 @@ impl MockServer {
                             let frames = frames.clone();
                             let stop = stop.clone();
                             let received = received.clone();
-                            let gate = gate.clone();
-                            let tail = tail.clone();
+                            let steps = steps.clone();
                             let handle = thread::spawn(move || {
-                                serve(stream, frames, half_close, stop, received, gate, tail);
+                                serve(stream, frames, half_close, stop, received, steps);
                             });
                             workers.lock().expect("workers").push(handle);
                         }
@@ -430,8 +439,7 @@ fn serve(
     half_close: bool,
     stop: Arc<AtomicBool>,
     received: Arc<Mutex<Vec<u8>>>,
-    gate: Option<Arc<AtomicBool>>,
-    tail: Vec<Vec<u8>>,
+    steps: Vec<(Arc<AtomicBool>, Vec<Vec<u8>>)>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
     for bytes in &frames {
@@ -441,8 +449,8 @@ fn serve(
     }
     let _ = stream.flush();
 
-    if let Some(gate) = gate {
-        let mut buf = [0u8; 8192];
+    let mut buf = [0u8; 8192];
+    for (gate, batch) in &steps {
         while !gate.load(Ordering::Relaxed) {
             if stop.load(Ordering::Relaxed) {
                 return;
@@ -461,7 +469,7 @@ fn serve(
                 Err(_) => return,
             }
         }
-        for bytes in &tail {
+        for bytes in batch {
             if stream.write_all(bytes).is_err() {
                 return;
             }
@@ -6125,8 +6133,11 @@ fn a_chat_message_reaches_the_frame_as_chat_text() {
 
 #[test]
 fn a_spot_move_for_this_room_recomposes_and_a_foreign_one_does_not() {
-    const FOREIGN: &str = "foreign-spot-move-processed";
-    const LOCAL: &str = "local-spot-move-processed";
+    // The ordering fences are PING frames, answered with a PONG, not TALK
+    // markers: a TALK adds a chat line that recomposes the frame on its own and
+    // would race the assertion below. A PING draws nothing.
+    const FOREIGN_REF: i32 = 901;
+    const LOCAL_REF: i32 = 902;
     let fixture = logon_fixture();
     let order = fixture.byte_order;
     let payload = room_payload("887");
@@ -6139,13 +6150,31 @@ fn a_spot_move_for_this_room_recomposes_and_a_foreign_one_does_not() {
             .encode(order)
             .expect("the room descriptor encodes"),
     );
-    let tail = vec![
-        spot_move_frame(order, 999, spot_id, Point::new(1, 1)),
-        talk_marker_frame(order, FOREIGN),
-        spot_move_frame(order, 887, spot_id, Point::new(240, 120)),
-        talk_marker_frame(order, LOCAL),
-    ];
-    let (server, gate) = MockServer::start_gated(initial, tail);
+    let foreign_gate = Arc::new(AtomicBool::new(false));
+    let local_gate = Arc::new(AtomicBool::new(false));
+    let server = MockServer::start_gated_steps(
+        initial,
+        vec![
+            (
+                foreign_gate.clone(),
+                vec![
+                    spot_move_frame(order, 999, spot_id, Point::new(1, 1)),
+                    Frame::empty(opcode::PING, FOREIGN_REF)
+                        .encode(order)
+                        .expect("ping encodes"),
+                ],
+            ),
+            (
+                local_gate.clone(),
+                vec![
+                    spot_move_frame(order, 887, spot_id, Point::new(240, 120)),
+                    Frame::empty(opcode::PING, LOCAL_REF)
+                        .encode(order)
+                        .expect("ping encodes"),
+                ],
+            ),
+        ],
+    );
     let cache = unique_temp_dir("spot-move-cache");
     let seed = seed_solid_media_dir(&room, BRIGHT);
     let (handle, stream) =
@@ -6166,37 +6195,44 @@ fn a_spot_move_for_this_room_recomposes_and_a_foreign_one_does_not() {
         .find(|screen| screen.room_id == 887)
         .expect("a frame was composed for room 887");
     wait_for_entry_alarm(&handle, screen);
-    let settled = settled_frame_version(&handle, Duration::from_secs(5));
+    let before = settled_frame_version(&handle, Duration::from_secs(5));
 
-    gate.store(true, Ordering::Relaxed);
-    let events = collect_events(
-        &mut rx,
-        |collected| chats(collected).iter().any(|text| text.contains(FOREIGN)),
-        Duration::from_secs(10),
-    );
+    // The foreign move: the PONG proves the runtime ran it, and the version must
+    // not move across that step.
+    foreign_gate.store(true, Ordering::Relaxed);
     assert!(
-        chats(&events).iter().any(|text| text.contains(FOREIGN)),
-        "the foreign spot move was processed before its marker: {:?}",
-        chats(&events)
+        wait_for(
+            || server
+                .received_frames(order)
+                .iter()
+                .any(|frame| frame.opcode == opcode::PONG && frame.ref_num == FOREIGN_REF),
+            Duration::from_secs(10)
+        ),
+        "the foreign spot move was processed"
     );
+    let after_foreign = settled_frame_version(&handle, Duration::from_secs(5));
     assert_eq!(
-        handle.frames().version(),
-        settled,
+        after_foreign, before,
         "a move aimed at room 999 must not recompose this room"
     );
 
-    let events = collect_events(
-        &mut rx,
-        |collected| chats(collected).iter().any(|text| text.contains(LOCAL)),
-        Duration::from_secs(10),
+    // The in-room move: it must recompose.
+    local_gate.store(true, Ordering::Relaxed);
+    assert!(
+        wait_for(
+            || server
+                .received_frames(order)
+                .iter()
+                .any(|frame| frame.opcode == opcode::PONG && frame.ref_num == LOCAL_REF),
+            Duration::from_secs(10)
+        ),
+        "the in-room spot move was processed"
     );
     assert!(
-        chats(&events).iter().any(|text| text.contains(LOCAL)),
-        "the in-room spot move was processed before its marker: {:?}",
-        chats(&events)
-    );
-    assert!(
-        handle.frames().version() > settled,
+        wait_for(
+            || handle.frames().version() > before,
+            Duration::from_secs(5)
+        ),
         "the move aimed at room 887 recomposed the frame"
     );
 
