@@ -3,9 +3,10 @@
 //! The binary composites one room into a PNG. A full run needs the 700 MB
 //! corpus, but the git-tracked `fixtures/logon-run1/frames/0007-server-room.bin`
 //! is a real captured `MSG_ROOMDESC`, and the binary accepts it directly with
-//! `--frame-file`. Every test runs with `HOME` pointed at an empty temp dir, so
-//! `fill_defaults` finds no corpus and no asset roots: the render uses the empty
-//! stores, which is both fast and machine-independent.
+//! `--frame-file`. Every test runs with the home directory variables pointed at
+//! an empty temp dir (see `run_bare`), so `fill_defaults` finds no corpus and no
+//! asset roots: the render uses the empty stores, which is both fast and
+//! machine-independent.
 //!
 //! What is *not* tested here is a run against the real corpus or the network;
 //! `corpus_render.rs` already covers the corpus when it is present, and it skips
@@ -71,11 +72,21 @@ fn run(home: &TempDir, args: &[String]) -> Output {
     run_bare(home, &full)
 }
 
-/// Run the binary with only the arguments given (still with `HOME` isolated).
+/// Run the binary with only the arguments given, isolating *every* environment
+/// variable the binary can read for a home-relative default. The binary reads
+/// `HOME` on Unix and `USERPROFILE` (falling back to `HOME`) on Windows, and
+/// `APPDATA`/`LOCALAPPDATA` for the Windows PalaceChat media roots. Setting all
+/// of them redirects every platform's default discovery at the temp dir, so a
+/// developer's real corpus is never consulted whichever variable the platform
+/// chooses. A future variable is covered by adding it to this one list.
 fn run_bare(home: &TempDir, args: &[String]) -> Output {
+    let isolated = home.0.as_os_str();
     Command::new(BIN)
         .args(args)
-        .env("HOME", home.0.as_os_str())
+        .env("HOME", isolated)
+        .env("USERPROFILE", isolated)
+        .env("APPDATA", isolated)
+        .env("LOCALAPPDATA", isolated)
         .output()
         .expect("spawn palace-render")
 }
