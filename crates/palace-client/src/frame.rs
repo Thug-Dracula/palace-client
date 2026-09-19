@@ -85,6 +85,12 @@ impl ViewGeometry {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ScreenState {
     pub version: u64,
+    /// Version of the middle board layer, or `None` when that layer is empty.
+    /// The middle layer sits above the base bitmap and below the avatar cards.
+    pub mid_version: Option<u64>,
+    /// Version of the top board layer, or `None` when that layer is empty.
+    /// The top layer sits above the avatar cards.
+    pub top_version: Option<u64>,
     pub room_id: i32,
     pub room_name: String,
     pub avatars: usize,
@@ -95,12 +101,23 @@ pub struct ScreenState {
 }
 
 #[derive(Debug, Default)]
-struct Inner {
+struct Layer {
     png: Vec<u8>,
     version: u64,
 }
 
-/// The latest composited frame, shared with the URI-scheme handler.
+#[derive(Debug, Default)]
+struct Inner {
+    base: Layer,
+    mid: Option<Layer>,
+    top: Option<Layer>,
+}
+
+/// The latest composited frame layers, shared with the URI-scheme handler.
+///
+/// `put`/`png`/`version` describe the base layer and are unchanged for existing
+/// callers. The middle and top layers are optional: each is absent until a
+/// non-empty bitmap is stored for it.
 #[derive(Debug, Default)]
 pub struct FrameStore {
     inner: Mutex<Inner>,
@@ -113,38 +130,89 @@ impl FrameStore {
         FrameStore::default()
     }
 
-    /// Replace the frame, returning its new version. Versions start at 1.
-    pub fn put(&self, png: Vec<u8>) -> u64 {
-        let mut inner = match self.inner.lock() {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        match self.inner.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
-        };
-        inner.png = png;
-        inner.version += 1;
-        inner.version
+        }
     }
 
-    /// A copy of the current PNG, if one has been composed.
+    /// Replace the base layer, returning its version. Versions start at 1.
+    ///
+    /// The version only advances when the bytes actually change. An unchanged
+    /// layer keeps the version it already had, exactly like the middle and top
+    /// layers: the display keys its base fetch on this number, so bumping it
+    /// for a byte-identical compose would make it re-download the whole base
+    /// bitmap (megabytes at DPR 2) even though nothing on the board moved.
+    /// The comparison and the store happen under one lock, so two callers can
+    /// never interleave between them.
+    pub fn put(&self, png: Vec<u8>) -> u64 {
+        let mut inner = self.lock();
+        if inner.base.png == png {
+            return inner.base.version;
+        }
+        inner.base.png = png;
+        inner.base.version += 1;
+        inner.base.version
+    }
+
+    /// A copy of the current base PNG, if one has been composed.
     #[must_use]
     pub fn png(&self) -> Option<Vec<u8>> {
-        let inner = match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if inner.png.is_empty() {
+        let inner = self.lock();
+        if inner.base.png.is_empty() {
             None
         } else {
-            Some(inner.png.clone())
+            Some(inner.base.png.clone())
         }
     }
 
-    /// The current frame version, 0 before the first frame.
+    /// The current base layer version, 0 before the first frame.
     #[must_use]
     pub fn version(&self) -> u64 {
-        match self.inner.lock() {
-            Ok(guard) => guard.version,
-            Err(poisoned) => poisoned.into_inner().version,
-        }
+        self.lock().base.version
+    }
+
+    /// Store the middle layer with the version reported by the renderer.
+    ///
+    /// An empty bitmap removes the layer, so `mid_png`/`mid_version` report
+    /// `None` again.
+    pub fn put_mid(&self, png: Vec<u8>, version: u64) {
+        let layer = (!png.is_empty()).then_some(Layer { png, version });
+        self.lock().mid = layer;
+    }
+
+    /// Store the top layer with the version reported by the renderer.
+    ///
+    /// An empty bitmap removes the layer, so `top_png`/`top_version` report
+    /// `None` again.
+    pub fn put_top(&self, png: Vec<u8>, version: u64) {
+        let layer = (!png.is_empty()).then_some(Layer { png, version });
+        self.lock().top = layer;
+    }
+
+    /// A copy of the current middle PNG, or `None` when the layer is absent.
+    #[must_use]
+    pub fn mid_png(&self) -> Option<Vec<u8>> {
+        self.lock().mid.as_ref().map(|layer| layer.png.clone())
+    }
+
+    /// A copy of the current top PNG, or `None` when the layer is absent.
+    #[must_use]
+    pub fn top_png(&self) -> Option<Vec<u8>> {
+        self.lock().top.as_ref().map(|layer| layer.png.clone())
+    }
+
+    /// The middle layer's version, or `None` when the layer is absent.
+    #[must_use]
+    pub fn mid_version(&self) -> Option<u64> {
+        self.lock().mid.as_ref().map(|layer| layer.version)
+    }
+
+    /// The top layer's version, or `None` when the layer is absent.
+    #[must_use]
+    pub fn top_version(&self) -> Option<u64> {
+        self.lock().top.as_ref().map(|layer| layer.version)
     }
 }
 
@@ -509,5 +577,111 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_fresh_store_has_no_layers_and_a_zero_base_version() {
+        let store = FrameStore::new();
+        assert_eq!(store.png(), None);
+        assert_eq!(store.version(), 0);
+        assert_eq!(store.mid_png(), None);
+        assert_eq!(store.mid_version(), None);
+        assert_eq!(store.top_png(), None);
+        assert_eq!(store.top_version(), None);
+    }
+
+    #[test]
+    fn mid_and_top_keep_independent_versions_and_bytes() {
+        let store = FrameStore::new();
+        store.put_mid(vec![1, 2, 3], 7);
+        store.put_top(vec![4, 5, 6], 9);
+        assert_eq!(store.mid_version(), Some(7));
+        assert_eq!(store.mid_png(), Some(vec![1, 2, 3]));
+        assert_eq!(store.top_version(), Some(9));
+        assert_eq!(store.top_png(), Some(vec![4, 5, 6]));
+
+        store.put_mid(vec![8, 9], 10);
+        assert_eq!(store.mid_version(), Some(10));
+        assert_eq!(store.mid_png(), Some(vec![8, 9]));
+        assert_eq!(
+            store.top_version(),
+            Some(9),
+            "top is untouched by a mid put"
+        );
+        assert_eq!(store.top_png(), Some(vec![4, 5, 6]));
+    }
+
+    #[test]
+    fn an_empty_layer_bitmap_clears_that_layer_only() {
+        let store = FrameStore::new();
+        store.put_mid(vec![1], 1);
+        store.put_top(vec![2], 2);
+        store.put_mid(Vec::new(), 3);
+        assert_eq!(store.mid_version(), None);
+        assert_eq!(store.mid_png(), None);
+        assert_eq!(store.top_version(), Some(2));
+        assert_eq!(store.top_png(), Some(vec![2]));
+    }
+
+    #[test]
+    fn putting_the_base_does_not_disturb_mid_or_top() {
+        let store = FrameStore::new();
+        store.put_mid(vec![1, 2, 3], 5);
+        store.put_top(vec![4, 5, 6], 6);
+        let base_version = store.put(vec![7, 8, 9]);
+        assert_eq!(base_version, 1);
+        assert_eq!(store.version(), 1);
+        assert_eq!(store.png(), Some(vec![7, 8, 9]));
+        assert_eq!(store.mid_version(), Some(5));
+        assert_eq!(store.mid_png(), Some(vec![1, 2, 3]));
+        assert_eq!(store.top_version(), Some(6));
+        assert_eq!(store.top_png(), Some(vec![4, 5, 6]));
+
+        store.put_mid(vec![10], 11);
+        store.put_top(vec![12], 13);
+        assert_eq!(
+            store.version(),
+            1,
+            "mid/top puts leave the base version alone"
+        );
+        assert_eq!(store.png(), Some(vec![7, 8, 9]));
+    }
+
+    #[test]
+    fn an_identical_base_keeps_its_version() {
+        let store = FrameStore::new();
+        let first = store.put(vec![1, 2, 3]);
+        let second = store.put(vec![1, 2, 3]);
+        assert_eq!(
+            second, first,
+            "byte-identical bytes must not advance the version, or the display re-fetches the base"
+        );
+        assert_eq!(store.version(), first);
+        assert_eq!(store.png(), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn changed_base_bytes_advance_the_version_and_store_the_latest() {
+        let store = FrameStore::new();
+        let first = store.put(vec![1, 2, 3]);
+        let second = store.put(vec![4, 5]);
+        assert_eq!(
+            second,
+            first + 1,
+            "different bytes must advance the version"
+        );
+        assert_eq!(store.version(), second);
+        assert_eq!(
+            store.png(),
+            Some(vec![4, 5]),
+            "the store holds the latest bytes"
+        );
+
+        let third = store.put(vec![4, 5]);
+        assert_eq!(
+            third, second,
+            "a repeat of the latest bytes keeps the version stable again"
+        );
+        assert_eq!(store.png(), Some(vec![4, 5]));
     }
 }

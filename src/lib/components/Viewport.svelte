@@ -5,6 +5,7 @@
   import RoomMenu from "./RoomMenu.svelte";
   import AvatarDialog from "./AvatarDialog.svelte";
   import PropBagDialog from "./PropBagDialog.svelte";
+  import { layoutAvatars, type AvatarLayout } from "../avatarLayout";
 
   let element: HTMLDivElement | undefined = $state();
   const last = { width: 0, height: 0, dpr: 0, native: false };
@@ -85,6 +86,12 @@
   });
 
   const geometry = $derived(store.screen?.geometry ?? null);
+
+  // Recomputes only when the roster reference changes, so screen/notes/tooltip
+  // updates never re-run the avatar math or touch the board images.
+  const avatarLayout = $derived<AvatarLayout>(
+    store.avatars ? layoutAvatars(store.avatars) : { sprites: [], names: [] },
+  );
 
   const tooltipAt = $derived.by(() => {
     if (pointer) {
@@ -181,6 +188,42 @@
         draggable="false"
         style="left:{geometry.content_x}px; top:{geometry.content_y}px; width:{geometry.content_w}px; height:{geometry.content_h}px;"
       />
+
+      <div class="avatar-layer">
+        {#each avatarLayout.sprites as sprite (sprite.key)}
+          <img
+            class="avatar-sprite"
+            src={sprite.url}
+            alt=""
+            draggable="false"
+            style="left:{sprite.left}px; top:{sprite.top}px; width:{sprite.width}px; height:{sprite.height}px; opacity:{sprite.alpha};"
+          />
+        {/each}
+        {#each avatarLayout.names as tag (tag.key)}
+          <div class="avatar-name" style="left:{tag.left}px; top:{tag.top}px;">{tag.name}</div>
+        {/each}
+      </div>
+
+      {#if store.screen.mid_version != null}
+        <img
+          class="board-layer"
+          src={api.midUrl(store.screen.mid_version)}
+          alt=""
+          draggable="false"
+          style="left:{geometry.content_x}px; top:{geometry.content_y}px; width:{geometry.content_w}px; height:{geometry.content_h}px;"
+        />
+      {/if}
+
+      {#if store.screen.top_version != null}
+        <img
+          class="board-layer"
+          src={api.topUrl(store.screen.top_version)}
+          alt=""
+          draggable="false"
+          style="left:{geometry.content_x}px; top:{geometry.content_y}px; width:{geometry.content_w}px; height:{geometry.content_h}px;"
+        />
+      {/if}
+
       <div class="badge">
         <span>{store.screen.room_id} · {geometry.room_w.toFixed(0)}×{geometry.room_h.toFixed(0)}</span>
         <span>buffer {geometry.bitmap_w}×{geometry.bitmap_h}</span>
@@ -227,3 +270,53 @@
     <PropBagDialog onclose={() => (propsOpen = false)} />
   {/if}
 </div>
+
+<style>
+  /* Overlay geometry matches the base frame: same content box, same scale.
+     Every layer is presentation-only, so pointer events fall through to the
+     .viewport handlers that own click/hover/drag. */
+  .avatar-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+
+  .avatar-sprite {
+    position: absolute;
+    display: block;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  .avatar-name {
+    position: absolute;
+    transform: translateX(-50%);
+    white-space: nowrap;
+    line-height: 1;
+    font-size: var(--fs-xs);
+    color: var(--text-0);
+    text-shadow: 0 1px 2px #000, 0 0 6px #000;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .board-layer {
+    position: absolute;
+    background: transparent;
+    pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  /* Small pixel-art sprite layers are scaled up by the room scale, so nearest
+     neighbour keeps their hard edges, matching the board's pixelated look. */
+  .avatar-sprite,
+  .board-layer {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+</style>

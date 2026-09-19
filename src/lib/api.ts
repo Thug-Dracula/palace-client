@@ -88,6 +88,47 @@ export interface ScreenState {
   props_pending: number;
   notes: string[];
   geometry: ViewGeometry;
+  /** Board middle layer version; null/absent when that layer is empty. */
+  mid_version?: number | null;
+  /** Board top layer version; null/absent when that layer is empty. */
+  top_version?: number | null;
+}
+
+/** A tagged reference to one piece of avatar artwork: a face or a prop. */
+export type AvatarArt =
+  | { kind: "face"; face: number; color: number }
+  | { kind: "prop"; id: number };
+
+/** One artwork layer of an avatar, positioned relative to its anchor. */
+export interface AvatarPartState {
+  art: AvatarArt;
+  dx: number;
+  dy: number;
+  alpha: number;
+  w: number;
+  h: number;
+}
+
+/** One avatar's identity, position and sprite layers. */
+export interface AvatarState {
+  id: number;
+  name: string;
+  x: number;
+  y: number;
+  face: number;
+  color: number;
+  is_self: boolean;
+  away: boolean;
+  parts: AvatarPartState[];
+}
+
+/** The avatar roster payload the webview sprite layer draws. */
+export interface AvatarRoster {
+  version: number;
+  room_id: number;
+  geometry: ViewGeometry;
+  name_tags_visible: boolean;
+  avatars: AvatarState[];
 }
 
 export interface ScriptReport {
@@ -105,6 +146,7 @@ export type ClientEvent =
   | { type: "room_entered"; room: RoomInfo }
   | { type: "chat"; line: ChatLine }
   | { type: "screen"; screen: ScreenState }
+  | { type: "avatars"; roster: AvatarRoster }
   | { type: "tooltip"; text: string | null }
   | {
       type: "script";
@@ -122,6 +164,20 @@ export type ClientEvent =
 
 export const frameUrl = (version: number): string =>
   `${internalBaseUrl()}/frame?v=${version}`;
+
+export const midUrl = (version: number): string =>
+  `${internalBaseUrl()}/mid?v=${version}`;
+
+export const topUrl = (version: number): string =>
+  `${internalBaseUrl()}/top?v=${version}`;
+
+/** A single worn prop's image. */
+export const propImageUrl = (id: number): string =>
+  `${internalBaseUrl()}/avatar-prop/${id}`;
+
+/** One face cell (a specific face/color combination) out of the shared sheet. */
+export const faceCellUrl = (face: number, color: number): string =>
+  `${internalBaseUrl()}/face-cell/${face}/${color}`;
 
 export const facesUrl = (): string => `${internalBaseUrl()}/faces`;
 

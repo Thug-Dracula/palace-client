@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use palace_client::FrameStore;
+use palace_client::{AvatarImageStore, FrameStore};
 use palace_prop::PropCatalog;
 use tauri::http::{Request, Response, StatusCode};
 use tauri::UriSchemeResponder;
@@ -61,23 +61,69 @@ impl CatalogSlot {
     }
 }
 
+/// A shared handle to the runtime's encoded avatar art (worn props and face
+/// cells), for the `avatar-prop/` and `face-cell/` routes.
+#[derive(Clone, Default)]
+pub struct AvatarImageSlot {
+    inner: Arc<Mutex<Option<Arc<AvatarImageStore>>>>,
+}
+
+impl AvatarImageSlot {
+    /// Point the slot at a runtime's avatar-image cache.
+    pub fn set(&self, store: Arc<AvatarImageStore>) {
+        match self.inner.lock() {
+            Ok(mut guard) => *guard = Some(store),
+            Err(poisoned) => *poisoned.into_inner() = Some(store),
+        }
+    }
+
+    /// The current avatar-image cache, if a runtime has been started.
+    #[must_use]
+    pub fn get(&self) -> Option<Arc<AvatarImageStore>> {
+        match self.inner.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
 /// Route a `palace://localhost/<path>` request.
 pub fn handle(
     slot: &FrameSlot,
     catalog: &CatalogSlot,
+    images: &AvatarImageSlot,
     request: &Request<Vec<u8>>,
     responder: UriSchemeResponder,
 ) {
     let path = request.uri().path().trim_start_matches('/').to_string();
-    match path.as_str() {
-        "frame" => handle_frame(slot, responder),
-        "faces" => responder.respond(png(palace_render::face_sheet_png().to_vec())),
-        "faces.json" => responder.respond(json(palace_render::face_grid_json())),
-        "props.json" => responder.respond(json(handle_props_json(catalog))),
-        _ => match path.strip_prefix("prop/") {
-            Some(id) => handle_prop(catalog, id, responder),
-            None => responder.respond(status(StatusCode::NOT_FOUND)),
-        },
+    if path == "frame" {
+        handle_frame(slot, responder);
+        return;
+    }
+    responder.respond(resolve(catalog, images, &path));
+}
+
+/// Resolve every route except `frame` to a response.
+///
+/// `frame` is handled separately: its store read happens on its own worker
+/// thread. Keeping this part pure makes the 404 paths testable without a live
+/// runtime or a responder.
+fn resolve(catalog: &CatalogSlot, images: &AvatarImageSlot, path: &str) -> Response<Vec<u8>> {
+    match path {
+        "faces" => png(palace_render::face_sheet_png().to_vec()),
+        "faces.json" => json(palace_render::face_grid_json()),
+        "props.json" => json(handle_props_json(catalog)),
+        _ => {
+            if let Some(id) = path.strip_prefix("prop/") {
+                handle_prop(catalog, id)
+            } else if let Some(id) = path.strip_prefix("avatar-prop/") {
+                handle_avatar_prop(images, id)
+            } else if let Some(pair) = path.strip_prefix("face-cell/") {
+                handle_face_cell(images, pair)
+            } else {
+                status(StatusCode::NOT_FOUND)
+            }
+        }
     }
 }
 
@@ -91,18 +137,49 @@ fn handle_props_json(catalog: &CatalogSlot) -> String {
 }
 
 /// One prop's thumbnail PNG, or 404 for an unknown id or an undecodable prop.
-fn handle_prop(catalog: &CatalogSlot, id: &str, responder: UriSchemeResponder) {
+fn handle_prop(catalog: &CatalogSlot, id: &str) -> Response<Vec<u8>> {
     let Some(id) = id.parse::<u32>().ok() else {
-        responder.respond(status(StatusCode::NOT_FOUND));
-        return;
+        return status(StatusCode::NOT_FOUND);
     };
     let Some(catalog) = catalog.get() else {
-        responder.respond(status(StatusCode::NOT_FOUND));
-        return;
+        return status(StatusCode::NOT_FOUND);
     };
     match catalog.thumbnail_png(id) {
-        Some(bytes) => responder.respond(png(bytes)),
-        None => responder.respond(status(StatusCode::NOT_FOUND)),
+        Some(bytes) => png(bytes),
+        None => status(StatusCode::NOT_FOUND),
+    }
+}
+
+/// A worn prop's decoded image, as PNG, from the runtime's own cache. 404 for an
+/// unknown id or before a runtime has encoded it.
+fn handle_avatar_prop(images: &AvatarImageSlot, id: &str) -> Response<Vec<u8>> {
+    let Some(id) = id.parse::<u32>().ok() else {
+        return status(StatusCode::NOT_FOUND);
+    };
+    match images.get().and_then(|store| store.prop_png(id)) {
+        Some(bytes) => png(bytes),
+        None => status(StatusCode::NOT_FOUND),
+    }
+}
+
+/// One built-in face cell as PNG, encoded and cached by the runtime. 404 for an
+/// out-of-range pair or a malformed path.
+fn handle_face_cell(images: &AvatarImageSlot, pair: &str) -> Response<Vec<u8>> {
+    let mut segments = pair.split('/');
+    let face = segments.next().and_then(|value| value.parse::<i16>().ok());
+    let color = segments.next().and_then(|value| value.parse::<i16>().ok());
+    if segments.next().is_some() {
+        return status(StatusCode::NOT_FOUND);
+    }
+    let (Some(face), Some(color)) = (face, color) else {
+        return status(StatusCode::NOT_FOUND);
+    };
+    match images
+        .get()
+        .and_then(|store| store.face_cell_png(face, color))
+    {
+        Some(bytes) => png(bytes),
+        None => status(StatusCode::NOT_FOUND),
     }
 }
 
@@ -146,4 +223,85 @@ fn status(code: StatusCode) -> Response<Vec<u8>> {
         .header("Access-Control-Allow-Origin", "*")
         .body(Vec::new())
         .unwrap_or_else(|_| Response::new(Vec::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slots() -> (CatalogSlot, AvatarImageSlot) {
+        (CatalogSlot::default(), AvatarImageSlot::default())
+    }
+
+    fn content_type(response: &Response<Vec<u8>>) -> Option<&str> {
+        response
+            .headers()
+            .get("Content-Type")
+            .and_then(|value| value.to_str().ok())
+    }
+
+    #[test]
+    fn an_unknown_path_is_not_found() {
+        let (catalog, images) = slots();
+        assert_eq!(
+            resolve(&catalog, &images, "nope").status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn an_unknown_avatar_prop_is_not_found() {
+        let (catalog, images) = slots();
+        assert_eq!(
+            resolve(&catalog, &images, "avatar-prop/123").status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            resolve(&catalog, &images, "avatar-prop/not-a-number").status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn a_cached_avatar_prop_is_served_as_png() {
+        let (catalog, images) = slots();
+        let store = Arc::new(AvatarImageStore::new());
+        let image = palace_prop::PropImage::from_rgba(2, 2, vec![0x22; 16]).expect("a 2x2 image");
+        store.cache_prop(42, &image).expect("the prop encodes");
+        images.set(store);
+
+        let response = resolve(&catalog, &images, "avatar-prop/42");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(content_type(&response), Some("image/png"));
+    }
+
+    #[test]
+    fn an_out_of_range_face_cell_is_not_found() {
+        let (catalog, images) = slots();
+        images.set(Arc::new(AvatarImageStore::new()));
+        assert_eq!(
+            resolve(&catalog, &images, "face-cell/13/0").status(),
+            StatusCode::NOT_FOUND,
+            "face 13 is past the sheet"
+        );
+        assert_eq!(
+            resolve(&catalog, &images, "face-cell/0/16").status(),
+            StatusCode::NOT_FOUND,
+            "colour 16 is past the sheet"
+        );
+        assert_eq!(
+            resolve(&catalog, &images, "face-cell/0").status(),
+            StatusCode::NOT_FOUND,
+            "a missing colour segment is malformed"
+        );
+    }
+
+    #[test]
+    fn a_valid_face_cell_is_served_as_png() {
+        let (catalog, images) = slots();
+        images.set(Arc::new(AvatarImageStore::new()));
+        let response = resolve(&catalog, &images, "face-cell/0/0");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(content_type(&response), Some("image/png"));
+    }
 }

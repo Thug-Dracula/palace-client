@@ -67,6 +67,7 @@ fn report(event: &ClientEvent) -> bool {
         | ClientEvent::MidiLoop { .. }
         | ClientEvent::MidiStop
         | ClientEvent::Beep
+        | ClientEvent::Avatars { .. }
         | ClientEvent::Tooltip { .. } => {}
     }
     matches!(event, ClientEvent::Screen { .. })

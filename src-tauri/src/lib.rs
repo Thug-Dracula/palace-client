@@ -175,6 +175,9 @@ pub fn start_client(
     if let Some(slot) = app.try_state::<protocol::FrameSlot>() {
         slot.set(handle.frames());
     }
+    if let Some(slot) = app.try_state::<protocol::AvatarImageSlot>() {
+        slot.set(handle.avatar_images());
+    }
     spawn_pump(app.clone(), stream, audio);
     Ok(handle)
 }
@@ -187,6 +190,8 @@ pub fn run() {
     let slot = protocol::FrameSlot::default();
     let handler_slot = slot.clone();
     let catalog_slot = protocol::CatalogSlot::default();
+    let image_slot = protocol::AvatarImageSlot::default();
+    let handler_images = image_slot.clone();
     match palace_prop::PropCatalog::open_default() {
         Some(catalog) => {
             logging::log(
@@ -208,8 +213,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(slot)
         .manage(catalog_slot)
+        .manage(image_slot)
         .register_asynchronous_uri_scheme_protocol("palace", move |_ctx, request, responder| {
-            protocol::handle(&handler_slot, &handler_catalog, &request, responder);
+            protocol::handle(
+                &handler_slot,
+                &handler_catalog,
+                &handler_images,
+                &request,
+                responder,
+            );
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,

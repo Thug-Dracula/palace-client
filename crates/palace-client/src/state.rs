@@ -117,6 +117,9 @@ pub struct Applied {
     pub banner: bool,
     pub rooms: bool,
     pub users: bool,
+    /// A remote user's reported position changed, so the runtime must publish
+    /// the avatar roster even though no user-list frame arrived.
+    pub users_moved: bool,
     pub room_entered: bool,
     pub chat: Vec<ChatLine>,
     pub render: bool,
@@ -131,34 +134,6 @@ pub struct Applied {
     /// the session, which the runtime turns into a status and a transcript line
     /// and acts on by stopping without reconnecting.
     pub disconnect: Option<messages::ServerDown>,
-}
-
-/// How long a remote avatar takes to glide from one reported position to the
-/// next. The server sends chunky position updates; the renderer samples this
-/// window so other players slide instead of jumping. The local user is never
-/// glided — the client is authoritative for its own avatar and applies a click
-/// at once.
-pub const MOVE_GLIDE_MS: u64 = 120;
-
-/// One remote avatar's in-flight glide between two reported positions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Motion {
-    from: (i16, i16),
-    to: (i16, i16),
-    start_ms: u64,
-}
-
-impl Motion {
-    /// The position `now_ms` into the glide, clamped to the two endpoints.
-    fn at(&self, now_ms: u64) -> (i16, i16) {
-        let window = MOVE_GLIDE_MS.max(1);
-        let elapsed = now_ms.saturating_sub(self.start_ms).min(window);
-        let t = elapsed as f64 / window as f64;
-        let lerp = |a: i16, b: i16| -> i16 {
-            (f64::from(a) + (f64::from(b) - f64::from(a)) * t).round() as i16
-        };
-        (lerp(self.from.0, self.to.0), lerp(self.from.1, self.to.1))
-    }
 }
 
 /// The sign-in name and password used to answer an `auth` challenge.
@@ -224,9 +199,6 @@ pub struct SessionState {
     last_error: Option<String>,
     /// The credential that answers an `auth` challenge, when one is configured.
     credential: Option<Credential>,
-    /// Remote avatars' in-flight movement glides, keyed by user id. The local
-    /// user is never animated here: its position is applied on click.
-    motion: BTreeMap<i32, Motion>,
 }
 
 impl SessionState {
@@ -264,7 +236,6 @@ impl SessionState {
             chat_seq: 0,
             last_error: None,
             credential: None,
-            motion: BTreeMap::new(),
         }
     }
 
@@ -375,7 +346,6 @@ impl SessionState {
         self.pending_fetch_room = None;
         self.pending_spot_scripts.clear();
         self.pending_prop_loads.clear();
-        self.motion.clear();
     }
 
     /// Start the draw list from a room's own stored commands.
@@ -556,6 +526,7 @@ impl SessionState {
                     });
                     entry.x = mv.position.h;
                     entry.y = mv.position.v;
+                    applied.users_moved = true;
                     applied.render = true;
                 }
             }
@@ -1089,84 +1060,6 @@ impl SessionState {
         true
     }
 
-    /// Snapshot every user's position, for motion bookkeeping across `apply`.
-    #[must_use]
-    pub fn user_positions(&self) -> BTreeMap<i32, (i16, i16)> {
-        self.users.iter().map(|(id, u)| (*id, (u.x, u.y))).collect()
-    }
-
-    /// Start a glide for every remote user whose position just changed.
-    ///
-    /// `before` is [`Self::user_positions`] sampled before the frame was
-    /// applied. A glide already in flight is re-targeted from its current
-    /// sample, so a second update mid-glide does not snap backwards.
-    pub fn begin_motions(&mut self, before: &BTreeMap<i32, (i16, i16)>, now_ms: u64) {
-        let self_id = self.banner.user_id;
-        let ids: Vec<i32> = self.users.keys().copied().collect();
-        for id in ids {
-            if id == self_id {
-                self.motion.remove(&id);
-                continue;
-            }
-            let Some(user) = self.users.get(&id) else {
-                continue;
-            };
-            let now_pos = (user.x, user.y);
-            if before.get(&id) == Some(&now_pos) {
-                continue;
-            }
-            let from = self
-                .motion
-                .get(&id)
-                .map(|motion| motion.at(now_ms))
-                .or_else(|| before.get(&id).copied())
-                .unwrap_or(now_pos);
-            if from == now_pos {
-                self.motion.remove(&id);
-                continue;
-            }
-            self.motion.insert(
-                id,
-                Motion {
-                    from,
-                    to: now_pos,
-                    start_ms: now_ms,
-                },
-            );
-        }
-        let known: Vec<i32> = self.users.keys().copied().collect();
-        self.motion
-            .retain(|id, _| *id != self_id && known.contains(id));
-    }
-
-    /// Advance the glide clock and drop completed glides.
-    ///
-    /// Returns whether any remote avatar is still gliding, so the runtime keeps
-    /// sampling and redrawing until every avatar has arrived.
-    pub fn advance_motion(&mut self, now_ms: u64) -> bool {
-        self.motion
-            .retain(|_, motion| now_ms < motion.start_ms.saturating_add(MOVE_GLIDE_MS));
-        !self.motion.is_empty()
-    }
-
-    /// Whether any remote avatar is mid-glide.
-    #[must_use]
-    pub fn has_motion(&self) -> bool {
-        !self.motion.is_empty()
-    }
-
-    /// The position to draw `id` at `now_ms`: a sample of its glide while one
-    /// is in flight, otherwise the model's own position.
-    #[must_use]
-    pub fn position_at(&self, id: i32, now_ms: u64) -> (i16, i16) {
-        if let Some(motion) = self.motion.get(&id) {
-            if now_ms < motion.start_ms.saturating_add(MOVE_GLIDE_MS) {
-                return motion.at(now_ms);
-            }
-        }
-        self.users.get(&id).map_or((0, 0), |user| (user.x, user.y))
-    }
-
     /// The users currently in the entered room, in a stable order.
     ///
     /// The signed-in user is always present, mirroring PalaceChat's
@@ -1312,45 +1205,28 @@ mod tests {
     }
 
     #[test]
-    fn a_server_move_is_glided_rather_than_jumped() {
+    fn a_remote_move_is_drawn_at_the_reported_position_at_once() {
         let mut state = room_state();
         add_user(&mut state, 21);
-        let before = state.user_positions();
-        state.users.get_mut(&21).expect("user 21").x = 120;
-        state.users.get_mut(&21).expect("user 21").y = 40;
-        state.begin_motions(&before, 1_000);
 
-        assert_eq!(
-            state.position_at(21, 1_000),
-            (0, 0),
-            "the glide starts where the avatar was"
+        let mut w = Writer::new(ByteOrder::Little);
+        Point::new(40, 120).encode(&mut w);
+        let applied = state.apply(
+            &Frame::new(opcode::USERMOVE, 21, w.into_vec()),
+            ByteOrder::Little,
         );
-        let mid = state.position_at(21, 1_000 + MOVE_GLIDE_MS / 2);
-        assert_ne!(mid, (0, 0), "the midpoint has left the origin");
-        assert_ne!(mid, (120, 40), "the midpoint has not arrived yet");
+
+        assert!(applied.users_moved, "a remote move must publish a roster");
+        let drawn = state
+            .users_in_room()
+            .into_iter()
+            .find(|user| user.id == 21)
+            .expect("the moved user is drawn");
         assert_eq!(
-            state.position_at(21, 1_000 + MOVE_GLIDE_MS),
+            (drawn.x, drawn.y),
             (120, 40),
-            "the glide lands exactly on the reported position"
+            "the drawn position is exactly the reported one, with no interpolation"
         );
-        assert!(
-            !state.advance_motion(1_000 + MOVE_GLIDE_MS),
-            "a finished glide stops asking for redraws"
-        );
-    }
-
-    #[test]
-    fn a_self_move_is_never_glided() {
-        let mut state = room_state();
-        add_user(&mut state, SELF);
-        let before = state.user_positions();
-        assert!(state.predict_self_move(200, 150));
-        state.begin_motions(&before, 1_000);
-        assert!(
-            !state.has_motion(),
-            "the local avatar is drawn where the click put it, not glided"
-        );
-        assert_eq!(state.position_at(SELF, 1_000), (200, 150));
     }
 
     /// The compositor draws avatars in the order this returns, so the order must

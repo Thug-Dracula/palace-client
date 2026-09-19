@@ -109,11 +109,35 @@ impl Sprite {
     }
 }
 
+/// Which piece of art an avatar part is, independent of its decoded pixels.
+///
+/// The scene records this identity next to each part so a client can hand the
+/// parts to a sprite layer — or rebuild the avatar elsewhere — without having to
+/// work out from the image which face cell or prop it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvatarPartArt {
+    /// A cell of the built-in face sheet: a face index and a colour index.
+    Face {
+        /// Face index into the built-in sheet.
+        face: i16,
+        /// Colour index into the built-in sheet.
+        color: i16,
+    },
+    /// A served prop, identified by the id it arrived with.
+    Prop {
+        /// The prop's id, as sent in the room/avatar payload.
+        id: u32,
+    },
+}
+
 /// One image that makes up an avatar, offset from the avatar's own anchor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AvatarPart {
     /// The decoded prop image.
     pub image: PropImage,
+    /// What art this part is, so a client can name the part without inspecting
+    /// the decoded pixels.
+    pub art: AvatarPartArt,
     /// Offset from the avatar's logical position to this part's top-left.
     pub dx: i32,
     /// See [`AvatarPart::dx`].

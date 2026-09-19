@@ -24,9 +24,10 @@ use palace_host::{
     ScriptEvent, UserView, WireContext,
 };
 use palace_render::{
-    clamp_avatar_position, clamp_dpr, draw_above_into, render_base, AnimationClock, AvatarSpec,
-    Canvas, ChatStyle, ChatText, MediaStore, PointF, PropStore, RenderOptions, Scene, SceneBuilder,
-    SizeF, ViewTransform, COLOR_VARIANTS, FACE_VARIANTS, FLAG_PICTURES_ABOVE_ALL,
+    clamp_avatar_position, clamp_dpr, draw_above_into, render_base, render_mid, render_top,
+    AnimationClock, AvatarSpec, Canvas, ChatStyle, ChatText, MediaStore, PointF, PropStore,
+    RenderOptions, Scene, SceneBuilder, SizeF, Sprite, ViewTransform, COLOR_VARIANTS,
+    FACE_VARIANTS, FLAG_PICTURES_ABOVE_ALL,
 };
 use palace_wire::byteorder::Writer;
 use palace_wire::error::WireError;
@@ -42,6 +43,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::assets::{
     missing_media, missing_props, run_media_worker, AssetWorkspace, MediaJob, MediaResult,
 };
+use crate::avatar_images::AvatarImageStore;
+use crate::avatars::{AvatarArt, AvatarPartState, AvatarRoster, AvatarState};
 use crate::error::{ClientError, Result};
 use crate::frame::{FrameStore, ScreenState, ViewGeometry};
 use crate::secret::Secret;
@@ -60,12 +63,32 @@ const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 /// Whether an animation-driven redraw is due, `interval` after the last frame.
 ///
-/// The glide clock is sampled on every loop pass (about `POLL_SLICE`), but the
-/// webview cannot fetch and decode a full-frame PNG at that rate, so animation
-/// redraws are capped to one per `interval`. Callers update `last` whenever a
-/// frame is composited, including input-driven ones.
+/// The rollback path bakes avatars into the board, so it asks for a board
+/// redraw when a remote user moves; the webview cannot fetch and decode a
+/// full-frame PNG at loop rate, so those redraws are capped to one per
+/// `interval`. Callers update `last` whenever a frame is composited, including
+/// input-driven ones.
 fn frame_due(last: Instant, now: Instant, interval: Duration) -> bool {
     now.saturating_duration_since(last) >= interval
+}
+
+/// The rollback switch: `PALACE_BAKE_AVATARS=1` restores the pre-cutover
+/// behaviour, where avatars and name tags are composited into one frame via the
+/// old `draw_above_into` path instead of being served as a separate roster and
+/// board layers. Read once, when the runtime starts; the composed path only
+/// looks at the cached flag.
+const BAKE_AVATARS_ENV_VAR: &str = "PALACE_BAKE_AVATARS";
+
+/// Parse the rollback flag. Exact `1` bakes; anything else (including unset)
+/// leaves the Stage 1 cutover in place.
+fn bake_avatars_from_value(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|value| value.to_str() == Some("1"))
+}
+
+/// Read the rollback flag from the environment. Called once by
+/// [`ClientRuntime::spawn`], never on the compose path.
+fn bake_avatars_from_env() -> bool {
+    bake_avatars_from_value(std::env::var_os(BAKE_AVATARS_ENV_VAR))
 }
 
 /// `HS_Door` (1): "a door" (protocol reference :1665). It cannot be locked —
@@ -246,6 +269,13 @@ pub enum ClientEvent {
     Screen {
         screen: ScreenState,
     },
+    /// The avatar roster for the current room, for a sprite layer to draw.
+    ///
+    /// Additive alongside the baked-in avatars: the frame still carries them,
+    /// and this snapshot lets a consumer place the same sprites itself.
+    Avatars {
+        roster: AvatarRoster,
+    },
     /// The hover tooltip changed: `Some` shows it, `None` hides it.
     Tooltip {
         text: Option<String>,
@@ -302,10 +332,16 @@ impl Default for ViewportSpec {
 struct Shared {
     cfg: ClientConfig,
     frames: Arc<FrameStore>,
+    /// Encoded avatar art (worn props and built-in face cells) the URI handler
+    /// serves. Filled by [`avatar_roster`] and by the face-cell route on demand.
+    avatar_images: Arc<AvatarImageStore>,
     events: UnboundedSender<ClientEvent>,
     viewport: Mutex<ViewportSpec>,
     running: AtomicBool,
     chat_seq: AtomicU64,
+    /// Monotonic revision for [`crate::avatars::AvatarRoster`], so a consumer can
+    /// drop a stale snapshot.
+    roster_version: AtomicU64,
     debug_frames: bool,
     last_room: Mutex<Option<i32>>,
     /// A scripted `GOTOROOM`, parked for the session loop.
@@ -323,6 +359,9 @@ struct Shared {
     asset_revision: AtomicU64,
     mouse: Mutex<(i32, i32)>,
     room_size: Mutex<(f64, f64)>,
+    /// `PALACE_BAKE_AVATARS=1`, read once at startup: bake avatars and name tags
+    /// into the single base frame instead of serving the three-layer board.
+    bake_avatars: bool,
 }
 
 impl Shared {
@@ -346,6 +385,15 @@ impl Shared {
                 kind,
             },
         });
+    }
+
+    fn next_roster_version(&self) -> u64 {
+        self.roster_version.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The shared encoded-avatar-art cache.
+    fn avatar_images(&self) -> &AvatarImageStore {
+        &self.avatar_images
     }
 
     fn viewport(&self) -> ViewportSpec {
@@ -437,6 +485,7 @@ impl Shared {
 pub struct ClientHandle {
     tx: UnboundedSender<ClientCommand>,
     frames: Arc<FrameStore>,
+    avatar_images: Arc<AvatarImageStore>,
     shared: Arc<Shared>,
 }
 
@@ -445,6 +494,12 @@ impl ClientHandle {
     #[must_use]
     pub fn frames(&self) -> Arc<FrameStore> {
         self.frames.clone()
+    }
+
+    /// The shared encoded-avatar-art cache, for a URI-scheme handler.
+    #[must_use]
+    pub fn avatar_images(&self) -> Arc<AvatarImageStore> {
+        self.avatar_images.clone()
     }
 
     /// Send a command, ignoring a closed runtime.
@@ -576,13 +631,16 @@ impl ClientRuntime {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (ev_tx, ev_rx) = unbounded_channel();
         let frames = Arc::new(FrameStore::new());
+        let avatar_images = Arc::new(AvatarImageStore::new());
         let shared = Arc::new(Shared {
             cfg,
             frames: frames.clone(),
+            avatar_images: avatar_images.clone(),
             events: ev_tx,
             viewport: Mutex::new(ViewportSpec::default()),
             running: AtomicBool::new(true),
             chat_seq: AtomicU64::new(0),
+            roster_version: AtomicU64::new(0),
             debug_frames: std::env::var_os("PALACE_DEBUG_FRAMES").is_some(),
             last_room: Mutex::new(None),
             pending_goto: Mutex::new(None),
@@ -591,11 +649,13 @@ impl ClientRuntime {
             asset_revision: AtomicU64::new(0),
             mouse: Mutex::new((0, 0)),
             room_size: Mutex::new((512.0, 384.0)),
+            bake_avatars: bake_avatars_from_env(),
         });
 
         let handle = ClientHandle {
             tx: cmd_tx,
             frames,
+            avatar_images,
             shared: shared.clone(),
         };
         let supervisor = shared.clone();
@@ -813,6 +873,7 @@ fn run_session(
 
     let start = Instant::now();
     let mut dirty_render = true;
+    let mut users_moved = false;
     let mut dirty_geom = true;
     let mut media_base: Option<String> = None;
     let mut last_room_size: Option<(f64, f64)> = None;
@@ -842,6 +903,7 @@ fn run_session(
                 ClientCommand::SetVisibility { names, avatars } => {
                     if apply_visibility(&mut state, &mut builder, names, avatars) {
                         dirty_render = true;
+                        emit_avatar_roster(&state, &mut builder, shared);
                     }
                 }
                 ClientCommand::SetAvatar { face, color } => {
@@ -854,12 +916,14 @@ fn run_session(
                     let color_changed = set_self_color(&mut state, i32::from(color));
                     if face_changed || color_changed {
                         dirty_render = true;
+                        emit_avatar_roster(&state, &mut builder, shared);
                     }
                 }
                 ClientCommand::SetProps { props } => {
                     let outcome = set_self_props(&mut state, &mut conn, &props)?;
                     if outcome.changed {
                         dirty_render = true;
+                        emit_avatar_roster(&state, &mut builder, shared);
                     }
                     if outcome.dropped > 0 {
                         shared.note(format!(
@@ -1115,7 +1179,11 @@ fn run_session(
                                         "walk: local apply id={} to=({mx},{my}) changed={moved}",
                                         state.banner.user_id
                                     ));
-                                    if moved {
+                                    emit_avatar_roster(&state, &mut builder, shared);
+                                    // The avatar moved, not the board: publish
+                                    // the roster and do not redraw it. The
+                                    // rollback path still bakes, so it redraws.
+                                    if moved && shared.bake_avatars {
                                         dirty_render = true;
                                         crate::trace::redraw_requested(
                                             state.banner.user_id,
@@ -1234,9 +1302,8 @@ fn run_session(
                 if palace_asset::owns(frame.opcode) {
                     pipeline_events.extend(pipeline.on_frame(&frame, order, now));
                 }
-                let before_positions = state.user_positions();
                 let applied = state.apply(&frame, order);
-                state.begin_motions(&before_positions, now);
+                users_moved |= applied.users_moved;
                 for outbound in &applied.outbound {
                     let _ = conn.send(outbound);
                 }
@@ -1281,6 +1348,7 @@ fn run_session(
                     shared.emit(ClientEvent::Users {
                         users: state.users_in_room(),
                     });
+                    emit_avatar_roster(&state, &mut builder, shared);
                 }
                 if applied.room_entered {
                     hover_spot = None;
@@ -1294,6 +1362,7 @@ fn run_session(
                             refresh_asset_facts(&state, &builder, &mut fact_cache, shared);
                             crate::trace::dump_scripts(&desc);
                             scripts.load_room(&desc);
+                            emit_avatar_roster(&state, &mut builder, shared);
                             for problem in &scripts.problems {
                                 shared.note(format!(
                                     "script: hotspot {} did not parse: {}",
@@ -1536,13 +1605,20 @@ fn run_session(
             );
         }
 
-        // Keep any remote-avatar glide moving even while the server is quiet.
-        // `advance_motion` still runs every pass so finished glides are pruned,
-        // but the redraw it asks for is capped at `MIN_FRAME_INTERVAL`; other
-        // sources of `dirty_render` are untouched.
-        let motion_due = state.advance_motion(start.elapsed().as_millis() as u64);
-        if motion_due && frame_due(last_frame, Instant::now(), MIN_FRAME_INTERVAL) {
-            dirty_render = true;
+        // A reported position is drawn at once: publish the roster in the same
+        // pass the frame that moved a remote user was applied, so every frame
+        // in a burst still yields exactly one roster. The rollback path bakes
+        // avatars into the board instead, so its redraw request stays behind
+        // the `MIN_FRAME_INTERVAL` animation cap and the move stays pending
+        // until a frame is due.
+        if users_moved
+            && (!shared.bake_avatars || frame_due(last_frame, Instant::now(), MIN_FRAME_INTERVAL))
+        {
+            users_moved = false;
+            if shared.bake_avatars {
+                dirty_render = true;
+            }
+            emit_avatar_roster(&state, &mut builder, shared);
         }
 
         if dirty_render {
@@ -1781,14 +1857,31 @@ struct CachedBase {
     canvas: Canvas,
 }
 
+/// A rendered board layer kept until its own signature changes.
+struct CachedLayer {
+    signature: u64,
+    png: Vec<u8>,
+}
+
+impl CachedLayer {
+    /// The layer's version, or `None` when it has no content. The signature is
+    /// the version: it changes exactly when the layer's content changes and is
+    /// stable otherwise, with no cross-session counter to reset.
+    fn version(&self) -> Option<u64> {
+        (!self.png.is_empty()).then_some(self.signature)
+    }
+}
+
 /// Keeps the static room layers rasterized between frames.
 ///
 /// A click only moves an avatar, but without this every click re-blits the
-/// whole background and overlays at device resolution. The base is rebuilt only
-/// when [`static_signature`] changes.
+/// whole background and overlays at device resolution. Each layer is rebuilt
+/// only when its own signature changes.
 #[derive(Default)]
 struct RenderCache {
     base: Option<CachedBase>,
+    mid: Option<CachedLayer>,
+    top: Option<CachedLayer>,
 }
 
 /// A cheap fingerprint of everything drawn below the avatars.
@@ -1839,6 +1932,130 @@ fn static_signature(state: &SessionState, dpr: f64, scene: &Scene, asset_revisio
     hasher.finish()
 }
 
+/// Hash the hotspot/state/picture inputs an overlay band is derived from.
+///
+/// The resolved sprite list alone cannot tell two different images of the same
+/// size apart, so the source selection is folded in as well.
+fn hash_overlay_sources(state: &SessionState, hasher: &mut DefaultHasher) {
+    let Some(room) = &state.room_desc else {
+        return;
+    };
+    room.header.room_id.hash(hasher);
+    for spot in &room.hotspots {
+        spot.id.hash(hasher);
+        spot.state.hash(hasher);
+        spot.nbr_states.hash(hasher);
+        spot.flags.hash(hasher);
+        if let Some(shown) = usize::try_from(spot.state)
+            .ok()
+            .and_then(|index| spot.states.get(index))
+        {
+            shown.pict_id.hash(hasher);
+            shown.pic_loc.h.hash(hasher);
+            shown.pic_loc.v.hash(hasher);
+        }
+    }
+    for picture in &room.pictures {
+        picture.pic_id.hash(hasher);
+        picture.name.hash(hasher);
+        picture.trans_color.hash(hasher);
+    }
+}
+
+/// Hash one overlay band's resolved placement, opacity and image size.
+fn hash_sprites(hasher: &mut DefaultHasher, sprites: &[Sprite]) {
+    for sprite in sprites {
+        sprite.x.hash(hasher);
+        sprite.y.hash(hasher);
+        sprite.z.hash(hasher);
+        sprite.alpha.to_bits().hash(hasher);
+        (sprite.image.width(), sprite.image.height()).hash(hasher);
+    }
+}
+
+/// A cheap fingerprint of everything the middle layer draws.
+///
+/// The middle layer is the "above avatars" overlay band plus the front paint
+/// layer. It does not include the base's loose props, so moving one does not
+/// re-encode the middle.
+fn mid_signature(state: &SessionState, dpr: f64, scene: &Scene, asset_revision: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    asset_revision.hash(&mut hasher);
+    dpr.to_bits().hash(&mut hasher);
+    scene.size.hash(&mut hasher);
+    scene.draw.revision().hash(&mut hasher);
+    hash_overlay_sources(state, &mut hasher);
+    hash_sprites(&mut hasher, &scene.overlays_above_avatars);
+    hasher.finish()
+}
+
+/// A cheap fingerprint of everything the top layer draws: the "above name tags"
+/// and "above everything" overlay bands, plus the chat text.
+fn top_signature(state: &SessionState, dpr: f64, scene: &Scene, asset_revision: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    asset_revision.hash(&mut hasher);
+    dpr.to_bits().hash(&mut hasher);
+    scene.size.hash(&mut hasher);
+    hash_overlay_sources(state, &mut hasher);
+    hash_sprites(&mut hasher, &scene.overlays_above_name_tags);
+    hash_sprites(&mut hasher, &scene.overlays_above_everything);
+    for chat in &scene.chat {
+        chat.text.hash(&mut hasher);
+        chat.x.hash(&mut hasher);
+        chat.y.hash(&mut hasher);
+        chat_style_code(chat.style).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn chat_style_code(style: ChatStyle) -> u8 {
+    match style {
+        ChatStyle::Talk => 0,
+        ChatStyle::Whisper => 1,
+        ChatStyle::System => 2,
+        ChatStyle::Error => 3,
+    }
+}
+
+/// Whether the middle layer has anything to draw.
+fn mid_has_content(scene: &Scene) -> bool {
+    !scene.overlays_above_avatars.is_empty() || !scene.draw.front().is_empty()
+}
+
+/// Whether the top layer has anything to draw.
+fn top_has_content(scene: &Scene) -> bool {
+    !scene.overlays_above_name_tags.is_empty()
+        || !scene.chat.is_empty()
+        || !scene.overlays_above_everything.is_empty()
+}
+
+/// Render a cached layer, re-encoding only when `signature` moved. An empty
+/// bitmap records that the layer has no content.
+fn cached_layer(
+    slot: &mut Option<CachedLayer>,
+    signature: u64,
+    has_content: bool,
+    render: impl FnOnce() -> Option<Canvas>,
+) -> Option<(Vec<u8>, Option<u64>)> {
+    if let Some(layer) = slot {
+        if layer.signature == signature {
+            return Some((layer.png.clone(), layer.version()));
+        }
+    }
+    let png = if has_content {
+        render()?.to_png_bytes().ok()?
+    } else {
+        Vec::new()
+    };
+    let layer = CachedLayer {
+        signature,
+        png: png.clone(),
+    };
+    let version = layer.version();
+    *slot = Some(layer);
+    Some((png, version))
+}
+
 fn compose(
     state: &SessionState,
     builder: &mut SceneBuilder,
@@ -1854,8 +2071,15 @@ fn compose(
     room.loose_props
         .retain(|prop| builder.props().contains(prop.spec.id));
 
-    let now_ms = start.elapsed().as_millis() as u64;
-    let (avatars, hidden_avatars) = visible_avatars(state, builder.props(), now_ms);
+    // The roster count is the same whether or not the frame bakes avatars: every
+    // user [`visible_avatars`] can draw. Only the rollback path feeds the specs
+    // into the scene.
+    let (visible_specs, hidden_avatars) = visible_avatars(state, builder.props());
+    let baked: &[AvatarSpec] = if shared.bake_avatars {
+        &visible_specs
+    } else {
+        &[]
+    };
 
     builder.clear_pic_opacity();
     for ((spot, index), alpha) in &state.pic_opacity {
@@ -1863,7 +2087,7 @@ fn compose(
     }
 
     let build_started = Instant::now();
-    let mut scene = builder.build_with(&room, &avatars, &[]);
+    let mut scene = builder.build_with(&room, baked, &[]);
     let build_done = Instant::now();
     scene.dim_level = state.room_dim;
     // The builder seeds `scene.draw` from the room descriptor alone; the session
@@ -1878,8 +2102,9 @@ fn compose(
         dpr,
         clock: AnimationClock::at(start.elapsed().as_millis() as u64),
     };
-    let signature = static_signature(state, dpr, &scene, shared.asset_revision());
-    let mut canvas = match &cache.base {
+    let asset_revision = shared.asset_revision();
+    let signature = static_signature(state, dpr, &scene, asset_revision);
+    let static_base = match &cache.base {
         Some(base) if base.signature == signature => base.canvas.clone(),
         _ => {
             let base = render_base(&scene, options);
@@ -1890,19 +2115,62 @@ fn compose(
             base
         }
     };
-    draw_above_into(&mut canvas, &scene, options.clock);
+
+    let (mid_png, mid_version, top_png, top_version);
+    let base_canvas = if shared.bake_avatars {
+        // Rollback: one frame carries the avatars, name tags and every layer
+        // above the base, exactly as before the cutover.
+        let mut canvas = static_base;
+        draw_above_into(&mut canvas, &scene, options.clock);
+        mid_png = Vec::new();
+        mid_version = None;
+        top_png = Vec::new();
+        top_version = None;
+        canvas
+    } else {
+        let mid_sig = mid_signature(state, dpr, &scene, asset_revision);
+        (mid_png, mid_version) =
+            cached_layer(&mut cache.mid, mid_sig, mid_has_content(&scene), || {
+                Some(render_mid(&scene, options))
+            })?;
+        let top_sig = top_signature(state, dpr, &scene, asset_revision);
+        (top_png, top_version) =
+            cached_layer(&mut cache.top, top_sig, top_has_content(&scene), || {
+                Some(render_top(&scene, options))
+            })?;
+        static_base
+    };
     let render_done = Instant::now();
-    let png = canvas.to_png_bytes().ok()?;
+    let png_started = Instant::now();
+    let png = base_canvas.to_png_bytes().ok()?;
+    let png_ms = (Instant::now() - png_started).as_millis();
+    let png_bytes = png.len();
+    let mid_bytes = mid_png.len();
+    let top_bytes = top_png.len();
+    let version = shared.frames.put(png);
+    if shared.bake_avatars {
+        shared.frames.put_mid(Vec::new(), 0);
+        shared.frames.put_top(Vec::new(), 0);
+    } else {
+        shared.frames.put_mid(mid_png, mid_version.unwrap_or(0));
+        shared.frames.put_top(top_png, top_version.unwrap_or(0));
+    }
     if crate::trace::enabled() {
+        let mid_v = mid_version.map_or_else(|| "-".to_owned(), |v| v.to_string());
+        let top_v = top_version.map_or_else(|| "-".to_owned(), |v| v.to_string());
         crate::trace::state(&format!(
-            "compose build={}ms render={}ms png={}ms bytes={}",
+            "compose build={}ms render={}ms png={}ms bytes={} mid_bytes={} top_bytes={} base_v={} mid_v={} top_v={}",
             (build_done - build_started).as_millis(),
             (render_done - build_done).as_millis(),
-            (Instant::now() - render_done).as_millis(),
-            png.len()
+            png_ms,
+            png_bytes,
+            mid_bytes,
+            top_bytes,
+            version,
+            mid_v,
+            top_v
         ));
     }
-    let version = shared.frames.put(png);
 
     let mut notes: Vec<String> = scene.notes.iter().map(|n| n.to_string()).collect();
     if props_pending > 0 {
@@ -1926,9 +2194,11 @@ fn compose(
 
     Some(ScreenState {
         version,
+        mid_version,
+        top_version,
         room_id: i32::from(room.header.room_id),
         room_name: room.name.clone(),
-        avatars: avatars.len(),
+        avatars: visible_specs.len(),
         loose_props: room.loose_props.len(),
         props_pending,
         notes,
@@ -1971,7 +2241,7 @@ fn avatar_specs(users: &[UserInfo], props: &PropStore) -> (Vec<AvatarSpec>, usiz
     let avatars = users
         .iter()
         .filter_map(|user| {
-            if !user.props.is_empty() && !user.props.iter().any(|id| props.contains(*id)) {
+            if !avatar_visible(user, props) {
                 hidden += 1;
                 return None;
             }
@@ -1985,22 +2255,179 @@ fn avatar_specs(users: &[UserInfo], props: &PropStore) -> (Vec<AvatarSpec>, usiz
     (avatars, hidden)
 }
 
-fn visible_avatars(
+/// Whether the bake will draw `user` with `props` available.
+fn avatar_visible(user: &UserInfo, props: &PropStore) -> bool {
+    user.props.is_empty() || user.props.iter().any(|id| props.contains(*id))
+}
+
+fn avatars_users(state: &SessionState) -> Vec<UserInfo> {
+    if state.avatars_hidden {
+        return Vec::new();
+    }
+    state.users_in_room()
+}
+
+fn visible_avatars(state: &SessionState, props: &PropStore) -> (Vec<AvatarSpec>, usize) {
+    avatar_specs(&avatars_users(state), props)
+}
+
+/// The users the bake will draw, paired with their specs, in the same order.
+/// Both this and [`visible_avatars`] filter through [`avatar_visible`], so the
+/// roster cannot name a different set of people than the frame draws.
+fn visible_user_specs(
     state: &SessionState,
     props: &PropStore,
-    now_ms: u64,
-) -> (Vec<AvatarSpec>, usize) {
-    if state.avatars_hidden {
-        (Vec::new(), 0)
-    } else {
-        let mut users = state.users_in_room();
-        for user in &mut users {
-            let (x, y) = state.position_at(user.id, now_ms);
-            user.x = x;
-            user.y = y;
+) -> (Vec<UserInfo>, Vec<AvatarSpec>, usize) {
+    let mut kept = Vec::new();
+    let mut hidden = 0usize;
+    for user in avatars_users(state) {
+        if avatar_visible(&user, props) {
+            kept.push(user);
+        } else {
+            hidden += 1;
         }
-        avatar_specs(&users, props)
     }
+    let (specs, _) = avatar_specs(&kept, props);
+    (kept, specs, hidden)
+}
+
+/// Build the avatar roster for the current room.
+///
+/// The scene is built exactly as [`compose`] builds it — same avatar list, same
+/// [`SceneBuilder::build_with`] call — so the roster's placements can never
+/// drift from what is baked into the frame. Stage 0 keeps the bake in place and
+/// publishes this alongside it.
+fn avatar_roster(
+    state: &SessionState,
+    builder: &mut SceneBuilder,
+    shared: &Arc<Shared>,
+) -> AvatarRoster {
+    let version = shared.next_roster_version();
+    let viewport = shared.viewport();
+    let dpr = clamp_dpr(viewport.dpr);
+
+    let Some(live) = state.room_desc.as_ref() else {
+        let (room_w, room_h) = shared.room_size();
+        let geometry = ViewGeometry::compute(
+            SizeF::new(f64::from(room_w), f64::from(room_h)),
+            SizeF::new(viewport.width, viewport.height),
+            viewport.zoom,
+            viewport.native,
+            dpr,
+        );
+        return AvatarRoster {
+            version,
+            room_id: state.current_room.as_ref().map_or(0, |room| room.id),
+            geometry,
+            name_tags_visible: builder.name_tags_visible(),
+            avatars: Vec::new(),
+        };
+    };
+
+    let mut room = live.clone();
+    room.loose_props
+        .retain(|prop| builder.props().contains(prop.spec.id));
+
+    let (mut users, specs, _hidden) = visible_user_specs(state, builder.props());
+    let mut scene = builder.build_with(&room, &specs, &[]);
+    let (logical_w, logical_h) = scene.logical_size();
+
+    // Cache each worn prop's PNG under its id. `contains` keeps an unresolved
+    // placeholder out of the cache, so the URI route still 404s an unknown id.
+    let images = shared.avatar_images();
+    for avatar in &scene.avatars {
+        for part in &avatar.parts {
+            if let palace_render::AvatarPartArt::Prop { id } = part.art {
+                if builder.props().contains(id) {
+                    let _ = images.cache_prop(id, &part.image);
+                }
+            }
+        }
+    }
+
+    // `scene.avatars` is built one-per-spec, in `users` order. Both lists are
+    // then stably sorted by the identical `(y, x)` key, so each avatar stays
+    // paired with its user while ending in the compositor's draw order.
+    for (user, avatar) in users.iter_mut().zip(scene.avatars.iter()) {
+        user.x = avatar.x as i16;
+        user.y = avatar.y as i16;
+    }
+    palace_render::sort_avatars(&mut scene.avatars);
+    users.sort_by_key(|user| (user.y, user.x));
+    debug_assert_eq!(scene.avatars.len(), users.len());
+
+    let avatars = scene
+        .avatars
+        .iter()
+        .zip(users.iter())
+        .map(|(avatar, user)| AvatarState {
+            id: user.id,
+            name: user.name.clone(),
+            x: avatar.x,
+            y: avatar.y,
+            face: user.face,
+            color: user.color,
+            is_self: user.is_self,
+            away: user.away,
+            parts: avatar
+                .parts
+                .iter()
+                .map(|part| AvatarPartState {
+                    art: match part.art {
+                        palace_render::AvatarPartArt::Face { face, color } => {
+                            AvatarArt::Face { face, color }
+                        }
+                        palace_render::AvatarPartArt::Prop { id } => AvatarArt::Prop { id },
+                    },
+                    dx: part.dx,
+                    dy: part.dy,
+                    alpha: part.alpha,
+                    w: part.image.width(),
+                    h: part.image.height(),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let geometry = ViewGeometry::compute(
+        SizeF::new(logical_w, logical_h),
+        SizeF::new(viewport.width, viewport.height),
+        viewport.zoom,
+        viewport.native,
+        dpr,
+    );
+
+    AvatarRoster {
+        version,
+        room_id: i32::from(room.header.room_id),
+        geometry,
+        name_tags_visible: scene.name_tags_visible,
+        avatars,
+    }
+}
+
+/// Decide which roster to publish.
+///
+/// In rollback mode [`compose`] bakes avatars and name tags into the frame, but
+/// the webview still draws every avatar the roster describes — so publishing the
+/// real roster would draw each person twice. Publish the same shape with no
+/// avatars instead. The normal path publishes the roster untouched.
+fn roster_for_publish(baked: bool, mut roster: AvatarRoster) -> AvatarRoster {
+    if baked {
+        roster.avatars.clear();
+    }
+    roster
+}
+
+/// Build and publish the avatar roster. All three Stage 0 trigger sites go
+/// through here, so the future cutover has one place to change.
+fn emit_avatar_roster(state: &SessionState, builder: &mut SceneBuilder, shared: &Arc<Shared>) {
+    let roster = roster_for_publish(shared.bake_avatars, avatar_roster(state, builder, shared));
+    if crate::trace::enabled() {
+        let bytes = serde_json::to_string(&roster).map_or(0, |json| json.len());
+        crate::trace::avatar_roster(roster.avatars.len(), bytes);
+    }
+    shared.emit(ClientEvent::Avatars { roster });
 }
 
 /// How many of the most recent chat lines the frame draws.
@@ -4894,21 +5321,17 @@ mod tests {
         let mut state = session_in_room();
         let props = PropStore::new();
         assert_eq!(
-            visible_avatars(&state, &props, 0).0.len(),
+            visible_avatars(&state, &props).0.len(),
             1,
             "the user is drawn"
         );
         state.avatars_hidden = true;
         assert!(
-            visible_avatars(&state, &props, 0).0.is_empty(),
+            visible_avatars(&state, &props).0.is_empty(),
             "and now is not"
         );
         state.avatars_hidden = false;
-        assert_eq!(
-            visible_avatars(&state, &props, 0).0.len(),
-            1,
-            "and back again"
-        );
+        assert_eq!(visible_avatars(&state, &props).0.len(), 1, "and back again");
     }
 
     #[test]
@@ -4970,6 +5393,126 @@ mod tests {
         assert_eq!(hidden, 0);
         assert_eq!(avatars.len(), 1);
         assert_eq!((avatars[0].face, avatars[0].color), (3, 7));
+    }
+
+    fn prop_blob(h_offset: i16, flags: u16) -> Vec<u8> {
+        let image =
+            palace_prop::PropImage::from_rgba(8, 8, vec![0x40; 8 * 8 * 4]).expect("prop image");
+        palace_prop::encode_s20_blob(&image, h_offset, 0, flags).expect("prop encodes")
+    }
+
+    #[test]
+    fn an_avatars_event_serializes_under_its_type_tag() {
+        let state = session_with_self();
+        let mut builder = SceneBuilder::new(MediaStore::default(), PropStore::new());
+        let shared = test_shared();
+        let roster = avatar_roster(&state, &mut builder, &shared);
+        let value =
+            serde_json::to_value(ClientEvent::Avatars { roster }).expect("the event serializes");
+        assert_eq!(value["type"], serde_json::json!("avatars"));
+        assert!(
+            value["roster"].is_object(),
+            "the roster travels under `roster`: {value}"
+        );
+    }
+
+    #[test]
+    fn avatar_roster_lists_avatars_in_compositor_draw_order() {
+        let mut state = session_in_room();
+        let mut near = user(2, vec![]);
+        near.x = 100;
+        near.y = 300;
+        let mut far = user(3, vec![]);
+        far.x = 200;
+        far.y = 100;
+        state.users.insert(2, near);
+        state.users.insert(3, far);
+
+        let mut builder = SceneBuilder::new(MediaStore::default(), PropStore::new());
+        let shared = test_shared();
+        let roster = avatar_roster(&state, &mut builder, &shared);
+
+        let order: Vec<(i32, i32)> = roster.avatars.iter().map(|a| (a.y, a.x)).collect();
+        assert_eq!(
+            order,
+            vec![(22, 22), (100, 200), (300, 100)],
+            "back-to-front is ascending (y, x); the self anchor is clamped to the 22px margin"
+        );
+        assert!(
+            roster.avatars.iter().any(|avatar| avatar.is_self),
+            "the local user is in the roster"
+        );
+    }
+
+    #[test]
+    fn avatar_roster_maps_parts_and_suppresses_a_head_prop_face() {
+        const NORMAL_PROP: u32 = 7002;
+        const HEAD_PROP: u32 = 7001;
+
+        let mut state = session_in_room();
+        let shared = test_shared();
+        let mut builder = SceneBuilder::new(MediaStore::default(), PropStore::new());
+
+        let roster = avatar_roster(&state, &mut builder, &shared);
+        let me = roster.avatars.iter().find(|a| a.is_self).expect("self");
+        assert_eq!(me.parts.len(), 1, "a prop-less avatar is exactly its face");
+        assert_eq!(
+            me.parts[0].art,
+            AvatarArt::Face { face: 3, color: 7 },
+            "the face part carries the user's face and colour"
+        );
+
+        builder
+            .props_mut()
+            .insert_blob(NORMAL_PROP, prop_blob(7, 0));
+        state.users.get_mut(&SELF_ID).expect("self").props = vec![NORMAL_PROP];
+        let roster = avatar_roster(&state, &mut builder, &shared);
+        let me = roster.avatars.iter().find(|a| a.is_self).expect("self");
+        assert_eq!(me.parts.len(), 2, "the face stays under a normal prop");
+        assert_eq!(me.parts[0].art, AvatarArt::Face { face: 3, color: 7 });
+        let prop = &me.parts[1];
+        assert_eq!(prop.art, AvatarArt::Prop { id: NORMAL_PROP });
+        assert_eq!(prop.dx, -22 + 7, "dx is -AVATAR_HALF plus the h_offset");
+        assert_eq!((prop.w, prop.h), (8, 8), "w/h are the decoded pixel size");
+
+        builder
+            .props_mut()
+            .insert_blob(HEAD_PROP, prop_blob(0, palace_prop::FLAG_HEAD));
+        state.users.get_mut(&SELF_ID).expect("self").props = vec![HEAD_PROP];
+        let roster = avatar_roster(&state, &mut builder, &shared);
+        let me = roster.avatars.iter().find(|a| a.is_self).expect("self");
+        assert_eq!(me.parts.len(), 1, "a HEAD prop is the avatar's only art");
+        assert_eq!(me.parts[0].art, AvatarArt::Prop { id: HEAD_PROP });
+        assert!(
+            !me.parts
+                .iter()
+                .any(|part| matches!(part.art, AvatarArt::Face { .. })),
+            "a worn HEAD prop suppresses the built-in face"
+        );
+    }
+
+    #[test]
+    fn a_worn_prop_image_is_cached_for_the_uri_route() {
+        const WORN_PROP: u32 = 8100;
+        const UNKNOWN_PROP: u32 = 8101;
+
+        let mut state = session_in_room();
+        state.users.get_mut(&SELF_ID).expect("self").props = vec![WORN_PROP];
+        let mut builder = SceneBuilder::new(MediaStore::default(), PropStore::new());
+        builder.props_mut().insert_blob(WORN_PROP, prop_blob(0, 0));
+        let shared = test_shared();
+
+        let _roster = avatar_roster(&state, &mut builder, &shared);
+        let images = shared.avatar_images();
+        let bytes = images
+            .prop_png(WORN_PROP)
+            .expect("the worn prop's image is cached");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "the route serves a PNG");
+        assert!(!bytes.is_empty(), "the cached image is non-empty");
+        assert!(
+            images.prop_png(UNKNOWN_PROP).is_none(),
+            "an id the roster never referenced is absent"
+        );
     }
 
     #[test]
@@ -5063,7 +5606,7 @@ mod tests {
         );
         assert!(state.avatars_hidden, "avatars off must reach the model");
         assert!(
-            visible_avatars(&state, builder.props(), 0).0.is_empty(),
+            visible_avatars(&state, builder.props()).0.is_empty(),
             "hidden avatars must leave the scene"
         );
         assert!(
@@ -5075,10 +5618,110 @@ mod tests {
         assert!(builder.name_tags_visible());
         assert!(!state.avatars_hidden);
         assert_eq!(
-            visible_avatars(&state, builder.props(), 0).0.len(),
+            visible_avatars(&state, builder.props()).0.len(),
             1,
             "showing again restores the avatar"
         );
+    }
+
+    #[test]
+    fn the_bake_avatars_rollback_flag_parses_exactly_one() {
+        use std::ffi::OsString;
+        assert!(
+            bake_avatars_from_value(Some(OsString::from("1"))),
+            "PALACE_BAKE_AVATARS=1 restores the baked frame"
+        );
+        assert!(
+            !bake_avatars_from_value(Some(OsString::from("0"))),
+            "=0 leaves the cutover in place"
+        );
+        assert!(
+            !bake_avatars_from_value(Some(OsString::from("true"))),
+            "only the exact value 1 enables the rollback"
+        );
+        assert!(
+            !bake_avatars_from_value(None),
+            "an unset variable leaves the cutover in place"
+        );
+    }
+
+    #[test]
+    fn the_rollback_publishes_an_empty_roster_so_cards_do_not_double_draw() {
+        let state = session_in_room();
+        let mut builder = SceneBuilder::new(MediaStore::default(), PropStore::new());
+        let shared = test_shared();
+        let roster = avatar_roster(&state, &mut builder, &shared);
+        assert!(
+            !roster.avatars.is_empty(),
+            "the built roster carries the room's avatars"
+        );
+
+        let cutover = roster_for_publish(false, roster.clone());
+        assert_eq!(
+            cutover.avatars, roster.avatars,
+            "the normal path publishes the real roster"
+        );
+
+        let baked = roster_for_publish(true, roster.clone());
+        assert!(
+            baked.avatars.is_empty(),
+            "rollback publishes no avatars, so the webview draws no cards"
+        );
+        assert_eq!(
+            (
+                baked.version,
+                baked.room_id,
+                baked.geometry,
+                baked.name_tags_visible
+            ),
+            (
+                roster.version,
+                roster.room_id,
+                roster.geometry,
+                roster.name_tags_visible
+            ),
+            "the rollback keeps the roster's shape so the webview stays consistent"
+        );
+    }
+
+    #[test]
+    fn the_rollback_switch_bakes_avatars_into_the_base_and_skips_the_layers() {
+        let state = state_in(&scripted_room(&[]));
+
+        // Stage 1: the avatar lives only in the roster, so no board layer
+        // carries its pixels.
+        let cutover = test_shared();
+        let cutover_screen = compose_screen(&state, &cutover);
+        let cutover_base = decode_png_rgba(&cutover.frames.png().expect("a base frame"));
+        assert_eq!(
+            cutover_screen.avatars, 1,
+            "the roster still counts the avatar"
+        );
+        assert_eq!(
+            cutover.frames.mid_png(),
+            None,
+            "no middle layer exists without content"
+        );
+        assert_eq!(
+            cutover.frames.top_png(),
+            None,
+            "no top layer exists without content"
+        );
+
+        // Rollback: the avatar is composited back into the single base frame.
+        let baked = test_shared_with_bake(true);
+        let baked_screen = compose_screen(&state, &baked);
+        let baked_base = decode_png_rgba(&baked.frames.png().expect("a base frame"));
+        assert_eq!(
+            baked_screen.avatars, 1,
+            "the rollback still reports the same roster count"
+        );
+        assert_ne!(
+            baked_base, cutover_base,
+            "the rollback base carries the avatar pixels the cutover base omits"
+        );
+        assert_eq!(baked.frames.mid_png(), None, "the rollback clears mid");
+        assert_eq!(baked.frames.top_png(), None, "the rollback clears top");
     }
 
     #[test]
@@ -5215,14 +5858,20 @@ mod tests {
     }
 
     fn test_shared() -> Arc<Shared> {
+        test_shared_with_bake(false)
+    }
+
+    fn test_shared_with_bake(bake_avatars: bool) -> Arc<Shared> {
         let (events, _rx) = unbounded_channel();
         Arc::new(Shared {
             cfg: ClientConfig::default(),
             frames: Arc::new(FrameStore::new()),
+            avatar_images: Arc::new(AvatarImageStore::new()),
             events,
             viewport: Mutex::new(ViewportSpec::default()),
             running: AtomicBool::new(true),
             chat_seq: AtomicU64::new(0),
+            roster_version: AtomicU64::new(0),
             debug_frames: false,
             last_room: Mutex::new(None),
             pending_goto: Mutex::new(None),
@@ -5231,6 +5880,7 @@ mod tests {
             asset_revision: AtomicU64::new(0),
             mouse: Mutex::new((0, 0)),
             room_size: Mutex::new((512.0, 384.0)),
+            bake_avatars,
         })
     }
 
@@ -5345,23 +5995,70 @@ mod tests {
         }
     }
 
-    /// Compose the session's frame into raw RGBA plus its bitmap width.
-    fn composed_rgba(state: &SessionState, shared: &Arc<Shared>) -> (Vec<u8>, u32) {
+    /// Compose the session's frame and return its report.
+    fn compose_screen(state: &SessionState, shared: &Arc<Shared>) -> ScreenState {
         let mut builder = SceneBuilder::new(MediaStore::new(&[]), PropStore::new());
         let mut cache = RenderCache::default();
-        let screen = compose(state, &mut builder, shared, Instant::now(), &mut cache)
-            .expect("a frame composes");
+        compose(state, &mut builder, shared, Instant::now(), &mut cache).expect("a frame composes")
+    }
+
+    /// Compose the session's frame into raw RGBA plus its bitmap width.
+    fn composed_rgba(state: &SessionState, shared: &Arc<Shared>) -> (Vec<u8>, u32) {
+        let screen = compose_screen(state, shared);
         let png = shared.frames.png().expect("the frame store holds a PNG");
+        (decode_png_rgba(&png), screen.geometry.bitmap_w)
+    }
+
+    /// Decode a PNG bitmap into raw RGBA.
+    fn decode_png_rgba(png: &[u8]) -> Vec<u8> {
         let decoder = png::Decoder::new(std::io::Cursor::new(png));
         let mut reader = decoder.read_info().expect("png info");
         let mut buf = vec![0u8; reader.output_buffer_size().expect("png buffer size")];
         reader.next_frame(&mut buf).expect("png frame");
-        (buf, screen.geometry.bitmap_w)
+        buf
     }
 
     fn rgba_pixel(rgba: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
         let at = ((y as usize) * (width as usize) + x as usize) * 4;
         [rgba[at], rgba[at + 1], rgba[at + 2], rgba[at + 3]]
+    }
+
+    /// The display keys its base fetch on `ScreenState.version`, so two composes
+    /// of an unchanged board must leave it alone; a real board change (here a
+    /// back-layer stroke) must advance it.
+    #[test]
+    fn an_unchanged_board_keeps_the_base_version_and_a_stroke_advances_it() {
+        let mut state = state_in(&scripted_room(&[]));
+        let shared = test_shared();
+
+        let first = compose_screen(&state, &shared);
+        assert_eq!(
+            first.version,
+            shared.frames.version(),
+            "the reported version is the one the frame store holds"
+        );
+
+        let second = compose_screen(&state, &shared);
+        assert_eq!(
+            second.version, first.version,
+            "two composes of the same board must keep the same base version \
+             ({} -> {})",
+            first.version, second.version
+        );
+        assert_eq!(shared.frames.version(), second.version);
+
+        state.apply(
+            &draw_frame(palace_room::draw_cmd::PATH, 0, &[(5, 5), (0, 10)]),
+            ByteOrder::Little,
+        );
+        let third = compose_screen(&state, &shared);
+        assert!(
+            third.version > second.version,
+            "a changed base bitmap must advance the version ({} -> {})",
+            second.version,
+            third.version
+        );
+        assert_eq!(shared.frames.version(), third.version);
     }
 
     /// One raw `DRAW` record, the same layout the server sends: a 10-byte
@@ -5934,31 +6631,29 @@ mod tests {
     }
 
     #[test]
-    fn a_front_layer_stroke_paints_over_an_avatar_while_a_back_layer_one_does_not() {
-        // The self avatar clamps to (22,22), so its 44x44 body covers (44,44).
-        let place_avatar = |state: &mut SessionState| {
-            if let Some(me) = state.users.get_mut(&HARNESS_SELF) {
-                me.x = 10;
-                me.y = 5;
-            }
-        };
-
+    fn a_back_layer_stroke_stays_in_the_base_and_a_front_layer_one_reaches_the_mid() {
+        // Avatar cards sit between the base and middle layers, so the back paint
+        // must be in the base (under the cards) and the front paint in the
+        // middle layer (over them).
         let mut back = state_in(&scripted_room(&[]));
-        place_avatar(&mut back);
         back.apply(
             &draw_frame(palace_room::draw_cmd::PATH, 0, &[(44, 44)]),
             ByteOrder::Little,
         );
-        let harness = harness();
-        let (back_rgba, width) = composed_rgba(&back, &harness.shared);
-        assert_ne!(
+        let back_harness = harness();
+        let (back_rgba, width) = composed_rgba(&back, &back_harness.shared);
+        assert_eq!(
             rgba_pixel(&back_rgba, width, 44, 44),
             RED,
-            "a back-layer stroke is painted under the avatars"
+            "a back-layer stroke is painted into the base"
+        );
+        assert_eq!(
+            back_harness.shared.frames.mid_png(),
+            None,
+            "a back-layer stroke does not create a middle layer"
         );
 
         let mut front = state_in(&scripted_room(&[]));
-        place_avatar(&mut front);
         front.apply(
             &draw_frame(
                 palace_room::draw_cmd::PATH,
@@ -5967,11 +6662,23 @@ mod tests {
             ),
             ByteOrder::Little,
         );
-        let (front_rgba, _) = composed_rgba(&front, &harness.shared);
-        assert_eq!(
-            rgba_pixel(&front_rgba, width, 44, 44),
+        let front_harness = harness();
+        let (front_base, width) = composed_rgba(&front, &front_harness.shared);
+        assert_ne!(
+            rgba_pixel(&front_base, width, 44, 44),
             RED,
-            "a front-layer stroke is painted over the avatars"
+            "a front-layer stroke must not be in the base"
+        );
+        let mid = front_harness
+            .shared
+            .frames
+            .mid_png()
+            .expect("the front paint creates the middle layer");
+        let mid_rgba = decode_png_rgba(&mid);
+        assert_eq!(
+            rgba_pixel(&mid_rgba, width, 44, 44),
+            RED,
+            "a front-layer stroke is painted into the middle layer"
         );
     }
 

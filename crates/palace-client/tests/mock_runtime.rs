@@ -299,6 +299,17 @@ fn seed_props_dir(ids: &[u32], rgb: [u8; 3]) -> PathBuf {
     dir
 }
 
+/// Write one decodable prop blob carrying the HEAD flag, so wearing it
+/// suppresses the avatar's built-in face.
+fn seed_head_prop_dir(id: u32, h_offset: i16) -> PathBuf {
+    let dir = unique_temp_dir("seed-head-prop");
+    let image = palace_prop::PropImage::from_rgba(8, 8, vec![0x40; 8 * 8 * 4]).expect("prop image");
+    let blob = palace_prop::encode_s20_blob(&image, h_offset, 0, palace_prop::FLAG_HEAD)
+        .expect("head prop encodes");
+    fs::write(dir.join(format!("{id}.bin")), &blob).expect("write seeded head prop");
+    dir
+}
+
 // ---------------------------------------------------------------------------
 // The mock server
 // ---------------------------------------------------------------------------
@@ -656,6 +667,16 @@ fn screens(events: &[ClientEvent]) -> Vec<&ScreenState> {
         .iter()
         .filter_map(|event| match event {
             ClientEvent::Screen { screen } => Some(screen),
+            _ => None,
+        })
+        .collect()
+}
+
+fn avatar_rosters(events: &[ClientEvent]) -> Vec<&palace_client::AvatarRoster> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::Avatars { roster } => Some(roster),
             _ => None,
         })
         .collect()
@@ -1094,13 +1115,22 @@ fn a_floor_click_shows_the_move_before_the_server_replies() {
         .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
     handle.click(floor.x, floor.y);
 
-    // The predicted move is drawn locally without waiting for the server.
+    // The predicted move is published as a roster immediately, without waiting
+    // for the server, and without redrawing the board: the avatar is no longer
+    // baked into the composed frame.
+    let after = collect_events(
+        &mut rx,
+        |collected| !avatar_rosters(collected).is_empty(),
+        Duration::from_secs(5),
+    );
     assert!(
-        wait_for(
-            || handle.frames().version() > settled,
-            Duration::from_secs(5)
-        ),
-        "the click's predicted position was composited before any server reply"
+        !avatar_rosters(&after).is_empty(),
+        "the click's predicted position was published as a roster before any server reply"
+    );
+    assert_eq!(
+        handle.frames().version(),
+        settled,
+        "a walk must not recomposite the board"
     );
 
     // The server is still told where we went: a `uLoc` went out alongside.
@@ -1151,7 +1181,9 @@ fn a_click_applies_the_local_move_before_the_frame_is_sent() {
         .into_iter()
         .find(|screen| screen.room_id == 901)
         .expect("a frame was composed");
-    let before = handle.frames().version();
+
+    // Drain the room-entry tail so only the click's own events are judged.
+    let _ = collect_events(&mut rx, |_| false, Duration::from_millis(150));
 
     // A floor click far outside the room clamps to the avatar margin.
     let floor = screen
@@ -1201,11 +1233,13 @@ fn a_click_applies_the_local_move_before_the_frame_is_sent() {
         "the server was told where the local avatar went"
     );
     assert!(
-        wait_for(
-            || handle.frames().version() > before,
-            Duration::from_secs(5)
-        ),
-        "the local move was composited without waiting for the server"
+        !avatar_rosters(&after).is_empty(),
+        "the local move was published as a roster without waiting for the server"
+    );
+    assert!(
+        screens(&after).is_empty(),
+        "the local move must not emit a Screen event: {:?}",
+        screens(&after)
     );
 
     handle.disconnect();
@@ -1270,11 +1304,11 @@ fn a_walk_click_is_applied_locally_then_sent_with_the_same_target() {
     cleanup(&seed);
 }
 
-/// A local move must ask for its own redraw in the click path, before the wire
-/// is touched and without waiting for any server frame. The trigger is the
-/// position change, so a no-op click must not ask for a redraw.
+/// A local move must publish its own roster in the click path, before the wire
+/// is touched and without waiting for any server frame, and it must not ask the
+/// board to redraw: the avatar is a sprite card over the board now.
 #[test]
-fn a_walk_click_requests_a_redraw_before_the_server_is_told() {
+fn a_walk_click_publishes_a_roster_and_not_a_board_redraw() {
     let fixture = logon_fixture();
     let (server, handle, mut rx, screen, cache, seed) =
         start_room_with_self(&fixture, "walk-redraw");
@@ -1287,6 +1321,7 @@ fn a_walk_click_requests_a_redraw_before_the_server_is_told() {
         screen.geometry.room_w as i32 - 22,
         screen.geometry.room_h as i32 - 22,
     );
+    let settled = settled_frame_version(&handle, Duration::from_secs(5));
 
     // Stop at the server send: every event before it came from the local path.
     handle.click(floor.x, floor.y);
@@ -1301,33 +1336,45 @@ fn a_walk_click_requests_a_redraw_before_the_server_is_told() {
     );
     let walk_notes: Vec<&str> = notes(&after)
         .into_iter()
-        .filter(|text| {
-            text.starts_with("walk: local apply")
-                || text.starts_with("walk: redraw requested")
-                || text.starts_with("walk: sent")
-        })
+        .filter(|text| text.starts_with("walk:"))
         .collect();
     assert_eq!(
         walk_notes.len(),
-        3,
-        "the move applies, requests a redraw, then tells the server: {walk_notes:?}"
+        2,
+        "the move applies then tells the server, with no redraw request: {walk_notes:?}"
     );
     assert!(
-        walk_notes[0].starts_with("walk: local apply")
-            && walk_notes[1].starts_with("walk: redraw requested")
-            && walk_notes[2].starts_with("walk: sent"),
-        "the redraw request is part of the local apply, before the send: {walk_notes:?}"
+        walk_notes[0].starts_with("walk: local apply") && walk_notes[1].starts_with("walk: sent"),
+        "the local apply is reported before the send: {walk_notes:?}"
     );
     let target = format!("to=({},{})", expected.0, expected.1);
     assert!(
-        walk_notes[0].contains(&target)
-            && walk_notes[1].contains(&target)
-            && walk_notes[2].contains(&target),
-        "every walk diagnostic names the clicked target: {walk_notes:?}"
+        walk_notes[0].contains(&target) && walk_notes[1].contains(&target),
+        "both diagnostics name the clicked target: {walk_notes:?}"
+    );
+    assert!(
+        !walk_notes
+            .iter()
+            .any(|text| text.starts_with("walk: redraw requested")),
+        "a walk must not request a board redraw: {walk_notes:?}"
+    );
+    assert!(
+        !avatar_rosters(&after).is_empty(),
+        "the walk published the avatar roster"
+    );
+    assert!(
+        screens(&after).is_empty(),
+        "the walk must not emit a Screen event: {:?}",
+        screens(&after)
+    );
+    assert_eq!(
+        handle.frames().version(),
+        settled,
+        "the board must not be recomposited by a walk"
     );
 
-    // The trigger is the change: clicking the same spot again moves nothing and
-    // so must not request another redraw.
+    // Clicking the same spot again moves nothing, so no redraw is requested and
+    // the board is still untouched.
     handle.click(floor.x, floor.y);
     let repeat = collect_events(
         &mut rx,
@@ -1354,11 +1401,284 @@ fn a_walk_click_requests_a_redraw_before_the_server_is_told() {
             .any(|text| text.starts_with("walk: redraw requested")),
         "a move that changes nothing must not request a redraw: {repeat_notes:?}"
     );
+    assert_eq!(
+        handle.frames().version(),
+        settled,
+        "a no-op click must not recomposite the board either"
+    );
 
     handle.disconnect();
     drop(server);
     cleanup(&cache);
     cleanup(&seed);
+}
+
+/// The core Stage 1 regression guard: a walk publishes `ClientEvent::Avatars`
+/// and never `ClientEvent::Screen`. Movement is a roster change, never a board
+/// change, so a walk that emits a Screen means an avatar slipped back into the
+/// composed picture.
+#[test]
+fn a_walk_publishes_the_roster_and_never_a_screen() {
+    let fixture = logon_fixture();
+    let (server, handle, mut rx, screen, cache, seed) =
+        start_room_with_self(&fixture, "walk-roster-only");
+
+    // Drain whatever room entry queued, so only the click's events are judged.
+    let _ = collect_events(&mut rx, |_| false, Duration::from_millis(150));
+    let settled = handle.frames().version();
+
+    let floor = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
+    handle.click(floor.x, floor.y);
+
+    let after = collect_events(
+        &mut rx,
+        |collected| {
+            !avatar_rosters(collected).is_empty()
+                && notes(collected)
+                    .iter()
+                    .any(|text| text.starts_with("walk: sent"))
+        },
+        Duration::from_secs(5),
+    );
+    // Give a late board recomposition a chance to show up before judging.
+    let late = collect_events(&mut rx, |_| false, Duration::from_millis(150));
+    let all: Vec<ClientEvent> = after.into_iter().chain(late).collect();
+
+    assert!(
+        !avatar_rosters(&all).is_empty(),
+        "the walk must publish ClientEvent::Avatars"
+    );
+    assert!(
+        screens(&all).is_empty(),
+        "the walk must not publish ClientEvent::Screen: {:?}",
+        screens(&all)
+    );
+    assert_eq!(
+        handle.frames().version(),
+        settled,
+        "the board must not be recomposited by a walk"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+/// The other half of the core guard: a genuine board change still publishes
+/// `ClientEvent::Screen`. The cutover removed avatars from the board, not the
+/// board itself.
+#[test]
+fn a_loose_prop_board_change_still_emits_a_screen() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let frames = room_only_frames(&fixture);
+    let tail = vec![prop_new_frame(
+        order,
+        4343,
+        0x0bad_f00d,
+        Point::new(120, 160),
+    )];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("board-change-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let props = seed_props_dir(&[4343], [0x20, 0xE0, 0x40]);
+    let mut cfg = config_for(server.port, cache.clone(), seed.clone());
+    cfg.seed_props = vec![props.clone()];
+    let (handle, stream) = ClientRuntime::spawn(cfg);
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .all(|screen| screen.loose_props == 0),
+        "the fixture room starts with no loose props"
+    );
+    let baseline_version = handle.frames().version();
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901 && screen.loose_props == 1)
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        !screens(&events).is_empty(),
+        "a genuine board change must publish ClientEvent::Screen: {:?}",
+        screens(&events)
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.loose_props == 1),
+        "the Screen reports the appended prop"
+    );
+    assert!(
+        handle.frames().version() > baseline_version,
+        "the board was recomposited"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+    cleanup(&props);
+}
+
+/// A click-to-walk publishes an avatar roster for the moved self, and a worn
+/// HEAD prop suppresses the built-in face in that roster. The roster is the only
+/// place avatars live now; the board carries none of it.
+#[test]
+fn a_walk_publishes_an_avatar_roster_for_the_moved_self() {
+    const HEAD_PROP: u32 = 7_701;
+
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(self_user_frame(order));
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("roster-cache");
+    let seed = seed_media_dir(&room);
+    let props = seed_head_prop_dir(HEAD_PROP, 7);
+    let mut cfg = config_for(server.port, cache.clone(), seed.clone());
+    cfg.seed_props = vec![props.clone()];
+    let (handle, stream) = ClientRuntime::spawn(cfg);
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+                && self_is_known(collected)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901)
+        .expect("a frame was composed")
+        .clone();
+
+    let target = (
+        screen.geometry.room_w as i32 - 22,
+        screen.geometry.room_h as i32 - 22,
+    );
+    let floor = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
+
+    // Wearing nothing: the roster names the moved self at its clamped target with
+    // exactly its built-in face.
+    handle.click(floor.x, floor.y);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.starts_with("walk: sent"))
+        },
+        Duration::from_secs(5),
+    );
+    let roster = avatar_rosters(&events)
+        .into_iter()
+        .last()
+        .expect("the walk published a roster");
+    assert_eq!(roster.room_id, 901, "the roster names the entered room");
+    let me = roster
+        .avatars
+        .iter()
+        .find(|avatar| avatar.is_self)
+        .expect("the moved self avatar is in the roster");
+    assert_eq!(
+        (me.x, me.y),
+        target,
+        "the roster reports the clamped move target"
+    );
+    assert_eq!(
+        me.parts.len(),
+        1,
+        "a prop-less avatar is exactly its face: {:?}",
+        me.parts
+    );
+    assert!(
+        matches!(me.parts[0].art, palace_client::AvatarArt::Face { .. }),
+        "the one part is the built-in face: {:?}",
+        me.parts[0].art
+    );
+
+    // Wear a HEAD prop and click again. Both commands travel the same channel in
+    // order, so the local worn list is set before the click is processed.
+    handle.set_props(vec![HEAD_PROP]);
+    assert!(
+        wait_for(
+            || server
+                .received_frames(order)
+                .iter()
+                .any(|frame| frame.opcode == opcode::USERPROP),
+            Duration::from_secs(5)
+        ),
+        "the worn HEAD prop reached the server, so the local list is set"
+    );
+    handle.click(floor.x, floor.y);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.starts_with("walk: sent"))
+        },
+        Duration::from_secs(5),
+    );
+    let roster = avatar_rosters(&events)
+        .into_iter()
+        .last()
+        .expect("the repeat walk published a roster");
+    let me = roster
+        .avatars
+        .iter()
+        .find(|avatar| avatar.is_self)
+        .expect("self");
+    assert!(
+        me.parts
+            .iter()
+            .all(|part| !matches!(part.art, palace_client::AvatarArt::Face { .. })),
+        "a worn HEAD prop suppresses the built-in face: {:?}",
+        me.parts
+    );
+    assert!(
+        me.parts.iter().any(
+            |part| matches!(part.art, palace_client::AvatarArt::Prop { id } if id == HEAD_PROP)
+        ),
+        "the head prop is the avatar's only art: {:?}",
+        me.parts
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+    cleanup(&props);
 }
 
 #[test]
@@ -1400,13 +1720,21 @@ fn an_agreeing_server_echo_does_not_recompose_the_frame() {
         .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
     handle.click(floor.x, floor.y);
 
-    // Wait for the click's own predicted frame and its local application.
+    // The click moves an avatar: it publishes the predicted roster at once and
+    // must not redraw the board, which no longer bakes avatars in.
+    let after = collect_events(
+        &mut rx,
+        |collected| !avatar_rosters(collected).is_empty(),
+        Duration::from_secs(5),
+    );
     assert!(
-        wait_for(
-            || handle.frames().version() > screen.version,
-            Duration::from_secs(5)
-        ),
-        "the click composited a local frame"
+        !avatar_rosters(&after).is_empty(),
+        "the click published its predicted roster"
+    );
+    assert_eq!(
+        handle.frames().version(),
+        screen.version,
+        "a walk must not recomposite the board"
     );
 
     // Now the server echoes the same position: reconciliation must be silent.
@@ -2404,14 +2732,18 @@ fn a_refused_room_change_restores_the_room_and_its_scripts() {
         |collected| {
             screens(collected)
                 .iter()
-                .any(|screen| screen.room_id == 901 && screen.version > before)
+                .any(|screen| screen.room_id == 901)
         },
         Duration::from_secs(10),
     );
     let screen = screens(&events)
         .into_iter()
-        .find(|screen| screen.room_id == 901 && screen.version > before)
+        .find(|screen| screen.room_id == 901)
         .expect("the restored room recomposited");
+    assert_eq!(
+        screen.version, before,
+        "the restored room has the same base bytes, so the content version is unchanged"
+    );
 
     let spot = room
         .hotspots
@@ -2980,7 +3312,6 @@ fn dimroom_percent_clamps_to_the_valid_range() {
     );
     assert!(!screens(&events).is_empty());
     let baseline = frame_luma(&handle);
-    let mut version = handle.frames().version();
 
     handle.run_script("150 DIMROOM");
     let events = collect_events(
@@ -2989,6 +3320,7 @@ fn dimroom_percent_clamps_to_the_valid_range() {
             notes(collected)
                 .iter()
                 .any(|text| text.contains("script: DIMROOM 150%"))
+                && !screens(collected).is_empty()
         },
         Duration::from_secs(10),
     );
@@ -2999,16 +3331,16 @@ fn dimroom_percent_clamps_to_the_valid_range() {
         "the out-of-range value reached the effect: {:?}",
         notes(&events)
     );
-    assert!(wait_for(
-        || handle.frames().version() > version,
-        Duration::from_secs(5)
-    ));
+    assert!(
+        !screens(&events).is_empty(),
+        "the clamped dim was composited into a frame"
+    );
     let over = frame_luma(&handle);
     assert!(
         (over - baseline).abs() < baseline * 0.02,
         "DIMROOM 150 saturates to undimmed ({over} vs {baseline})"
     );
-    version = handle.frames().version();
+    let version = handle.frames().version();
 
     handle.run_script("0 50 - DIMROOM");
     let events = collect_events(
@@ -3273,10 +3605,14 @@ fn frames_with_users_in_order(fixture: &Fixture, forward: bool) -> Vec<Vec<u8>> 
     frames
 }
 
-/// One run: serve `frames`, wait until every user is drawn, then capture the
-/// composited PNG. The frame is read after a viewport change forces a fresh
-/// composition, so the captured bytes are the same pipeline step in both runs.
-fn compose_and_capture(frames: Vec<Vec<u8>>, tag: &str) -> Vec<u8> {
+/// One run: serve `frames`, wait until the published roster holds every user,
+/// then capture the board PNG and that roster. Avatars are sprites over the
+/// board now, so the roster — not the board — is where an insertion-order leak
+/// would show up; both are captured so both can be compared.
+fn compose_and_capture(
+    frames: Vec<Vec<u8>>,
+    tag: &str,
+) -> (Vec<u8>, Vec<palace_client::AvatarState>) {
     let fixture = logon_fixture();
     let room = room_desc(&fixture);
     let server = MockServer::start(frames);
@@ -3286,72 +3622,35 @@ fn compose_and_capture(frames: Vec<Vec<u8>>, tag: &str) -> Vec<u8> {
         ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
     let mut rx = stream.into_receiver();
 
+    let holds_both = |roster: &palace_client::AvatarRoster| {
+        ORDER_USERS
+            .iter()
+            .all(|(id, ..)| roster.avatars.iter().any(|avatar| avatar.id == *id))
+    };
     let events = collect_events(
         &mut rx,
         |collected| {
             screens(collected)
                 .iter()
                 .any(|screen| screen.room_id == 901)
-                && user_lists(collected).iter().any(|users| {
-                    users.iter().any(|user| user.id == ORDER_USERS[0].0)
-                        && users.iter().any(|user| user.id == ORDER_USERS[1].0)
-                })
+                && avatar_rosters(collected)
+                    .iter()
+                    .any(|roster| holds_both(roster))
         },
         Duration::from_secs(20),
     );
-    let baseline = screens(&events)
-        .iter()
-        .find(|screen| screen.room_id == 901)
-        .map(|screen| screen.version)
-        .expect("a frame was composed");
-    assert!(
-        user_lists(&events).iter().any(|users| {
-            users.iter().any(|user| user.id == ORDER_USERS[0].0)
-                && users.iter().any(|user| user.id == ORDER_USERS[1].0)
-        }),
-        "both users arrived before the frame was captured"
-    );
-    // The user list is emitted before the next composition, so wait for the
-    // frame that actually has both of them before capturing anything.
-    let events = collect_events(
-        &mut rx,
-        |collected| {
-            screens(collected)
-                .iter()
-                .any(|screen| screen.room_id == 901 && screen.version >= baseline + 2)
-        },
-        Duration::from_secs(10),
-    );
-    assert!(
-        screens(&events)
-            .iter()
-            .any(|screen| screen.room_id == 901 && screen.version >= baseline + 2),
-        "the frame with both users was composed"
-    );
-
-    handle.set_viewport(1000.0, 700.0, 1.0, 1.0, false);
-    let events = collect_events(
-        &mut rx,
-        |collected| {
-            screens(collected)
-                .iter()
-                .any(|screen| screen.room_id == 901 && screen.version > baseline)
-        },
-        Duration::from_secs(10),
-    );
-    assert!(
-        screens(&events)
-            .iter()
-            .any(|screen| screen.room_id == 901 && screen.version > baseline),
-        "the settled frame was recomposed"
-    );
+    let roster = avatar_rosters(&events)
+        .into_iter()
+        .rfind(|roster| holds_both(roster))
+        .expect("a roster with both users was published");
+    let avatars = roster.avatars.clone();
     let png = handle.frames().png().expect("a frame was composited");
 
     handle.disconnect();
     drop(server);
     cleanup(&cache);
     cleanup(&seed);
-    png
+    (png, avatars)
 }
 
 /// Users are stored in a map and can arrive in any order; the composited frame
@@ -3360,22 +3659,28 @@ fn compose_and_capture(frames: Vec<Vec<u8>>, tag: &str) -> Vec<u8> {
 #[test]
 fn the_same_users_inserted_in_a_different_order_composite_byte_identical_frames() {
     let fixture = logon_fixture();
-    let forward = compose_and_capture(frames_with_users_in_order(&fixture, true), "forward");
-    let reversed = compose_and_capture(frames_with_users_in_order(&fixture, false), "reversed");
+    let (forward_png, forward_avatars) =
+        compose_and_capture(frames_with_users_in_order(&fixture, true), "forward");
+    let (reversed_png, reversed_avatars) =
+        compose_and_capture(frames_with_users_in_order(&fixture, false), "reversed");
     assert_eq!(
-        forward, reversed,
-        "the same room and users in a different insertion order must produce byte-identical frames"
+        forward_png, reversed_png,
+        "the same room in a different insertion order must produce a byte-identical board"
+    );
+    assert_eq!(
+        forward_avatars, reversed_avatars,
+        "the same users in a different insertion order must produce an identical roster"
     );
     // 512x384 at dpr 1: the captured PNG is the room, not the viewport.
     assert_eq!(
-        frame_rgba(&forward).len(),
+        frame_rgba(&forward_png).len(),
         512 * 384 * 4,
         "the captured frame is the room at dpr 1"
     );
 }
 
 #[test]
-fn a_remote_face_and_colour_change_update_the_user_and_recompose() {
+fn a_remote_face_and_colour_change_reaches_the_roster_not_the_board() {
     let fixture = logon_fixture();
     let order = fixture.byte_order;
     let room = room_desc(&fixture);
@@ -3419,19 +3724,23 @@ fn a_remote_face_and_colour_change_update_the_user_and_recompose() {
         "another user entered with face 1"
     );
     let baseline_png = handle.frames().png().expect("a frame was composited");
-    let baseline_version = handle.frames().version();
 
     gate.store(true, Ordering::Relaxed);
     let events = collect_events(
         &mut rx,
         |collected| {
-            let face = user_lists(collected)
-                .iter()
-                .any(|users| users.iter().any(|user| user.id == 21 && user.face == 7));
-            let color = user_lists(collected)
-                .iter()
-                .any(|users| users.iter().any(|user| user.id == 21 && user.color == 9));
-            face && color
+            let model = user_lists(collected).iter().any(|users| {
+                users
+                    .iter()
+                    .any(|user| user.id == 21 && user.face == 7 && user.color == 9)
+            });
+            let roster = avatar_rosters(collected).iter().any(|roster| {
+                roster
+                    .avatars
+                    .iter()
+                    .any(|avatar| avatar.id == 21 && avatar.face == 7 && avatar.color == 9)
+            });
+            model && roster
         },
         Duration::from_secs(10),
     );
@@ -3447,17 +3756,127 @@ fn a_remote_face_and_colour_change_update_the_user_and_recompose() {
             .any(|users| users.iter().any(|user| user.id == 21 && user.color == 9)),
         "USERCOLOR updated the other user's colour"
     );
-    assert!(
-        wait_for(
-            || handle.frames().version() > baseline_version,
-            Duration::from_secs(5)
-        ),
-        "the appearance change was composited into a new frame"
+    let roster = avatar_rosters(&events)
+        .into_iter()
+        .find(|roster| {
+            roster
+                .avatars
+                .iter()
+                .any(|avatar| avatar.id == 21 && avatar.face == 7 && avatar.color == 9)
+        })
+        .expect("the appearance change was published in the roster");
+    let other = roster
+        .avatars
+        .iter()
+        .find(|avatar| avatar.id == 21)
+        .expect("the other user is in the roster");
+    assert_eq!(
+        (other.face, other.color),
+        (7, 9),
+        "the roster carries the new face and colour"
     );
-    assert_ne!(
+    assert_eq!(
         handle.frames().png().as_deref(),
         Some(baseline_png.as_slice()),
-        "the composited frame changed when the other user's face and colour did"
+        "avatars no longer live in the base frame: an appearance change must not change it"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+/// A reported position is drawn at once: the frame that moves a remote user
+/// publishes the roster in the same pass, at exactly the reported spot. With no
+/// glide, that frame is the only trigger, so a missing publish would leave the
+/// avatar frozen until an unrelated event.
+#[test]
+fn a_remote_move_reaches_the_roster_at_the_reported_position_without_a_glide() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = room_only_frames(&fixture);
+    frames.push(user_new_frame(
+        order,
+        21,
+        "Other",
+        1,
+        2,
+        &[],
+        Point::new(120, 100),
+    ));
+    let tail = vec![user_move_frame(Point::new(150, 200), 21, order)
+        .encode(order)
+        .expect("uLoc encodes")];
+    let (server, gate) = MockServer::start_gated(frames, tail);
+    let cache = unique_temp_dir("remote-move-cache");
+    let seed = seed_solid_media_dir(&room, BRIGHT);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == 901)
+                && avatar_rosters(collected).iter().any(|roster| {
+                    roster
+                        .avatars
+                        .iter()
+                        .any(|avatar| avatar.id == 21 && avatar.x == 100 && avatar.y == 120)
+                })
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        avatar_rosters(&events).iter().any(|roster| {
+            roster
+                .avatars
+                .iter()
+                .any(|avatar| avatar.id == 21 && avatar.x == 100 && avatar.y == 120)
+        }),
+        "the remote user entered at the reported position"
+    );
+    let baseline_png = handle.frames().png().expect("a frame was composited");
+
+    gate.store(true, Ordering::Relaxed);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            avatar_rosters(collected).iter().any(|roster| {
+                roster
+                    .avatars
+                    .iter()
+                    .any(|avatar| avatar.id == 21 && avatar.x == 200 && avatar.y == 150)
+            })
+        },
+        Duration::from_secs(10),
+    );
+
+    let moved: Vec<_> = avatar_rosters(&events)
+        .into_iter()
+        .filter(|roster| roster.avatars.iter().any(|avatar| avatar.id == 21))
+        .collect();
+    assert!(!moved.is_empty(), "the remote move published a roster");
+    for roster in &moved {
+        let other = roster
+            .avatars
+            .iter()
+            .find(|avatar| avatar.id == 21)
+            .expect("the moved user is in the roster");
+        assert_eq!(
+            (other.x, other.y),
+            (200, 150),
+            "every roster after the move draws the user at the reported position, with no interpolation"
+        );
+    }
+    assert_eq!(
+        handle.frames().png().as_deref(),
+        Some(baseline_png.as_slice()),
+        "avatars live in the roster: a remote move must not change the board"
     );
 
     handle.disconnect();
@@ -3578,9 +3997,7 @@ fn a_script_rename_sends_a_usern_frame_with_our_id_and_name() {
             notes(collected)
                 .iter()
                 .any(|text| text.contains("script: SETUSERNAME \"Bob\""))
-                && screens(collected)
-                    .iter()
-                    .any(|screen| screen.room_id == 901 && screen.version > initial_version)
+                && !screens(collected).is_empty()
         },
         Duration::from_secs(10),
     );
@@ -3599,14 +4016,17 @@ fn a_script_rename_sends_a_usern_frame_with_our_id_and_name() {
         notes(&events)
     );
     assert!(
-        screens(&events)
-            .iter()
-            .any(|screen| screen.room_id == 901 && screen.version > initial_version),
-        "the rename was applied locally at once and forced a re-render: {:?}",
+        !screens(&events).is_empty(),
+        "the rename was applied locally at once and recomposed the screen: {:?}",
         screens(&events)
             .iter()
             .map(|screen| screen.version)
             .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        handle.frames().version(),
+        initial_version,
+        "a rename changes the name tag, not the board's bytes"
     );
 
     handle.disconnect();
@@ -3734,22 +4154,21 @@ fn a_usern_for_the_local_user_with_the_previous_name_reverts_it() {
     handle.run_script("\"Bob\" SETUSERNAME");
     let events = collect_events(
         &mut rx,
-        |collected| {
-            screens(collected)
-                .iter()
-                .any(|screen| screen.room_id == 901 && screen.version > entry_version)
-        },
+        |collected| !screens(collected).is_empty(),
         Duration::from_secs(10),
     );
     assert!(
-        screens(&events)
-            .iter()
-            .any(|screen| screen.room_id == 901 && screen.version > entry_version),
-        "the local rename was applied at once and forced a re-render: {:?}",
+        !screens(&events).is_empty(),
+        "the local rename was applied at once and recomposed the screen: {:?}",
         screens(&events)
             .iter()
             .map(|screen| screen.version)
             .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        handle.frames().version(),
+        entry_version,
+        "a rename changes the name tag, not the board's bytes"
     );
 
     // The documented failure path: the server reports the *previous* name back.
@@ -4397,14 +4816,17 @@ fn sent_room_goto(server: &MockServer, order: ByteOrder) -> Option<u16> {
 /// Room 887's `ON ENTER` arms a one-shot `1 ALARMEXEC` that rewrites door 1 and
 /// door 2's states on a later tick; a lock sent before it fires would be undone.
 /// Wait for that alarm's recompose — the only one after the first frame here —
-/// before a lock test acts.
-fn wait_for_entry_alarm(handle: &ClientHandle, screen: &ScreenState) {
-    let version = screen.version;
+/// before a lock test acts. The base version is a content identity now, so a
+/// recompose that leaves the board byte-identical would not move it; the
+/// published frame event is the signal that a recompose happened at all.
+fn wait_for_entry_alarm(rx: &mut UnboundedReceiver<ClientEvent>) {
+    let events = collect_events(
+        rx,
+        |collected| !screens(collected).is_empty(),
+        Duration::from_secs(5),
+    );
     assert!(
-        wait_for(
-            || handle.frames().version() > version,
-            Duration::from_secs(5)
-        ),
+        !screens(&events).is_empty(),
         "the room's entry alarm recomposed the frame"
     );
 }
@@ -4451,7 +4873,7 @@ fn a_click_on_a_plain_door_with_state_one_still_dispatches_select() {
         .find(|screen| screen.room_id == 887)
         .expect("a frame was composed for room 887");
     let (x, y) = hotspot_click(door, screen);
-    wait_for_entry_alarm(&handle, screen);
+    wait_for_entry_alarm(&mut rx);
 
     gate.store(true, Ordering::Relaxed);
     let events = collect_events(
@@ -5365,18 +5787,21 @@ fn a_setpos_script_moves_the_local_user_to_the_clamped_position() {
     let events = collect_events(
         &mut rx,
         |collected| {
-            screens(collected)
+            notes(collected)
                 .iter()
-                .any(|screen| screen.version > initial_version)
+                .any(|text| text.contains(&format!("SETPOS to ({},{})", expected.0, expected.1)))
+                && !screens(collected).is_empty()
         },
         Duration::from_secs(5),
     );
     assert!(
-        screens(&events)
-            .iter()
-            .any(|screen| screen.version > initial_version),
-        "the move forced a re-render: {:?}",
-        screens(&events)
+        !screens(&events).is_empty(),
+        "the move was applied locally at once and recomposed the screen"
+    );
+    assert_eq!(
+        handle.frames().version(),
+        initial_version,
+        "a move changes the avatar sprite, not the board's bytes"
     );
     assert!(
         notes(&events)
@@ -5541,7 +5966,8 @@ fn hiding_avatars_empties_the_scene_and_showing_restores_it() {
 fn set_avatar_sends_the_face_and_colour_frames_normalised() {
     let fixture = logon_fixture();
     let order = fixture.byte_order;
-    let (server, handle, _rx, screen, cache, seed) = start_room_with_self(&fixture, "set-avatar");
+    let (server, handle, mut rx, screen, cache, seed) =
+        start_room_with_self(&fixture, "set-avatar");
 
     handle.set_avatar(2, 3);
     assert!(
@@ -5625,9 +6051,31 @@ fn set_avatar_sends_the_face_and_colour_frames_normalised() {
         other => panic!("expected UserColor, got {other:?}"),
     }
 
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            avatar_rosters(collected).iter().any(|roster| {
+                roster
+                    .avatars
+                    .iter()
+                    .any(|avatar| avatar.is_self && avatar.face == 0 && avatar.color == 15)
+            })
+        },
+        Duration::from_secs(5),
+    );
     assert!(
-        handle.frames().version() > screen.version,
-        "the change re-rendered the frame without waiting for a server echo"
+        avatar_rosters(&events).iter().any(|roster| {
+            roster
+                .avatars
+                .iter()
+                .any(|avatar| avatar.is_self && avatar.face == 0 && avatar.color == 15)
+        }),
+        "the normalised face and colour reached the roster without a server echo"
+    );
+    assert_eq!(
+        handle.frames().version(),
+        screen.version,
+        "an appearance change does not recompose the board"
     );
 
     handle.disconnect();
@@ -5662,8 +6110,17 @@ fn ids_of(prop: &UserProp) -> Vec<i32> {
 fn set_props_sends_one_userprop_naming_us_and_the_worn_ids() {
     let fixture = logon_fixture();
     let order = fixture.byte_order;
-    let (server, handle, _rx, initial, cache, seed) =
+    let (server, handle, mut rx, initial, cache, seed) =
         start_room_with_self(&fixture, "set-props-send");
+    let entry = collect_events(
+        &mut rx,
+        |collected| !avatar_rosters(collected).is_empty(),
+        Duration::from_secs(5),
+    );
+    let before = avatar_rosters(&entry)
+        .last()
+        .map(|roster| roster.version)
+        .unwrap_or(0);
 
     handle.set_props(vec![10, 20, 30]);
     assert!(
@@ -5688,12 +6145,25 @@ fn set_props_sends_one_userprop_naming_us_and_the_worn_ids() {
         "the reference sends crc 0 for the art it has not uploaded"
     );
 
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            avatar_rosters(collected)
+                .iter()
+                .any(|roster| roster.version > before)
+        },
+        Duration::from_secs(5),
+    );
     assert!(
-        wait_for(
-            || handle.frames().version() > initial.version,
-            Duration::from_secs(5)
-        ),
-        "the change re-rendered the frame without waiting for a server echo"
+        avatar_rosters(&events)
+            .iter()
+            .any(|roster| roster.version > before),
+        "the worn list published a fresh roster without a server echo"
+    );
+    assert_eq!(
+        handle.frames().version(),
+        initial.version,
+        "worn props change the avatar sprite, not the board"
     );
 
     handle.disconnect();
@@ -5959,15 +6429,15 @@ fn a_worn_list_longer_than_nine_is_clamped_and_reported() {
     cleanup(&seed);
 }
 
-/// The name a frame draws above an avatar is the name the wire carried in the
-/// `UserRec`, and it is rasterized for the *specific* string on the spec — not
-/// just "some tag". The same test checks that the prop filter still wins: a user
-/// whose prop art never arrives is skipped, so they must get no tag at all.
+/// The name a roster card draws is the name the wire carried in the `UserRec`,
+/// and the board must not carry it: toggling names may only change the roster,
+/// never a board layer. The prop filter still wins — a user whose prop art never
+/// arrived is skipped from the roster entirely.
 ///
 /// This is the guard that failed while `avatar_specs` left `AvatarSpec::name`
 /// `None`: every tag was silently suppressed and the whole suite stayed green.
 #[test]
-fn a_named_user_reaches_the_frame_as_a_name_tag() {
+fn a_named_user_reaches_the_roster_and_not_the_board() {
     const NAME: &str = "Alpha";
     const GHOST: &str = "Ghost";
     const OTHER_ID: i32 = 77;
@@ -6015,7 +6485,12 @@ fn a_named_user_reaches_the_frame_as_a_name_tag() {
     }
     let events = collect_events(
         &mut rx,
-        |collected| screens(collected).iter().any(drawn_and_skipped),
+        |collected| {
+            screens(collected).iter().any(drawn_and_skipped)
+                && avatar_rosters(collected)
+                    .iter()
+                    .any(|roster| roster.avatars.iter().any(|avatar| avatar.name == NAME))
+        },
         Duration::from_secs(20),
     );
     let screen = screens(&events)
@@ -6027,108 +6502,90 @@ fn a_named_user_reaches_the_frame_as_a_name_tag() {
         screen.avatars, 1,
         "the prop filter still skips the user whose art has not arrived"
     );
-
-    // A settled frame with names visible, then the same frame with names off.
-    // Avatars stay on, so the only difference is the tags.
-    let visible_version = settled_frame_version(&handle, Duration::from_secs(5));
-    let with_names = frame_rgba(&handle.frames().png().expect("a composed frame"));
-    handle.set_visibility(false, true);
-    assert!(
-        wait_for(
-            || handle.frames().version() > visible_version,
-            Duration::from_secs(5)
-        ),
-        "toggling names re-rendered the frame"
-    );
-    settled_frame_version(&handle, Duration::from_secs(5));
-    let without_names = frame_rgba(&handle.frames().png().expect("a composed frame"));
-
-    let width = screen.geometry.bitmap_w as usize;
-    let height = screen.geometry.bitmap_h as i64;
-    let room_w = screen.geometry.room_w as i32;
-    let room_h = screen.geometry.room_h as i32;
-    // The tag blit origin, exactly as `draw_name_tag` computes it.
-    let tag_origin = |name: &str, anchor: (i32, i32)| {
-        let tag = palace_render::name_tag(name).expect("the name rasterizes");
-        let (text_x, text_y) = palace_render::name_tag_position(anchor.0, anchor.1, tag.text_width);
-        let (origin_x, origin_y) = (tag.origin_x, tag.origin_y);
-        (
-            tag,
-            (text_x - f64::from(origin_x)).floor() as i64,
-            (text_y - f64::from(origin_y)).floor() as i64,
-        )
-    };
-    // The wire name's fully opaque glyph pixels must be pure white exactly at the
-    // reference placement. A `None` name draws nothing, so this assertion is what
-    // catches the regression.
-    let alpha = palace_render::clamp_avatar_position(240, 200, room_w, room_h);
-    let (tag, blit_x, blit_y) = tag_origin(NAME, alpha);
-    let mut opaque = 0usize;
-    let mut changed = 0usize;
-    for sy in 0..tag.image.height() {
-        for sx in 0..tag.image.width() {
-            let Some(pixel) = tag.image.pixel(sx, sy) else {
-                continue;
-            };
-            if pixel[3] != 255 {
-                continue;
-            }
-            let dx = blit_x + i64::from(sx);
-            let dy = blit_y + i64::from(sy);
-            if dx < 0 || dy < 0 || dx >= width as i64 || dy >= height {
-                continue;
-            }
-            let at = (dy as usize * width + dx as usize) * 4;
-            opaque += 1;
-            assert_eq!(
-                with_names[at..at + 4],
-                pixel,
-                "the tag for {NAME} must be drawn at ({dx},{dy})"
-            );
-            if with_names[at..at + 4] != without_names[at..at + 4] {
-                changed += 1;
-            }
-        }
-    }
-    assert!(
-        opaque > 0,
-        "the name {NAME} has fully opaque glyph pixels to find"
-    );
-    assert!(changed > 0, "the tag is drawn only while names are visible");
-
-    // The prop filter wins over the name: the skipped user's glyph pixels must
-    // stay un-drawn, proving the two rules do not contradict each other.
-    let ghost_anchor = palace_render::clamp_avatar_position(100, 100, room_w, room_h);
-    let (ghost_tag, ghost_blit_x, ghost_blit_y) = tag_origin(GHOST, ghost_anchor);
-    let mut ghost_opaque = 0usize;
-    let mut ghost_matched = 0usize;
-    for sy in 0..ghost_tag.image.height() {
-        for sx in 0..ghost_tag.image.width() {
-            let Some(pixel) = ghost_tag.image.pixel(sx, sy) else {
-                continue;
-            };
-            if pixel[3] != 255 {
-                continue;
-            }
-            let dx = ghost_blit_x + i64::from(sx);
-            let dy = ghost_blit_y + i64::from(sy);
-            if dx < 0 || dy < 0 || dx >= width as i64 || dy >= height {
-                continue;
-            }
-            ghost_opaque += 1;
-            let at = (dy as usize * width + dx as usize) * 4;
-            if with_names[at..at + 4] == pixel {
-                ghost_matched += 1;
-            }
-        }
-    }
-    assert!(
-        ghost_opaque > 0,
-        "the skipped name has opaque pixels to look for"
+    let roster = avatar_rosters(&events)
+        .into_iter()
+        .find(|roster| roster.avatars.iter().any(|avatar| avatar.name == NAME))
+        .expect("the named user is in the roster");
+    assert_eq!(
+        roster.avatars.len(),
+        1,
+        "only the user whose art arrived is in the roster: {:?}",
+        roster.avatars
     );
     assert_eq!(
-        ghost_matched, 0,
-        "a user whose prop art never arrived must not be tagged"
+        roster.avatars[0].name, NAME,
+        "the roster carries the name the wire sent"
+    );
+    assert!(
+        roster.avatars.iter().all(|avatar| avatar.name != GHOST),
+        "a user whose prop art never arrived is not in the roster"
+    );
+    assert!(roster.name_tags_visible, "names start visible");
+
+    // Toggling names off must not change any board layer: the tags belong to
+    // the roster's sprite layer, not the picture. The avatar stays in the roster.
+    let base_before = handle.frames().png();
+    let mid_before = handle.frames().mid_png();
+    let top_before = handle.frames().top_png();
+    handle.set_visibility(false, true);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            avatar_rosters(collected)
+                .iter()
+                .any(|roster| !roster.name_tags_visible)
+        },
+        Duration::from_secs(5),
+    );
+    let hidden_names = avatar_rosters(&events)
+        .into_iter()
+        .find(|roster| !roster.name_tags_visible)
+        .expect("hiding names published a roster with the tags off");
+    assert!(
+        hidden_names
+            .avatars
+            .iter()
+            .any(|avatar| avatar.name == NAME),
+        "the named avatar is still in the roster while tags are hidden"
+    );
+    assert_eq!(
+        handle.frames().png(),
+        base_before,
+        "the base layer must not carry name tags"
+    );
+    assert_eq!(
+        handle.frames().mid_png(),
+        mid_before,
+        "the middle layer must not carry name tags"
+    );
+    assert_eq!(
+        handle.frames().top_png(),
+        top_before,
+        "the top layer must not carry name tags"
+    );
+
+    // Hiding avatars empties the roster and still leaves every board layer alone.
+    let base_before = handle.frames().png();
+    handle.set_visibility(true, false);
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            avatar_rosters(collected)
+                .iter()
+                .any(|roster| roster.avatars.is_empty())
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        avatar_rosters(&events)
+            .iter()
+            .any(|roster| roster.avatars.is_empty()),
+        "hiding avatars emptied the roster"
+    );
+    assert_eq!(
+        handle.frames().png(),
+        base_before,
+        "the base layer must not carry avatars"
     );
 
     handle.disconnect();
@@ -6138,7 +6595,7 @@ fn a_named_user_reaches_the_frame_as_a_name_tag() {
 }
 
 #[test]
-fn a_chat_message_reaches_the_frame_as_chat_text() {
+fn a_chat_message_reaches_the_top_layer_as_chat_text() {
     const SPEAKER: &str = "Alpha";
     const SPEAKER_ID: i32 = 77;
     const MESSAGE: &str = "hello there";
@@ -6180,8 +6637,8 @@ fn a_chat_message_reaches_the_frame_as_chat_text() {
         .expect("the speaker was drawn")
         .clone();
 
-    let before_version = settled_frame_version(&handle, Duration::from_secs(5));
-    let before = frame_rgba(&handle.frames().png().expect("a composed frame"));
+    let before_base = handle.frames().png();
+    let before_top = handle.frames().top_png();
 
     gate.store(true, Ordering::Relaxed);
     let events = collect_events(
@@ -6196,17 +6653,25 @@ fn a_chat_message_reaches_the_frame_as_chat_text() {
     );
     assert!(
         wait_for(
-            || handle.frames().version() > before_version,
+            || handle.frames().top_png() != before_top,
             Duration::from_secs(5)
         ),
-        "the chat line recomposed the frame"
+        "the chat line created the top board layer"
     );
-    settled_frame_version(&handle, Duration::from_secs(5));
-    let after = frame_rgba(&handle.frames().png().expect("a composed frame"));
-    assert_ne!(before, after, "the chat text changed the composed frame");
+    let top = handle
+        .frames()
+        .top_png()
+        .expect("the chat text lives in the top layer");
+    assert_eq!(
+        handle.frames().png(),
+        before_base,
+        "chat text must not change the base layer"
+    );
 
-    // The chat text must appear at exactly the reference placement: the
-    // speaker's clamped avatar anchor, the 20 px gap, and the rasterized image.
+    // The chat text must appear in the top layer at exactly the reference
+    // placement: the speaker's clamped avatar anchor, the 20 px gap, and the
+    // rasterized image.
+    let top_rgba = frame_rgba(&top);
     let width = screen.geometry.bitmap_w as usize;
     let height = screen.geometry.bitmap_h as i64;
     let anchor = palace_render::clamp_avatar_position(
@@ -6250,7 +6715,7 @@ fn a_chat_message_reaches_the_frame_as_chat_text() {
             let at = (dy as usize * width + dx as usize) * 4;
             opaque += 1;
             assert_eq!(
-                after[at..at + 4],
+                top_rgba[at..at + 4],
                 pixel,
                 "the chat text for {MESSAGE} must be drawn at ({dx},{dy})"
             );
@@ -6326,11 +6791,11 @@ fn a_spot_move_for_this_room_recomposes_and_a_foreign_one_does_not() {
         },
         Duration::from_secs(20),
     );
-    let screen = screens(&events)
-        .into_iter()
-        .find(|screen| screen.room_id == 887)
-        .expect("a frame was composed for room 887");
-    wait_for_entry_alarm(&handle, screen);
+    assert!(
+        screens(&events).iter().any(|screen| screen.room_id == 887),
+        "a frame was composed for room 887"
+    );
+    wait_for_entry_alarm(&mut rx);
     let before = settled_frame_version(&handle, Duration::from_secs(5));
 
     // The foreign move: the PONG proves the runtime ran it, and the version must
@@ -6351,8 +6816,13 @@ fn a_spot_move_for_this_room_recomposes_and_a_foreign_one_does_not() {
         after_foreign, before,
         "a move aimed at room 999 must not recompose this room"
     );
+    // Drop anything buffered before the in-room move so its recompose is the
+    // only frame event this window can see.
+    let _ = collect_events(&mut rx, |_| false, Duration::from_millis(50));
 
-    // The in-room move: it must recompose.
+    // The in-room move: it must recompose. The base version is a content
+    // identity, so a recompose whose board bytes are unchanged keeps it; the
+    // published frame event is the signal that a recompose happened.
     local_gate.store(true, Ordering::Relaxed);
     assert!(
         wait_for(
@@ -6364,11 +6834,13 @@ fn a_spot_move_for_this_room_recomposes_and_a_foreign_one_does_not() {
         ),
         "the in-room spot move was processed"
     );
+    let events = collect_events(
+        &mut rx,
+        |collected| !screens(collected).is_empty(),
+        Duration::from_secs(5),
+    );
     assert!(
-        wait_for(
-            || handle.frames().version() > before,
-            Duration::from_secs(5)
-        ),
+        !screens(&events).is_empty(),
         "the move aimed at room 887 recomposed the frame"
     );
 

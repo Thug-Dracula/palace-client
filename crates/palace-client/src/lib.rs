@@ -24,6 +24,8 @@
 )]
 
 pub mod assets;
+pub mod avatar_images;
+pub mod avatars;
 pub mod error;
 pub mod frame;
 pub mod runtime;
@@ -33,6 +35,8 @@ pub mod state;
 pub mod trace;
 pub mod xtlk;
 
+pub use avatar_images::{encode_face_cell, AvatarImageStore};
+pub use avatars::{AvatarArt, AvatarPartState, AvatarRoster, AvatarState};
 pub use error::{ClientError, Result};
 pub use frame::{FrameStore, ScreenState, ViewGeometry};
 pub use palace_wire::messages::{ClientIdentity, Puid};

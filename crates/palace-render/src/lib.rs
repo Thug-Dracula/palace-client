@@ -77,8 +77,8 @@ pub use chattext::{
     CHAT_X_GAP, CHAT_Y_OFFSET, MAX_CHAT_TEXT_CHARS,
 };
 pub use compositor::{
-    draw_above_into, draw_base_into, draw_into, render, render_base, sort_avatars, AnimationClock,
-    RenderOptions,
+    draw_above_into, draw_base_into, draw_into, render, render_base, render_mid, render_top,
+    sort_avatars, AnimationClock, RenderOptions,
 };
 pub use corpus::RoomSource;
 pub use draw::{
@@ -95,8 +95,8 @@ pub use nametag::{
     NAME_TAG_FONT_PX, NAME_TAG_GLOW_RADIUS, NAME_TAG_X_FUDGE, NAME_TAG_Y_OFFSET,
 };
 pub use scene::{
-    layer_for_hotspot_flags, Avatar, AvatarPart, Layer, Scene, Sprite, FLAG_PICTURES_ABOVE_ALL,
-    FLAG_PICTURES_ABOVE_NAME_TAGS, FLAG_PICTURES_ABOVE_PROPS,
+    layer_for_hotspot_flags, Avatar, AvatarPart, AvatarPartArt, Layer, Scene, Sprite,
+    FLAG_PICTURES_ABOVE_ALL, FLAG_PICTURES_ABOVE_NAME_TAGS, FLAG_PICTURES_ABOVE_PROPS,
 };
 pub use viewport::{
     clamp_dpr, clamp_zoom, room_size_from_background, PointF, RectF, ScaleMode, SizeF,

@@ -1,5 +1,6 @@
 import type {
   AudioState,
+  AvatarRoster,
   ChatLine,
   ClientEvent,
   ConnectionStatus,
@@ -51,6 +52,7 @@ class PalaceStore {
   room = $state<RoomInfo | null>(null);
   chat = $state<LocalChatLine[]>([]);
   screen = $state<ScreenState | null>(null);
+  avatars = $state<AvatarRoster | null>(null);
   tooltip = $state<string | null>(null);
   notes = $state<string[]>([]);
   notices = $state<string[]>([]);
@@ -166,6 +168,11 @@ class PalaceStore {
       case "status":
         this.status = event.status;
         this.statusMessage = event.message;
+        // A roster is only meaningful while a session is live; drop it on the
+        // way out so a reconnect cannot paint stale sprites over a new room.
+        if (event.status === "disconnected" || event.status === "error") {
+          this.avatars = null;
+        }
         break;
       case "banner":
         this.banner = event.banner;
@@ -178,6 +185,7 @@ class PalaceStore {
         break;
       case "room_entered":
         this.room = event.room;
+        this.avatars = null;
         break;
       case "chat":
         this.pushLine(event.line);
@@ -185,6 +193,9 @@ class PalaceStore {
       case "screen":
         this.screen = event.screen;
         this.notes = event.screen.notes;
+        break;
+      case "avatars":
+        this.avatars = event.roster;
         break;
       case "tooltip":
         this.tooltip = event.text;

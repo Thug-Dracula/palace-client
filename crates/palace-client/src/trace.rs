@@ -43,6 +43,10 @@
 //!   notes the failure once on stderr. Tracing can never break a session.
 //! * **Thread-safe.** One [`Mutex`] guards the sink; the runtime may log from the
 //!   network thread and the media thread.
+//! * **Bounded.** A file sink is capped at [`MAX_BYTES`]; when it fills it is
+//!   rotated to `<path>.1`, older archives are shifted down, and only
+//!   [`MAX_ARCHIVES`] are kept. stderr has no cap because it is not ours to
+//!   rotate.
 //! * **Readable while running.** Every line is flushed as it is written.
 //! * **Behaviour-neutral.** No control flow reads the tracing state.
 //!
@@ -52,9 +56,9 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -81,6 +85,19 @@ pub const DUMP_VARS_ENV_VAR: &str = "PALACE_DUMP_VARS";
 /// echo arbitrarily long chat, and a trace must not grow an unbounded line.
 const MAX_LINE: usize = 4096;
 
+/// Largest active trace file before it is rotated.
+///
+/// Traces are far more verbose than the app log (`logging.rs` caps that one at
+/// 5 MiB), so this cap is deliberately larger; a single archive preserves the
+/// most recent context across a rotation while the total on disk stays bounded.
+pub const MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// How many rotated trace files are kept (`<path>.1` through `<path>.N`).
+///
+/// One archive is enough for a trace: it keeps the run-up to the rotation
+/// alongside the fresh active file without letting disk use grow without bound.
+pub const MAX_ARCHIVES: u32 = 1;
+
 /// The process-wide tracer, or `None` while tracing is off.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// The installed tracer. Replaced only by [`install`].
@@ -106,8 +123,71 @@ pub struct Tracer {
 }
 
 enum Sink {
-    File(File),
+    File(FileSink),
     Stderr,
+}
+
+/// One open trace file plus its rotation policy.
+///
+/// The file handle and the written-byte counter live together so that a single
+/// [`Mutex`] — the one on [`Tracer::sink`] — guards both. The write path only
+/// has `&self`, so the counter is interior-mutable rather than reset by the
+/// caller.
+struct FileSink {
+    file: File,
+    path: PathBuf,
+    written: u64,
+    max_bytes: u64,
+    max_archives: u32,
+}
+
+impl FileSink {
+    /// Open `path` for appending, honouring any bytes already there.
+    fn open(path: &Path, max_bytes: u64, max_archives: u32) -> io::Result<FileSink> {
+        let file = open_append(path)?;
+        let written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+        Ok(FileSink {
+            file,
+            path: path.to_path_buf(),
+            written,
+            max_bytes,
+            max_archives,
+        })
+    }
+
+    /// Append one framed line, rotating first when it would cross the cap.
+    ///
+    /// Rotation is best effort: if the rename or reopen fails the bytes are
+    /// still appended to the file that is open, so tracing degrades to plain
+    /// appending instead of panicking or dropping the tracer.
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.written.saturating_add(bytes.len() as u64) > self.max_bytes {
+            let _ = self.rotate();
+        }
+        self.file.write_all(bytes)?;
+        self.file.flush()?;
+        self.written = self.written.saturating_add(bytes.len() as u64);
+        Ok(())
+    }
+
+    /// Shift the archives down, move the active file to `.1`, and reopen empty.
+    fn rotate(&mut self) -> io::Result<()> {
+        if self.max_archives > 0 {
+            let _ = fs::remove_file(archive_path(&self.path, self.max_archives));
+            for index in (1..self.max_archives).rev() {
+                let from = archive_path(&self.path, index);
+                if from.exists() {
+                    let _ = fs::rename(&from, archive_path(&self.path, index + 1));
+                }
+            }
+            let _ = fs::rename(&self.path, archive_path(&self.path, 1));
+        } else {
+            let _ = fs::remove_file(&self.path);
+        }
+        self.file = open_append(&self.path)?;
+        self.written = 0;
+        Ok(())
+    }
 }
 
 impl Tracer {
@@ -116,11 +196,16 @@ impl Tracer {
     /// Returns the I/O error rather than panicking; [`start_from_env`] turns
     /// that into an inert no-op.
     pub fn to_path(path: impl AsRef<Path>) -> io::Result<Tracer> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path.as_ref())?;
-        Ok(Tracer::new(Sink::File(file)))
+        Tracer::to_path_with_limits(path.as_ref(), MAX_BYTES, MAX_ARCHIVES)
+    }
+
+    /// Open a trace file with an explicit rotation policy.
+    ///
+    /// [`to_path`] supplies the published [`MAX_BYTES`] and [`MAX_ARCHIVES`];
+    /// tests supply a small cap so the boundary is crossed in a few writes.
+    fn to_path_with_limits(path: &Path, max_bytes: u64, max_archives: u32) -> io::Result<Tracer> {
+        let sink = FileSink::open(path, max_bytes, max_archives)?;
+        Ok(Tracer::new(Sink::File(sink)))
     }
 
     /// Trace to stderr, for `PALACE_TRACE=1` / `PALACE_TRACE=stderr`.
@@ -260,12 +345,25 @@ impl Tracer {
 
 fn write_sink(sink: &mut Sink, bytes: &[u8]) -> io::Result<()> {
     match sink {
-        Sink::File(file) => file.write_all(bytes).and_then(|()| file.flush()),
+        Sink::File(file) => file.append(bytes),
         Sink::Stderr => {
             let mut stderr = io::stderr().lock();
             stderr.write_all(bytes).and_then(|()| stderr.flush())
         }
     }
+}
+
+/// Open `path` for appending, creating it if it does not exist.
+fn open_append(path: &Path) -> io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// `<path>.1` for `index` 1, and so on — the rotation naming convention shared
+/// with the desktop shell's log.
+fn archive_path(path: &Path, index: u32) -> PathBuf {
+    let mut name: OsString = path.as_os_str().to_os_string();
+    name.push(format!(".{index}"));
+    PathBuf::from(name)
 }
 
 /// The process-wide tracer, or `None` while tracing is off.
@@ -436,6 +534,12 @@ pub fn describe_client_event(event: &ClientEvent) -> String {
             screen.loose_props,
             screen.props_pending
         ),
+        ClientEvent::Avatars { roster } => format!(
+            "[avatars] v{} room {} count={}",
+            roster.version,
+            roster.room_id,
+            roster.avatars.len()
+        ),
         ClientEvent::Script {
             event,
             fired,
@@ -531,6 +635,14 @@ pub fn worn_props(user_id: i32, props: &[AssetSpec]) {
     if let Some(tracer) = tracer() {
         tracer.worn_props(user_id, props);
     }
+}
+
+/// An avatar roster was published: how many avatars, and how many JSON bytes.
+pub fn avatar_roster(count: usize, bytes: usize) {
+    let Some(tracer) = tracer() else {
+        return;
+    };
+    tracer.state(&format!("avatar_roster count={count} bytes={bytes}"));
 }
 
 /// The signed-in user's own move was applied to the model before the wire.
@@ -844,6 +956,75 @@ mod tests {
         assert!(text.contains("nav_request room=4"), "{text}");
         assert!(text.contains("worn_props user=7 ids=[99]"), "{text}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_write_past_the_cap_rotates_the_file_and_keeps_one_archive() {
+        let path = temp_path("rotate");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(archive_path(&path, 1));
+        let tracer = Tracer::to_path_with_limits(&path, 200, MAX_ARCHIVES).expect("opens");
+
+        for index in 0..10 {
+            tracer.state(&format!("line {index} {}", "x".repeat(40)));
+        }
+
+        let archive = archive_path(&path, 1);
+        assert!(archive.is_file(), "crossing the cap creates a .1 archive");
+        let active = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        assert!(
+            active <= 200,
+            "the active file stays under the cap: {active}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&archive);
+    }
+
+    #[test]
+    fn rotation_never_keeps_more_than_max_archives() {
+        let path = temp_path("archive-cap");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(archive_path(&path, 1));
+        let tracer = Tracer::to_path_with_limits(&path, 200, MAX_ARCHIVES).expect("opens");
+
+        for index in 0..100 {
+            tracer.state(&format!("line {index} {}", "y".repeat(60)));
+        }
+
+        assert!(
+            archive_path(&path, 1).is_file(),
+            "at least one rotation happened"
+        );
+        assert!(
+            !archive_path(&path, 2).exists(),
+            "no archive past MAX_ARCHIVES is kept"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(archive_path(&path, 1));
+    }
+
+    #[test]
+    fn the_trace_text_still_reaches_the_active_file_after_rotation() {
+        let path = temp_path("rotate-text");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(archive_path(&path, 1));
+        let tracer = Tracer::to_path_with_limits(&path, 200, MAX_ARCHIVES).expect("opens");
+
+        for index in 0..6 {
+            tracer.state(&format!("filler {index} {}", "z".repeat(60)));
+        }
+        tracer.state("the final marker survives");
+
+        let text = read(&path);
+        assert!(
+            text.contains("the final marker survives"),
+            "the newest text lands in the active file: {text}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(archive_path(&path, 1));
     }
 
     #[test]

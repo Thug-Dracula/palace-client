@@ -157,6 +157,36 @@ pub fn render_base(scene: &Scene, options: RenderOptions) -> Canvas {
     canvas
 }
 
+/// Render only the middle above-avatar layers: the "above avatars" overlay band
+/// and the front paint layer.
+///
+/// The canvas starts fully transparent — this is a layer to stack over a frame
+/// the caller already holds, not a frame in its own right. It has the same
+/// device size a [`render`] of the same scene would produce. Use [`render`] for
+/// one composited frame.
+#[must_use]
+pub fn render_mid(scene: &Scene, options: RenderOptions) -> Canvas {
+    let (width, height) = scene.logical_size();
+    let mut canvas = Canvas::for_room(width, height, options.dpr);
+    draw_mid_into(&mut canvas, scene, options.clock);
+    canvas
+}
+
+/// Render only the top layers above the name tags: the "above name tags" overlay
+/// band, the chat text and the "above everything" overlay band.
+///
+/// The canvas starts fully transparent — this is a layer to stack over a frame
+/// the caller already holds, not a frame in its own right. It has the same
+/// device size a [`render`] of the same scene would produce. Use [`render`] for
+/// one composited frame.
+#[must_use]
+pub fn render_top(scene: &Scene, options: RenderOptions) -> Canvas {
+    let (width, height) = scene.logical_size();
+    let mut canvas = Canvas::for_room(width, height, options.dpr);
+    draw_top_into(&mut canvas, scene, options.clock);
+    canvas
+}
+
 /// Draw the below-avatar layers of `scene` onto `canvas`.
 pub fn draw_base_into(canvas: &mut Canvas, scene: &Scene) {
     canvas.fill(scene.backdrop);
@@ -170,8 +200,40 @@ pub fn draw_base_into(canvas: &mut Canvas, scene: &Scene) {
     blit_layer(canvas, &scene.loose_props);
 }
 
+/// Draw the middle layers above the avatars: the "above avatars" overlays and
+/// the front paint layer.
+///
+/// This is the lower half of the above-avatar tail. It stops below the name-tag
+/// band, so a caller can stack the avatars and name tags it owns around a
+/// mid/top pair instead of receiving them baked into one composited frame.
+///
+/// Draw onto a canvas that already holds the base layers from [`draw_base_into`]
+/// and the avatars, exactly as [`draw_above_into`] does.
+pub fn draw_mid_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationClock) {
+    blit_layer(canvas, &scene.overlays_above_avatars);
+    crate::draw::rasterize_front(canvas, &scene.draw);
+}
+
+/// Draw the top layers above the name tags: the "above name tags" overlays, the
+/// chat text and the "above everything" overlays.
+///
+/// This is the upper half of the above-avatar tail. See [`draw_mid_into`] for
+/// why the tail is split and [`draw_above_into`] for how the two halves bracket
+/// the name-tag band.
+pub fn draw_top_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationClock) {
+    blit_layer(canvas, &scene.overlays_above_name_tags);
+    for chat in &scene.chat {
+        crate::chattext::draw_chat_text(canvas, chat);
+    }
+    blit_layer(canvas, &scene.overlays_above_everything);
+}
+
 /// Draw the avatars and every layer above them onto a canvas that already holds
 /// the base layers from [`draw_base_into`] or [`render_base`].
+///
+/// The tail above the avatars is [`draw_mid_into`], then the name-tag band, then
+/// [`draw_top_into`]: the same pixels as one pass, but with the mid and top
+/// layers separately addressable.
 pub fn draw_above_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationClock) {
     let mut avatars = scene.avatars.clone();
     sort_avatars(&mut avatars);
@@ -179,8 +241,7 @@ pub fn draw_above_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationCloc
         draw_avatar(canvas, avatar);
     }
 
-    blit_layer(canvas, &scene.overlays_above_avatars);
-    crate::draw::rasterize_front(canvas, &scene.draw);
+    draw_mid_into(canvas, scene, _clock);
     if scene.name_tags_visible {
         for avatar in &avatars {
             if let Some(name) = avatar.name.as_deref() {
@@ -188,11 +249,7 @@ pub fn draw_above_into(canvas: &mut Canvas, scene: &Scene, _clock: AnimationCloc
             }
         }
     }
-    blit_layer(canvas, &scene.overlays_above_name_tags);
-    for chat in &scene.chat {
-        crate::chattext::draw_chat_text(canvas, chat);
-    }
-    blit_layer(canvas, &scene.overlays_above_everything);
+    draw_top_into(canvas, scene, _clock);
 }
 
 /// Blit one layer, stably ordered by each sprite's `z` key.
@@ -224,8 +281,9 @@ fn draw_avatar(canvas: &mut Canvas, avatar: &Avatar) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::AvatarPart;
+    use crate::scene::{AvatarPart, AvatarPartArt};
     use palace_prop::PropImage;
+    use palace_room::{draw_cmd, draw_flags, DrawCmd, DrawPayload, Point};
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const GREEN: [u8; 4] = [0, 255, 0, 255];
@@ -252,6 +310,7 @@ mod tests {
                 dx: 0,
                 dy: 0,
                 alpha: 1.0,
+                art: AvatarPartArt::Prop { id: 1 },
             }],
             name: None,
         }
@@ -275,6 +334,7 @@ mod tests {
                 dx: -(size as i32) / 2,
                 dy: -(size as i32) / 2,
                 alpha: 1.0,
+                art: AvatarPartArt::Prop { id: 1 },
             }],
             name: None,
         }
@@ -357,6 +417,24 @@ mod tests {
             1 => scene.overlays_above_avatars.push(s),
             2 => scene.overlays_above_name_tags.push(s),
             _ => scene.overlays_above_everything.push(s),
+        }
+    }
+
+    /// A front-layer path stroking a 3-pixel horizontal line in `rgba` from
+    /// `(x, y)`, so a pixel test can recognise the front paint layer.
+    fn front_line(rgba: [u8; 4], x: i32, y: i32) -> DrawCmd {
+        DrawCmd {
+            command: draw_cmd::PATH,
+            flags: draw_flags::LAYER_FRONT,
+            payload: Some(DrawPayload {
+                pen_size: 1,
+                num_points: 1,
+                pen_rgb: [rgba[0], rgba[1], rgba[2]],
+                points: vec![Point::new(y as i16, x as i16), Point::new(0, 2)],
+                line_rgba: Some([rgba[3], rgba[0], rgba[1], rgba[2]]),
+                fill_rgba: None,
+            }),
+            ..DrawCmd::default()
         }
     }
 
@@ -697,6 +775,252 @@ mod tests {
             px(&c, ux, uy),
             GREEN,
             "an AboveNameTags sprite must cover the name tag at the same pixel"
+        );
+    }
+
+    /// `draw_mid_into` owns exactly the AboveAvatars band and the front paint
+    /// layer; neither appears in `draw_top_into`.
+    #[test]
+    fn mid_layer_draws_above_avatar_overlays_and_front_draw() {
+        let mut scene = Scene::new(10, 10);
+        scene.overlays_above_avatars = vec![sprite(RED, 1, 1, 0)];
+        scene.draw.apply(front_line(GREEN, 4, 4));
+
+        let (width, height) = scene.logical_size();
+        let mut mid = Canvas::for_room(width, height, 1.0);
+        draw_mid_into(&mut mid, &scene, AnimationClock::zero());
+        assert_eq!(
+            px(&mid, 1, 1),
+            RED,
+            "the AboveAvatars overlay belongs to the mid layer"
+        );
+        assert_eq!(
+            px(&mid, 5, 4),
+            GREEN,
+            "the front draw command belongs to the mid layer"
+        );
+
+        let mut top = Canvas::for_room(width, height, 1.0);
+        draw_top_into(&mut top, &scene, AnimationClock::zero());
+        assert_eq!(
+            px(&top, 1, 1),
+            [0, 0, 0, 0],
+            "the AboveAvatars overlay must not be in the top layer"
+        );
+        assert_eq!(
+            px(&top, 5, 4),
+            [0, 0, 0, 0],
+            "the front draw command must not be in the top layer"
+        );
+    }
+
+    /// `draw_top_into` owns exactly the AboveNameTags band, chat text and the
+    /// AboveEverything band; none appears in `draw_mid_into`.
+    #[test]
+    fn top_layer_draws_above_name_tag_overlays_chat_and_above_everything() {
+        let item = crate::chattext::ChatText {
+            text: "Chat".to_string(),
+            x: 64,
+            y: 40,
+            style: crate::chattext::ChatStyle::Talk,
+        };
+        let (fx, fy) = chat_pixel_frame_position(&item);
+        let (ux, uy) = (fx as u32, fy as u32);
+
+        let mut scene = Scene::new(128, 96);
+        scene.overlays_above_name_tags = vec![sprite(RED, 2, 2, 0)];
+        scene.chat = vec![item];
+        scene.overlays_above_everything = vec![sprite(BLUE, 6, 6, 0)];
+
+        let (width, height) = scene.logical_size();
+        let mut top = Canvas::for_room(width, height, 1.0);
+        draw_top_into(&mut top, &scene, AnimationClock::zero());
+        assert_eq!(
+            px(&top, 2, 2),
+            RED,
+            "the AboveNameTags overlay belongs to the top layer"
+        );
+        assert_ne!(
+            px(&top, ux, uy),
+            [0, 0, 0, 0],
+            "the chat text belongs to the top layer"
+        );
+        assert_eq!(
+            px(&top, 6, 6),
+            BLUE,
+            "the AboveEverything overlay belongs to the top layer"
+        );
+
+        let mut mid = Canvas::for_room(width, height, 1.0);
+        draw_mid_into(&mut mid, &scene, AnimationClock::zero());
+        assert_eq!(
+            px(&mid, 2, 2),
+            [0, 0, 0, 0],
+            "the AboveNameTags overlay must not be in the mid layer"
+        );
+        assert_eq!(
+            px(&mid, ux, uy),
+            [0, 0, 0, 0],
+            "the chat text must not be in the mid layer"
+        );
+        assert_eq!(
+            px(&mid, 6, 6),
+            [0, 0, 0, 0],
+            "the AboveEverything overlay must not be in the mid layer"
+        );
+    }
+
+    /// `render_mid` is the mid layer on its own transparent canvas: it paints
+    /// the AboveAvatars overlay and the front draw, and nothing from a top band.
+    #[test]
+    fn render_mid_paints_the_above_avatar_band_and_front_draw_only() {
+        let item = crate::chattext::ChatText {
+            text: "Chat".to_string(),
+            x: 64,
+            y: 40,
+            style: crate::chattext::ChatStyle::Talk,
+        };
+        let (fx, fy) = chat_pixel_frame_position(&item);
+        let (ux, uy) = (fx as u32, fy as u32);
+
+        let mut scene = Scene::new(128, 96);
+        scene.overlays_above_avatars = vec![sprite(RED, 1, 1, 0)];
+        scene.draw.apply(front_line(GREEN, 4, 4));
+        scene.overlays_above_name_tags = vec![sprite(BLUE, 8, 8, 0)];
+        scene.overlays_above_everything = vec![sprite([255, 255, 0, 255], 6, 6, 0)];
+        scene.chat = vec![item];
+
+        let mid = render_mid(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(
+            px(&mid, 1, 1),
+            RED,
+            "the AboveAvatars overlay belongs to the mid layer"
+        );
+        assert_eq!(
+            px(&mid, 5, 4),
+            GREEN,
+            "the front draw command belongs to the mid layer"
+        );
+        assert_eq!(
+            px(&mid, 8, 8),
+            [0, 0, 0, 0],
+            "an AboveNameTags overlay must stay out of the mid layer"
+        );
+        assert_eq!(
+            px(&mid, 6, 6),
+            [0, 0, 0, 0],
+            "an AboveEverything overlay must stay out of the mid layer"
+        );
+        assert_eq!(
+            px(&mid, ux, uy),
+            [0, 0, 0, 0],
+            "chat text must stay out of the mid layer"
+        );
+        let full = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(
+            (mid.width(), mid.height()),
+            (full.width(), full.height()),
+            "the mid canvas uses the same device size as a full render"
+        );
+    }
+
+    /// `render_top` is the top layer on its own transparent canvas: it paints the
+    /// AboveNameTags overlay, the chat text and the AboveEverything overlay, and
+    /// nothing from the mid layer.
+    #[test]
+    fn render_top_paints_the_upper_bands_only() {
+        let item = crate::chattext::ChatText {
+            text: "Chat".to_string(),
+            x: 64,
+            y: 40,
+            style: crate::chattext::ChatStyle::Talk,
+        };
+        let (fx, fy) = chat_pixel_frame_position(&item);
+        let (ux, uy) = (fx as u32, fy as u32);
+
+        let mut scene = Scene::new(128, 96);
+        scene.overlays_above_name_tags = vec![sprite(RED, 2, 2, 0)];
+        scene.chat = vec![item];
+        scene.overlays_above_everything = vec![sprite(BLUE, 6, 6, 0)];
+        scene.overlays_above_avatars = vec![sprite(GREEN, 10, 10, 0)];
+        scene.draw.apply(front_line(GREEN, 12, 12));
+
+        let top = render_top(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(
+            px(&top, 2, 2),
+            RED,
+            "the AboveNameTags overlay belongs to the top layer"
+        );
+        assert_ne!(
+            px(&top, ux, uy),
+            [0, 0, 0, 0],
+            "the chat text belongs to the top layer"
+        );
+        assert_eq!(
+            px(&top, 6, 6),
+            BLUE,
+            "the AboveEverything overlay belongs to the top layer"
+        );
+        assert_eq!(
+            px(&top, 10, 10),
+            [0, 0, 0, 0],
+            "an AboveAvatars overlay must stay out of the top layer"
+        );
+        assert_eq!(
+            px(&top, 13, 12),
+            [0, 0, 0, 0],
+            "the front draw command must stay out of the top layer"
+        );
+        let full = render(&scene, RenderOptions::at_dpr(1.0));
+        assert_eq!(
+            (top.width(), top.height()),
+            (full.width(), full.height()),
+            "the top canvas uses the same device size as a full render"
+        );
+    }
+
+    /// The refactor moves no pixels: `draw_above_into` is byte-for-byte the
+    /// avatar pass, then `draw_mid_into`, then the name-tag band, then
+    /// `draw_top_into`.
+    #[test]
+    fn draw_above_into_is_mid_then_name_tags_then_top() {
+        let mut scene = Scene::new(128, 96);
+        scene.avatars = vec![named_avatar("Bob", 64, 40)];
+        scene.overlays_above_avatars = vec![sprite(RED, 3, 3, 0)];
+        scene.overlays_above_name_tags = vec![sprite(BLUE, 5, 5, 0)];
+        scene.overlays_above_everything = vec![sprite(GREEN, 7, 7, 0)];
+        scene.draw.apply(front_line(GREEN, 10, 10));
+        scene.chat = vec![crate::chattext::ChatText {
+            text: "Chat".to_string(),
+            x: 64,
+            y: 40,
+            style: crate::chattext::ChatStyle::Talk,
+        }];
+
+        let (width, height) = scene.logical_size();
+        let mut direct = Canvas::for_room(width, height, 1.0);
+        draw_above_into(&mut direct, &scene, AnimationClock::zero());
+
+        let mut manual = Canvas::for_room(width, height, 1.0);
+        let mut avatars = scene.avatars.clone();
+        sort_avatars(&mut avatars);
+        for avatar in &avatars {
+            draw_avatar(&mut manual, avatar);
+        }
+        draw_mid_into(&mut manual, &scene, AnimationClock::zero());
+        if scene.name_tags_visible {
+            for avatar in &avatars {
+                if let Some(name) = avatar.name.as_deref() {
+                    crate::nametag::draw_name_tag(&mut manual, avatar.x, avatar.y, name);
+                }
+            }
+        }
+        draw_top_into(&mut manual, &scene, AnimationClock::zero());
+
+        assert_eq!(
+            direct.as_rgba(),
+            manual.as_rgba(),
+            "draw_above_into must equal the avatar pass + mid + name tags + top"
         );
     }
 }

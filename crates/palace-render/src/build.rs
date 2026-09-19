@@ -28,7 +28,9 @@ use palace_room::RoomDesc;
 use crate::assets::{MediaStore, PropStore};
 use crate::error::AssetNote;
 use crate::image_clut::image_clut as clut_lookup;
-use crate::scene::{layer_for_hotspot_flags, Avatar, AvatarPart, Layer, Scene, Sprite};
+use crate::scene::{
+    layer_for_hotspot_flags, Avatar, AvatarPart, AvatarPartArt, Layer, Scene, Sprite,
+};
 use crate::viewport::{room_size_from_background, SizeF};
 
 /// The drawn size of a Type 0 avatar.
@@ -407,6 +409,7 @@ impl SceneBuilder {
                 dy: -AVATAR_HALF + i32::from(decoded.v_offset),
                 image: decoded.image,
                 alpha: decoded.alpha,
+                art: AvatarPartArt::Prop { id: *id },
             });
         }
         if !has_head_prop {
@@ -417,6 +420,10 @@ impl SceneBuilder {
                     dx: 0,
                     dy: 0,
                     alpha: 1.0,
+                    art: AvatarPartArt::Face {
+                        face: spec.face,
+                        color: spec.color,
+                    },
                 },
             );
         }
@@ -833,6 +840,11 @@ mod tests {
             crate::face::smiley_cell(3, 5),
             "the (3, 5) cell, not some other"
         );
+        assert_eq!(
+            face.art,
+            AvatarPartArt::Face { face: 3, color: 5 },
+            "the part remembers the face cell it was built from"
+        );
 
         let canvas = render(&scene, RenderOptions::at_dpr(1.0));
         let (fx, fy) = first_opaque(&face.image);
@@ -881,6 +893,11 @@ mod tests {
             "the head prop must suppress the built-in face, not sit beside it"
         );
         assert_eq!(
+            avatar.parts[0].art,
+            AvatarPartArt::Prop { id: 7001 },
+            "the head prop's identity survives the face suppression"
+        );
+        assert_eq!(
             avatar.parts[0].dx,
             -AVATAR_HALF + 7,
             "the prop keeps its header offset"
@@ -901,6 +918,16 @@ mod tests {
         assert_eq!(avatar.parts[0].image, crate::face::smiley_cell(1, 2));
         assert_eq!((avatar.parts[0].dx, avatar.parts[0].dy), (0, 0));
         assert_eq!(avatar.parts[1].dx, -AVATAR_HALF + 7);
+        assert_eq!(
+            avatar.parts[0].art,
+            AvatarPartArt::Face { face: 1, color: 2 },
+            "the face keeps its cell identity"
+        );
+        assert_eq!(
+            avatar.parts[1].art,
+            AvatarPartArt::Prop { id: 7002 },
+            "the worn prop keeps the id it was worn as"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
