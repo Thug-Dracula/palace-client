@@ -30,7 +30,7 @@ use palace_wire::fixture::{default_fixture_dir, Fixture};
 use palace_wire::frame::{user_move_frame, Frame};
 use palace_wire::messages::{
     aux_flags, client_logon_record_with_identity, reference_logon_record, AssetSpec,
-    ClientIdentity, Message, Point, UserProp, UserRec,
+    ClientIdentity, Message, Point, RoomRec, UserProp, UserRec,
 };
 use palace_wire::opcode;
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
@@ -2179,6 +2179,142 @@ fn leaving_a_room_dispatches_the_leave_handler() {
     );
 
     handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+/// A hand-built `room` payload with one hotspot (id 6) whose script is
+/// `source`. The fixture corpus has no arena-style `ON LEAVE` reset and the
+/// tree has no room encoder, so the bytes are assembled here.
+fn scripted_room_payload(order: ByteOrder, room_id: i16, source: &str) -> Vec<u8> {
+    let mut var = Writer::new(order);
+    // An offset field of 0 means "absent", so the name starts at 2, like the
+    // live corpus.
+    var.write_i16(0);
+    let name_ofst = var.len() as i16;
+    var.write_pstring("Mock arena");
+    let pict_ofst = var.len() as i16;
+    var.write_pstring("mock-arena.png");
+    let hotspot_ofst = var.len() as i16;
+    let script_ofst = hotspot_ofst + 48;
+    var.write_i32(0); // scriptEventMask
+    var.write_i32(0); // flags
+    var.write_i32(0); // secureInfo
+    var.write_i32(0); // refCon
+    var.write_i16(0); // loc.y
+    var.write_i16(0); // loc.x
+    var.write_i16(6); // id — the spot the ON LEAVE reset names
+    var.write_i16(0); // dest
+    var.write_i16(0); // nbrPts
+    var.write_i16(0); // ptsOfst
+    var.write_i16(0); // type
+    var.write_i16(0); // groupID
+    var.write_i16(0); // nbrScripts
+    var.write_i16(0); // scriptRecOfst
+    var.write_i16(0); // state
+    var.write_i16(0); // nbrStates
+    var.write_i16(0); // stateRecOfst
+    var.write_i16(0); // nameOfst
+    var.write_i16(script_ofst); // scriptTextOfst
+    var.write_i16(0); // alignReserved
+    var.write_cstring(source);
+
+    let len_vars = var.len() as i16;
+    let header = RoomRec {
+        room_id,
+        room_name_ofst: name_ofst,
+        pict_name_ofst: pict_ofst,
+        nbr_hotspots: 1,
+        hotspot_ofst,
+        len_vars,
+        ..RoomRec::default()
+    };
+    let mut w = Writer::new(order);
+    header.encode(&mut w);
+    w.write_bytes(&var.into_vec());
+    w.into_vec()
+}
+
+/// The offset of `needle` in `haystack`, if present.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[test]
+fn signing_off_runs_the_rooms_on_leave_handlers() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    const ARENA_ROOM: i16 = 31747;
+
+    let payload = scripted_room_payload(order, ARENA_ROOM, "ON LEAVE { 0 6 SETSPOTSTATE }");
+    let room = palace_room::decode_payload(&payload, order).expect("the mock arena decodes");
+    assert!(
+        room.is_clean(),
+        "the mock arena parses without warnings: {:?}",
+        room.warnings
+    );
+
+    let mut frames = vec![server_bytes(&fixture)[0].clone()];
+    frames.push(
+        Frame::new(opcode::ROOMDESC, 0, payload)
+            .encode(order)
+            .expect("the room descriptor encodes"),
+    );
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("signoff-leave-cache");
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            screens(collected)
+                .iter()
+                .any(|screen| screen.room_id == i32::from(ARENA_ROOM))
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        screens(&events)
+            .iter()
+            .any(|screen| screen.room_id == i32::from(ARENA_ROOM)),
+        "the mock arena was entered and composited: {:?}",
+        screens(&events)
+            .iter()
+            .map(|screen| screen.room_id)
+            .collect::<Vec<_>>()
+    );
+
+    handle.disconnect();
+
+    let reset = spot_state_frame(order, ARENA_ROOM, 6, 0);
+    let logoff = Frame::empty(opcode::LOGOFF, 0)
+        .encode(order)
+        .expect("logoff encodes");
+    assert!(
+        wait_for(
+            || {
+                let received = server.received_bytes();
+                find_bytes(&received, &reset).is_some() && find_bytes(&received, &logoff).is_some()
+            },
+            Duration::from_secs(10),
+        ),
+        "signing off sent the room's ON LEAVE reset: bytes after the sign-off were {:?}",
+        server.received_frames(order)
+    );
+    let received = server.received_bytes();
+    let reset_at = find_bytes(&received, &reset).expect("the reset frame arrived");
+    let logoff_at = find_bytes(&received, &logoff).expect("the logoff frame arrived");
+    assert!(
+        reset_at < logoff_at,
+        "the ON LEAVE reset (spot 6, state 0) went out before the LOGOFF frame"
+    );
+
     drop(server);
     cleanup(&cache);
     cleanup(&seed);

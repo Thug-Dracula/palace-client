@@ -54,6 +54,20 @@ use crate::state::{
 const MEDIA_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const PROP_REQUEST_BUDGET: usize = 80;
 
+/// The fastest the animation redraw may run. Each redraw ships a full-frame PNG
+/// to the webview, which cannot consume them at loop rate.
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Whether an animation-driven redraw is due, `interval` after the last frame.
+///
+/// The glide clock is sampled on every loop pass (about `POLL_SLICE`), but the
+/// webview cannot fetch and decode a full-frame PNG at that rate, so animation
+/// redraws are capped to one per `interval`. Callers update `last` whenever a
+/// frame is composited, including input-driven ones.
+fn frame_due(last: Instant, now: Instant, interval: Duration) -> bool {
+    now.saturating_duration_since(last) >= interval
+}
+
 /// `HS_Door` (1): "a door" (protocol reference :1665). It cannot be locked —
 /// the reference names only `HS_LockableDoor` (3) as "a door that can be
 /// locked" (:1667) — so a plain door's `state` is a picture selector and
@@ -806,6 +820,8 @@ fn run_session(
     let mut render_cache = RenderCache::default();
     let mut last_dpr = shared.viewport().dpr;
     let mut last_asset_request = Instant::now() - MEDIA_REQUEST_INTERVAL;
+    // A full interval in the past, so the first frame is not delayed.
+    let mut last_frame = Instant::now() - MIN_FRAME_INTERVAL;
     let mut props_received = 0usize;
     let mut restored_room = false;
     let mut fact_cache = FactCache::default();
@@ -877,6 +893,14 @@ fn run_session(
                 }
                 ClientCommand::Refresh => resync = true,
                 ClientCommand::Disconnect => {
+                    run_room_leave(
+                        &mut scripts,
+                        &mut state,
+                        shared,
+                        &mut conn,
+                        &mut dirty_render,
+                        &mut occupied_room,
+                    );
                     end = Some(false);
                     break;
                 }
@@ -1137,6 +1161,7 @@ fn run_session(
                 &mut last_room_size,
                 &mut last_screen,
             );
+            last_frame = Instant::now();
             dirty_render = false;
             dirty_geom = false;
         }
@@ -1512,7 +1537,11 @@ fn run_session(
         }
 
         // Keep any remote-avatar glide moving even while the server is quiet.
-        if state.advance_motion(start.elapsed().as_millis() as u64) {
+        // `advance_motion` still runs every pass so finished glides are pruned,
+        // but the redraw it asks for is capped at `MIN_FRAME_INTERVAL`; other
+        // sources of `dirty_render` are untouched.
+        let motion_due = state.advance_motion(start.elapsed().as_millis() as u64);
+        if motion_due && frame_due(last_frame, Instant::now(), MIN_FRAME_INTERVAL) {
             dirty_render = true;
         }
 
@@ -1526,6 +1555,7 @@ fn run_session(
                 &mut last_room_size,
                 &mut last_screen,
             );
+            last_frame = Instant::now();
             dirty_render = false;
             dirty_geom = false;
         } else if dirty_geom {
@@ -2263,6 +2293,37 @@ fn run_dispatch_report(
     run_event(scripts, event, state, shared, conn, dirty_render, only, 0)
 }
 
+/// Run the current room's `ON LEAVE` handlers and send their effects.
+///
+/// A room change runs this so the room being left can clean up: the Colosseum
+/// arms `ON LEAVE` with the team-slot resets. Signing off must run the same
+/// cleanup, or a fighter's "slot taken" flag stays set on the room and the next
+/// arrival is told the team is full.
+fn run_room_leave(
+    scripts: &mut ScriptEngine,
+    state: &mut SessionState,
+    shared: &Arc<Shared>,
+    conn: &mut Connection,
+    dirty_render: &mut bool,
+    occupied_room: &mut bool,
+) {
+    if *occupied_room {
+        crate::trace::room_leave(state.current_room.as_ref().map(|room| room.id));
+        for event in run_dispatch(
+            scripts,
+            ScriptEvent::Leave,
+            state,
+            shared,
+            conn,
+            dirty_render,
+            None,
+        ) {
+            shared.emit(event);
+        }
+        *occupied_room = false;
+    }
+}
+
 /// Send the room-change request for `room_id` and reset the room being left.
 ///
 /// The `/goto` command and a click on an unclaimed door both run this, so the
@@ -2280,21 +2341,7 @@ fn request_room(
     if let Ok(mut guard) = shared.last_room.lock() {
         *guard = Some(room_id);
     }
-    if *occupied_room {
-        crate::trace::room_leave(state.current_room.as_ref().map(|room| room.id));
-        for event in run_dispatch(
-            scripts,
-            ScriptEvent::Leave,
-            state,
-            shared,
-            conn,
-            dirty_render,
-            None,
-        ) {
-            shared.emit(event);
-        }
-        *occupied_room = false;
-    }
+    run_room_leave(scripts, state, shared, conn, dirty_render, occupied_room);
     state.begin_room_change();
     crate::trace::nav_request(room_id);
     conn.send(&state.navigate_frame(room_id))?;
@@ -4005,6 +4052,28 @@ fn remove_pic(state: &mut SessionState, spot: i32, picture: i32) -> bool {
 mod tests {
     use super::*;
     use palace_wire::byteorder::ByteOrder;
+
+    #[test]
+    fn animation_frames_are_capped_at_the_minimum_interval() {
+        let last = Instant::now();
+        let interval = Duration::from_millis(33);
+        assert!(
+            !frame_due(last, last, interval),
+            "a redraw at the same instant must be suppressed"
+        );
+        assert!(
+            !frame_due(last, last + Duration::from_millis(32), interval),
+            "a redraw inside the interval must be suppressed"
+        );
+        assert!(
+            frame_due(last, last + interval, interval),
+            "a redraw one full interval later is due"
+        );
+        assert!(
+            frame_due(last, last + Duration::from_millis(250), interval),
+            "a redraw long after the interval is due"
+        );
+    }
 
     #[test]
     fn only_a_lockable_door_reads_state_one_as_locked() {
