@@ -73,6 +73,7 @@
 )]
 
 pub mod bag;
+pub mod catalog;
 pub mod codec;
 pub mod crc;
 pub mod encode;
@@ -82,6 +83,7 @@ pub mod image;
 pub mod palette;
 
 pub use bag::{BagEntry, PropBag, BAG_INDEX_RECORD_LEN, BAG_PREFIX_LEN};
+pub use catalog::{CatalogEntry, PropCatalog};
 pub use crc::{asset_crc, payload_crc, ASSET_CRC_MAGIC};
 pub use encode::{encode_s20_blob, encode_s20_payload, quantize};
 pub use error::{PropError, Result, MAX_DIMENSION, MAX_PIXELS};

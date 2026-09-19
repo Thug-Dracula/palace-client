@@ -13,7 +13,7 @@ pub use settings::Settings;
 
 use logging::Level;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use palace_audio::{AudioConfig, AudioEngine, AudioHandle};
@@ -186,14 +186,30 @@ pub fn run() {
     }
     let slot = protocol::FrameSlot::default();
     let handler_slot = slot.clone();
+    let catalog_slot = protocol::CatalogSlot::default();
+    match palace_prop::PropCatalog::open_default() {
+        Some(catalog) => {
+            logging::log(
+                Level::Info,
+                format!("prop catalog loaded: {} entries", catalog.len()),
+            );
+            catalog_slot.set(Arc::new(catalog));
+        }
+        None => logging::log(
+            Level::Info,
+            "no readable prop bag found; prop catalog empty",
+        ),
+    }
+    let handler_catalog = catalog_slot.clone();
     let defaults = Settings::from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(slot)
+        .manage(catalog_slot)
         .register_asynchronous_uri_scheme_protocol("palace", move |_ctx, request, responder| {
-            protocol::handle(&handler_slot, &request, responder);
+            protocol::handle(&handler_slot, &handler_catalog, &request, responder);
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,

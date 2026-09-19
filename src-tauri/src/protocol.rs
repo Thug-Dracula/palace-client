@@ -7,6 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use palace_client::FrameStore;
+use palace_prop::PropCatalog;
 use tauri::http::{Request, Response, StatusCode};
 use tauri::UriSchemeResponder;
 
@@ -35,14 +36,73 @@ impl FrameSlot {
     }
 }
 
+/// A shared handle to the prop catalog loaded at startup.
+#[derive(Clone, Default)]
+pub struct CatalogSlot {
+    inner: Arc<Mutex<Option<Arc<PropCatalog>>>>,
+}
+
+impl CatalogSlot {
+    /// Point the slot at a loaded catalog.
+    pub fn set(&self, catalog: Arc<PropCatalog>) {
+        match self.inner.lock() {
+            Ok(mut guard) => *guard = Some(catalog),
+            Err(poisoned) => *poisoned.into_inner() = Some(catalog),
+        }
+    }
+
+    /// The loaded catalog, if the user has a readable prop bag.
+    #[must_use]
+    pub fn get(&self) -> Option<Arc<PropCatalog>> {
+        match self.inner.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
 /// Route a `palace://localhost/<path>` request.
-pub fn handle(slot: &FrameSlot, request: &Request<Vec<u8>>, responder: UriSchemeResponder) {
+pub fn handle(
+    slot: &FrameSlot,
+    catalog: &CatalogSlot,
+    request: &Request<Vec<u8>>,
+    responder: UriSchemeResponder,
+) {
     let path = request.uri().path().trim_start_matches('/').to_string();
     match path.as_str() {
         "frame" => handle_frame(slot, responder),
         "faces" => responder.respond(png(palace_render::face_sheet_png().to_vec())),
         "faces.json" => responder.respond(json(palace_render::face_grid_json())),
-        _ => responder.respond(status(StatusCode::NOT_FOUND)),
+        "props.json" => responder.respond(json(handle_props_json(catalog))),
+        _ => match path.strip_prefix("prop/") {
+            Some(id) => handle_prop(catalog, id, responder),
+            None => responder.respond(status(StatusCode::NOT_FOUND)),
+        },
+    }
+}
+
+/// The whole catalog as JSON. An absent bag serves a valid empty catalog rather
+/// than an error, so the picker renders an empty state instead of failing.
+fn handle_props_json(catalog: &CatalogSlot) -> String {
+    match catalog.get() {
+        Some(catalog) => catalog.catalog_json(),
+        None => "{\"props\":[]}".to_string(),
+    }
+}
+
+/// One prop's thumbnail PNG, or 404 for an unknown id or an undecodable prop.
+fn handle_prop(catalog: &CatalogSlot, id: &str, responder: UriSchemeResponder) {
+    let Some(id) = id.parse::<u32>().ok() else {
+        responder.respond(status(StatusCode::NOT_FOUND));
+        return;
+    };
+    let Some(catalog) = catalog.get() else {
+        responder.respond(status(StatusCode::NOT_FOUND));
+        return;
+    };
+    match catalog.thumbnail_png(id) {
+        Some(bytes) => responder.respond(png(bytes)),
+        None => responder.respond(status(StatusCode::NOT_FOUND)),
     }
 }
 

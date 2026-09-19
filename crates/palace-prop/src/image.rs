@@ -128,15 +128,15 @@ impl PropImage {
             .collect()
     }
 
-    /// Write the image out as a PNG.
+    /// Encode the image as an in-memory PNG.
     ///
-    /// This exists so a human can look at what the decoder produced; nothing in
-    /// the decode path calls it.
-    pub fn write_png(&self, path: impl AsRef<Path>) -> Result<()> {
-        let file = std::fs::File::create(path).map_err(|e| PropError::Png {
-            detail: e.to_string(),
-        })?;
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), self.width, self.height);
+    /// The same RGBA8 encoding [`PropImage::write_png`] writes to a file, but
+    /// returned as bytes so a caller can hand it to an HTTP-style responder
+    /// without touching the filesystem. Reuses the workspace's `png` crate; no
+    /// image format is re-implemented here.
+    pub fn to_png_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, self.width, self.height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().map_err(|e| PropError::Png {
@@ -147,6 +147,19 @@ impl PropImage {
             .map_err(|e| PropError::Png {
                 detail: e.to_string(),
             })?;
-        Ok(())
+        drop(writer);
+        Ok(out)
+    }
+
+    /// Write the image out as a PNG.
+    ///
+    /// This exists so a human can look at what the decoder produced; nothing in
+    /// the decode path calls it. It shares the in-memory encoder above so the
+    /// bytes a file gets and the bytes a route would serve cannot drift.
+    pub fn write_png(&self, path: impl AsRef<Path>) -> Result<()> {
+        let bytes = self.to_png_bytes()?;
+        std::fs::write(path, bytes).map_err(|e| PropError::Png {
+            detail: e.to_string(),
+        })
     }
 }

@@ -2480,6 +2480,7 @@ version = "0.2.0"
 dependencies = [
  "palace-audio",
  "palace-client",
+ "palace-prop",
  "palace-render",
  "serde",
  "serde_json",
