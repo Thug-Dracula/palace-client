@@ -99,6 +99,31 @@ cargo run -p palace-probe -- --host your.server --port 9998 --user RustProbe
 `--verbose` prints every frame in the logon burst. Fixture capture and the
 differential oracle commands are documented in [protocol.md](protocol.md).
 
+### Windows
+
+The Windows build is a first-class target. Prerequisites:
+
+- **Rust 1.87 or newer** with the **MSVC toolchain** (`x86_64-pc-windows-msvc`,
+  the installer's default) and the **MSVC C++ build tools** (Visual Studio
+  Build Tools with "Desktop development with C++" selected).
+- The **WebView2 runtime** — current Windows 10 and 11 ship it; if it is
+  missing it is a free Microsoft download.
+- **bun** for the frontend and the Tauri CLI.
+
+Then, from a clone of the repository:
+
+```powershell
+bun install
+bun run tauri dev      # run the client from source
+bun run tauri build    # build the installer and the portable exe
+```
+
+A portable copy is not self-contained: on Windows the app resolves its
+SoundFont at `resources\soundfonts\` **relative to the executable**. Keep the
+`resources` tree the build stages in `target\release\` beside
+`palace-app.exe` (the `windows-portable` zip from CI already does), or the
+client starts silent.
+
 ---
 
 ## Workspace layout
