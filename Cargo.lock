@@ -2528,6 +2528,7 @@ dependencies = [
 name = "palace-host"
 version = "0.2.0"
 dependencies = [
+ "chrono",
  "iptscrae",
  "iptscrae-palace",
  "palace-render",

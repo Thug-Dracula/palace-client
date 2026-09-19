@@ -13,5 +13,12 @@ iptscrae-palace = { workspace = true }
 palace-room = { workspace = true }
 palace-wire = { workspace = true }
 
+# Windows has no `/etc/localtime` and does not set `TZ`, so `GETTIMEZONE` asks
+# the platform for the local offset. `chrono`'s `Local` wraps the OS time-zone
+# API without `unsafe` (which this crate forbids) and is already in the
+# workspace lock via the Tauri stack.
+[target.'cfg(windows)'.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 [dev-dependencies]
 palace-render = { workspace = true }

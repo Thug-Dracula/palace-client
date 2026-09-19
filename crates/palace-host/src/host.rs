@@ -357,25 +357,52 @@ fn flat_points(args: &[Value], index: usize) -> Vec<(i32, i32)> {
 ///
 /// The Sparky reference pushes the IANA zone name, but the corpus template
 /// (`113_hs0.txt`) feeds the result straight into `tz dst + 3600 *`, so the
-/// host answers the numeric offset those scripts consume. The offset comes
-/// from the TZif database at `/etc/localtime`; a `TZ` fixed offset is the
-/// fallback, and `0` (UTC) is the last resort.
+/// host answers the numeric offset those scripts consume. Unix reads the TZif
+/// database at `/etc/localtime`, with a `TZ` fixed offset as the fallback;
+/// Windows reads the active zone from the platform. `0` (UTC) is the last
+/// resort on every platform. The result is whole hours east of UTC, truncated
+/// toward zero.
 fn local_utc_offset_hours() -> i32 {
+    platform_local_utc_offset_hours().unwrap_or(0)
+}
+
+/// The platform's local UTC offset in whole hours, or `None` when the platform
+/// cannot answer.
+#[cfg(not(windows))]
+fn platform_local_utc_offset_hours() -> Option<i32> {
     if let Some(seconds) = std::fs::read("/etc/localtime")
         .ok()
         .and_then(|data| tzif_offset_seconds(&data))
     {
-        return (seconds / 3600) as i32;
+        return Some(whole_hours_from_seconds(seconds));
     }
     if let Ok(tz) = std::env::var("TZ") {
         if let Some(hours) = fixed_tz_offset_hours(&tz) {
-            return hours;
+            return Some(hours);
         }
     }
-    0
+    None
+}
+
+/// Windows keeps zones in the registry, not in `/etc/localtime`, and never
+/// sets `TZ`. `chrono`'s `Local` reads the active zone's rules from the OS and
+/// resolves DST, with no `unsafe` in this crate (which forbids it).
+#[cfg(windows)]
+fn platform_local_utc_offset_hours() -> Option<i32> {
+    use chrono::Offset as _;
+
+    let seconds = chrono::Local::now().offset().fix().local_minus_utc();
+    Some(whole_hours_from_seconds(i64::from(seconds)))
+}
+
+/// Whole hours in an east-positive `seconds` offset, truncated toward zero;
+/// shared by both platform lookups so the unit and sign stay identical.
+fn whole_hours_from_seconds(seconds: i64) -> i32 {
+    (seconds / 3600) as i32
 }
 
 /// The current UTC offset in seconds from a TZif (`/etc/localtime`) blob.
+#[cfg(any(not(windows), test))]
 fn tzif_offset_seconds(data: &[u8]) -> Option<i64> {
     if data.len() < 44 || &data[..4] != b"TZif" {
         return None;
@@ -403,6 +430,7 @@ fn tzif_offset_seconds(data: &[u8]) -> Option<i64> {
 }
 
 /// The offset of the transition active now in one TZif data block.
+#[cfg(any(not(windows), test))]
 fn parse_tzif_block(data: &[u8], pos: usize, counts: &[usize; 6], wide: bool) -> Option<i64> {
     let (timecnt, typecnt, charcnt, leapcnt, isstdcnt, isutcnt) = (
         counts[3], counts[4], counts[5], counts[2], counts[1], counts[0],
@@ -447,6 +475,7 @@ fn parse_tzif_block(data: &[u8], pos: usize, counts: &[usize; 6], wide: bool) ->
 }
 
 /// A POSIX-style fixed-offset `TZ` value, in whole hours.
+#[cfg(any(not(windows), test))]
 fn fixed_tz_offset_hours(tz: &str) -> Option<i32> {
     let tz = tz.trim();
     for prefix in ["UTC", "GMT"] {
@@ -2738,5 +2767,55 @@ mod tests {
             }
         );
         assert_eq!(host.unsupported.get("ADDPROP"), Some(&1));
+    }
+
+    #[test]
+    fn whole_hours_truncate_toward_zero_like_the_unix_path() {
+        assert_eq!(whole_hours_from_seconds(0), 0);
+        assert_eq!(whole_hours_from_seconds(3_600), 1);
+        assert_eq!(whole_hours_from_seconds(-3_600), -1);
+        assert_eq!(whole_hours_from_seconds(19_800), 5); // +05:30
+        assert_eq!(whole_hours_from_seconds(20_700), 5); // +05:45
+        assert_eq!(whole_hours_from_seconds(-18_000), -5);
+        assert_eq!(whole_hours_from_seconds(-19_800), -5); // -05:30
+        assert_eq!(whole_hours_from_seconds(-1_800), 0); // -00:30
+        assert_eq!(whole_hours_from_seconds(50_400), 14);
+    }
+
+    /// A minimal big-endian TZif v1 blob with one transition and one type.
+    fn tzif_v1(utoff_seconds: i32) -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"TZif");
+        blob.push(0); // version 1: legacy 32-bit block only
+        blob.extend_from_slice(&[0u8; 15]); // reserved
+        for count in [0i32, 0, 0, 1, 1, 0] {
+            // isutcnt, isstdcnt, leapcnt, timecnt, typecnt, charcnt
+            blob.extend_from_slice(&count.to_be_bytes());
+        }
+        blob.extend_from_slice(&0i32.to_be_bytes()); // one transition at the epoch
+        blob.push(0); // the transition selects type 0
+        blob.extend_from_slice(&utoff_seconds.to_be_bytes()); // type 0: utoff
+        blob.push(0); // isdst
+        blob.push(0); // desigidx
+        blob
+    }
+
+    #[test]
+    fn tzif_offset_reads_the_active_type() {
+        assert_eq!(tzif_offset_seconds(&tzif_v1(19_800)), Some(19_800)); // +05:30
+        assert_eq!(tzif_offset_seconds(&tzif_v1(-18_000)), Some(-18_000)); // -05:00
+        assert_eq!(tzif_offset_seconds(b"not a tzif"), None);
+        assert_eq!(tzif_offset_seconds(&tzif_v1(3_600)[..40]), None);
+    }
+
+    #[test]
+    fn fixed_tz_parses_posix_fixed_offsets() {
+        assert_eq!(fixed_tz_offset_hours("UTC"), Some(0));
+        assert_eq!(fixed_tz_offset_hours("GMT"), Some(0));
+        assert_eq!(fixed_tz_offset_hours("UTC+2"), Some(-2));
+        assert_eq!(fixed_tz_offset_hours("GMT-3"), Some(3));
+        assert_eq!(fixed_tz_offset_hours("UTC+5:30"), Some(-5));
+        assert_eq!(fixed_tz_offset_hours("America/New_York"), None);
+        assert_eq!(fixed_tz_offset_hours(""), None);
     }
 }
