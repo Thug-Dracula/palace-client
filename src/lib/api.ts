@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import { internalBaseUrl } from "./internalUrl";
+
 export const EVENT_NAME = "palace://event";
 
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
@@ -118,9 +120,10 @@ export type ClientEvent =
   | { type: "midi_stop" }
   | { type: "beep" };
 
-export const frameUrl = (version: number): string => `palace://localhost/frame?v=${version}`;
+export const frameUrl = (version: number): string =>
+  `${internalBaseUrl()}/frame?v=${version}`;
 
-export const facesUrl = (): string => "palace://localhost/faces";
+export const facesUrl = (): string => `${internalBaseUrl()}/faces`;
 
 export interface FaceGrid {
   cell: number;
@@ -130,7 +133,7 @@ export interface FaceGrid {
 }
 
 export const facesGrid = async (): Promise<FaceGrid> => {
-  const response = await fetch("palace://localhost/faces.json");
+  const response = await fetch(`${internalBaseUrl()}/faces.json`);
   if (!response.ok) {
     throw new Error(`face grid: HTTP ${response.status}`);
   }
@@ -153,7 +156,7 @@ export interface PropsCatalog {
 }
 
 export const propsCatalog = async (): Promise<PropEntry[]> => {
-  const response = await fetch("palace://localhost/props.json");
+  const response = await fetch(`${internalBaseUrl()}/props.json`);
   if (!response.ok) {
     throw new Error(`prop catalog: HTTP ${response.status}`);
   }
@@ -161,7 +164,7 @@ export const propsCatalog = async (): Promise<PropEntry[]> => {
   return Array.isArray(catalog.props) ? catalog.props : [];
 };
 
-export const propThumbUrl = (id: number): string => `palace://localhost/prop/${id}`;
+export const propThumbUrl = (id: number): string => `${internalBaseUrl()}/prop/${id}`;
 
 export const getSettings = (): Promise<Settings> => invoke("get_settings");
 
