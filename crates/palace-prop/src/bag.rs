@@ -1,8 +1,10 @@
 //! Reader for the Palace prop bag: a `.bundle` directory holding the client's
 //! own collection of props.
 //!
-//! The modern Palace client keeps its prop bag in
-//! `~/.local/share/PalaceChat/PropBag.bundle/`, as two flat files:
+//! The modern Palace client keeps its prop bag in a `PropBag.bundle/`
+//! directory: on Linux `~/.local/share/PalaceChat/PropBag.bundle/`, on
+//! Windows a `PalaceChat*` directory under `%APPDATA%` or `%LOCALAPPDATA%`.
+//! Either way the bundle holds two flat files:
 //!
 //! ```text
 //! PalaceChat.pids    the index

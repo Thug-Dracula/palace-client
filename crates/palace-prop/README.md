@@ -22,7 +22,7 @@ Props are a self-contained binary format, so there is no dependency on
 ## 1. Quick start
 
 ```bash
-cargo test -p palace-prop                 # 162 tests, no corpus needed
+cargo test -p palace-prop                 # 174 tests, no corpus needed
 
 # Decode the whole local corpus (about 12 seconds):
 cargo run -p palace-prop --release --bin prop-tool -- \
@@ -274,13 +274,21 @@ for each byte: crc = rotate_left(crc, 1) ^ byte
 
 ### 2.13 The prop bag — `PropBag.bundle/`
 
-`src/bag.rs` reads the modern client's own prop collection, a directory such as
-`~/.local/share/PalaceChat/PropBag.bundle/` holding two flat files:
+`src/bag.rs` reads the modern client's own prop collection, a `PropBag.bundle/`
+directory holding two flat files:
 
 | File | Meaning |
 |---|---|
 | `*.pids` | the index |
 | `*.props` | the blobs, concatenated |
+
+The catalog's default location is platform-aware (`src/catalog.rs`,
+`default_dir`): `PALACE_PROP_BAG` wins when set; on Windows the search is the
+first `PropBag.bundle` inside a `PalaceChat*` directory under `%APPDATA%`, then
+under `%LOCALAPPDATA%` (the bare `PalaceChat` name first, versioned names such
+as `PalaceChat 4` — the older 4.x client — after); on Unix it is
+`~/.local/share/PalaceChat/PropBag.bundle`. A missing bag yields an empty
+catalog (`None`), never an error.
 
 **Index — confirmed.** `.pids` is a flat array of 16-byte **big-endian** records
 `(a: u32, b: u32, offset: u32, size: u32)`. On a live snapshot frozen
@@ -335,7 +343,7 @@ records and is rejected by the single-prop decoder; its cached thumbnail is
 
 > The bag is live data. It grew from 3,844 to 3,846 records *during* this analysis;
 > all numbers above are for the frozen `/tmp` snapshot named in §9. Never write to
-> `~/.local/share/PalaceChat/`.
+> the client's data directory (`~/.local/share/PalaceChat/` on Linux).
 
 Confidence:
 

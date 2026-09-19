@@ -7,6 +7,9 @@
 //! ```
 //!
 //! Everything defaults to the local corpus under `$CORPUS`; see `--help`.
+//! The home directory is `HOME` on Unix and `USERPROFILE` on Windows, so the
+//! defaults resolve on both platforms; any default that does not exist is
+//! skipped rather than guessed at.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -14,7 +17,7 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use palace_render::{
@@ -46,7 +49,8 @@ OUTPUT:
 ROOM SOURCE / ASSETS:
     --rooms-dir <DIR>      room payload directory (default $CORPUS/payloads_all)
     --media-root <DIR>     background/overlay root; repeatable
-                           (defaults: media_dl, http_harvest, arks)
+                           (defaults: $CORPUS media dirs plus the
+                           PalaceChat client's own Media directory)
     --props-dir <DIR>      prop blob directory; repeatable
                            (defaults: props_harvested, arks)
     --roster <FILE>        .prp prop roster (default $CORPUS/pserver.prp if present)
@@ -461,41 +465,245 @@ fn parse_viewport(spec: &str) -> Result<(f64, f64), String> {
     Ok((w, h))
 }
 
+/// The Unix client's per-user data directory below the home directory.
+const UNIX_PALACE_CHAT_MEDIA_SUBDIR: &str = ".local/share/PalaceChat/Media";
+/// The media directory name inside a PalaceChat data directory.
+const PALACE_CHAT_MEDIA_DIR: &str = "Media";
+/// The Windows profile subdirectory that holds the AppData roots, and the two
+/// leaves inside it. Used only when `%APPDATA%`/`%LOCALAPPDATA%` are unset.
+const WINDOWS_APPDATA_SUBDIR: &str = "AppData";
+/// The roaming leaf under [`WINDOWS_APPDATA_SUBDIR`] (`%APPDATA%`).
+const WINDOWS_ROAMING_LEAF: &str = "Roaming";
+/// The local leaf under [`WINDOWS_APPDATA_SUBDIR`] (`%LOCALAPPDATA%`).
+const WINDOWS_LOCAL_LEAF: &str = "Local";
+/// A `PalaceChat*` scan is capped at this many directory names per root.
+const MAX_PALACE_CHAT_DIRS: usize = 4;
+
+/// The user's home directory for default asset discovery: `HOME` on Unix,
+/// `USERPROFILE` on Windows (falling back to `HOME` when it is the only one
+/// set, as some shells do). There is no hardcoded fallback; when no home is
+/// known every home-relative default is skipped.
+fn home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+    } else {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+}
+
+/// The PalaceChat client's own media directories for this platform.
+///
+/// Unix uses `~/.local/share/PalaceChat/Media`; Windows uses `Media` inside
+/// every `PalaceChat*` data directory under `%APPDATA%` and `%LOCALAPPDATA%`.
+/// The Windows rung is built by [`windows_palace_chat_media_roots`], which
+/// takes its roots as arguments so it is testable from any host.
+fn palace_chat_media_roots(home: Option<&Path>) -> Vec<PathBuf> {
+    if cfg!(windows) {
+        windows_palace_chat_media_roots(
+            std::env::var_os("APPDATA").map(PathBuf::from),
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+            std::env::var_os("USERPROFILE").map(PathBuf::from),
+        )
+    } else {
+        unix_palace_chat_media_roots(home)
+    }
+}
+
+/// The Unix client media directory: `~/.local/share/PalaceChat/Media`.
+fn unix_palace_chat_media_roots(home: Option<&Path>) -> Vec<PathBuf> {
+    home.map(|home| home.join(UNIX_PALACE_CHAT_MEDIA_SUBDIR))
+        .into_iter()
+        .collect()
+}
+
+/// `Media` inside every `PalaceChat*` directory under `%APPDATA%`, then under
+/// `%LOCALAPPDATA%`; a root is derived from `%USERPROFILE%` when its own
+/// variable is unset. The list is not existence-filtered — the caller checks.
+fn windows_palace_chat_media_roots(
+    app_data: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    user_profile: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let roaming = app_data.or_else(|| derive_appdata(&user_profile, WINDOWS_ROAMING_LEAF));
+    let local = local_app_data.or_else(|| derive_appdata(&user_profile, WINDOWS_LOCAL_LEAF));
+    let mut roots = Vec::new();
+    for root in [roaming, local].into_iter().flatten() {
+        for name in palace_chat_dir_names(&root) {
+            roots.push(root.join(name).join(PALACE_CHAT_MEDIA_DIR));
+        }
+    }
+    roots
+}
+
+fn derive_appdata(user_profile: &Option<PathBuf>, leaf: &str) -> Option<PathBuf> {
+    user_profile
+        .as_ref()
+        .map(|profile| profile.join(WINDOWS_APPDATA_SUBDIR).join(leaf))
+}
+
+/// Every `PalaceChat*` directory name directly under `root`, sorted so the
+/// bare `PalaceChat` (the current client) precedes versioned names such as
+/// `PalaceChat 4` (the older 4.x client), capped at [`MAX_PALACE_CHAT_DIRS`].
+fn palace_chat_dir_names(root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.to_ascii_lowercase().starts_with("palacechat") {
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    names.sort();
+    names.truncate(MAX_PALACE_CHAT_DIRS);
+    names
+}
+
 fn fill_defaults(args: &mut Args) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "$HOME".to_string());
-    let colosseum = PathBuf::from(&home).join("colosseum");
+    let home = home_dir();
+    let colosseum = home.as_ref().map(|home| home.join("colosseum"));
+
     if args.rooms_dir.is_none() {
-        let dir = colosseum.join("payloads_all");
-        if dir.is_dir() {
-            args.rooms_dir = Some(dir);
+        if let Some(dir) = colosseum.as_ref().map(|c| c.join("payloads_all")) {
+            if dir.is_dir() {
+                args.rooms_dir = Some(dir);
+            }
         }
     }
     if args.media_roots.is_empty() {
-        for candidate in [
-            colosseum.join("reference/media/media_dl"),
-            colosseum.join("http_harvest"),
-            colosseum.join("arks"),
-            PathBuf::from(&home).join("media/props"),
-            PathBuf::from(&home).join("media/props"),
-            PathBuf::from(&home).join(".local/share/PalaceChat/Media"),
-            PathBuf::from(&home).join("media/colosseum-bgs"),
-        ] {
+        // Later roots win on a name collision (see `MediaStore::new`), so the
+        // corpus fallbacks come first and the client's own media comes last.
+        let mut candidates = Vec::new();
+        if let Some(colosseum) = &colosseum {
+            candidates.push(colosseum.join("reference/media/media_dl"));
+            candidates.push(colosseum.join("http_harvest"));
+            candidates.push(colosseum.join("arks"));
+        }
+        if let Some(home) = &home {
+            candidates.push(home.join("media/props"));
+            candidates.push(home.join("media/props"));
+        }
+        candidates.extend(palace_chat_media_roots(home.as_deref()));
+        if let Some(home) = &home {
+            candidates.push(home.join("media/colosseum-bgs"));
+        }
+        for candidate in candidates {
             if candidate.is_dir() {
                 args.media_roots.push(candidate);
             }
         }
     }
     if args.props_dirs.is_empty() {
-        for candidate in [colosseum.join("props_harvested"), colosseum.join("arks")] {
-            if candidate.is_dir() {
-                args.props_dirs.push(candidate);
+        if let Some(colosseum) = &colosseum {
+            for candidate in [colosseum.join("props_harvested"), colosseum.join("arks")] {
+                if candidate.is_dir() {
+                    args.props_dirs.push(candidate);
+                }
             }
         }
     }
     if args.roster.is_none() {
-        let roster = colosseum.join("pserver.prp");
-        if roster.is_file() {
-            args.roster = Some(roster);
+        if let Some(roster) = colosseum.as_ref().map(|c| c.join("pserver.prp")) {
+            if roster.is_file() {
+                args.roster = Some(roster);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A temporary directory that deletes itself; the platform branches are
+    /// exercised against these synthetic roots, never the real user profile.
+    struct TempDir(PathBuf);
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "palace-render-defaults-{tag}-{}-{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            TempDir(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn unix_media_roots_are_the_xdg_palace_chat_media_dir() {
+        assert_eq!(
+            unix_palace_chat_media_roots(Some(Path::new("/home/user"))),
+            vec![PathBuf::from("/home/user/.local/share/PalaceChat/Media")]
+        );
+        assert!(unix_palace_chat_media_roots(None).is_empty());
+    }
+
+    #[test]
+    fn windows_media_roots_scan_both_appdata_roots() {
+        let root = TempDir::new("win-media");
+        let roaming = root.path().join("roaming");
+        let local = root.path().join("local");
+        let modern = roaming.join("PalaceChat").join("Media");
+        let versioned = local.join("PalaceChat 4").join("Media");
+        std::fs::create_dir_all(&modern).expect("create roaming media");
+        std::fs::create_dir_all(&versioned).expect("create local media");
+
+        assert_eq!(
+            windows_palace_chat_media_roots(Some(roaming), Some(local), None),
+            vec![modern, versioned],
+            "%APPDATA% must come before %LOCALAPPDATA%"
+        );
+    }
+
+    #[test]
+    fn windows_media_roots_derive_appdata_from_user_profile() {
+        let root = TempDir::new("win-profile");
+        let profile = root.path().to_path_buf();
+        let media = profile
+            .join(WINDOWS_APPDATA_SUBDIR)
+            .join(WINDOWS_ROAMING_LEAF)
+            .join("PalaceChat")
+            .join(PALACE_CHAT_MEDIA_DIR);
+        std::fs::create_dir_all(&media).expect("create profile media");
+
+        assert_eq!(
+            windows_palace_chat_media_roots(None, None, Some(profile)),
+            vec![media]
+        );
+    }
+
+    #[test]
+    fn windows_media_roots_are_empty_without_a_palace_chat_directory() {
+        let root = TempDir::new("win-media-none");
+        assert!(
+            windows_palace_chat_media_roots(Some(root.path().join("roaming")), None, None)
+                .is_empty()
+        );
     }
 }

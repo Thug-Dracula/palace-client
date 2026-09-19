@@ -3,14 +3,25 @@
 //! This module turns the on-disk [`crate::bag::PropBag`] into a flat list of
 //! browsable entries plus the two binary endpoints a picker needs: a JSON
 //! catalog and a PNG thumbnail per prop. It **only ever reads** the user's
-//! files — it never creates, writes or repairs anything under
-//! `~/.local/share/PalaceChat/`. A missing or malformed bag yields `None`
-//! rather than a panic or an error the caller has to handle.
+//! files — it never creates, writes or repairs anything under the client's
+//! data directory (`~/.local/share/PalaceChat/` on Unix, a `PalaceChat*`
+//! directory under `%APPDATA%`/`%LOCALAPPDATA%` on Windows). A missing or
+//! malformed bag yields `None` rather than a panic or an error the caller has
+//! to handle.
+//!
+//! # Discovery
+//!
+//! [`PropCatalog::open_default`] reads `PALACE_PROP_BAG` when it is set and
+//! otherwise searches the per-platform locations documented on `default_dir`:
+//! the Windows client's `PalaceChat*` data directories under `%APPDATA%`, then
+//! `%LOCALAPPDATA%`; or `~/.local/share/PalaceChat/PropBag.bundle` on Unix.
+//! Discovery is read-only and yields `None` when nothing matches.
 //!
 //! # On-disk format
 //!
-//! The bag is a `PropBag.bundle/` directory, discovered as `PROP_BAG` (see
-//! [`PropCatalog::open_default`]) and read entirely with [`crate::bag`]:
+//! The bag is a `PropBag.bundle/` directory, selected by `PALACE_PROP_BAG`
+//! when set (see [`PropCatalog::open_default`]) and read entirely with
+//! [`crate::bag`]:
 //!
 //! * `*.pids` — the index. A flat array of 16-byte **big-endian** records
 //!   `(id: u32, crc: u32, offset: u32, size: u32)`. On the live bag observed
@@ -66,8 +77,24 @@ use std::path::{Path, PathBuf};
 
 use crate::bag::{BagEntry, PropBag, BAG_INDEX_RECORD_LEN, BAG_PREFIX_LEN};
 
-/// Bundle path under the user's home when `PALACE_PROP_BAG` is unset.
+/// Bundle path under the user's home on Unix when `PALACE_PROP_BAG` is unset.
 const DEFAULT_BAG_SUBDIR: &str = ".local/share/PalaceChat/PropBag.bundle";
+
+/// The bundle directory name inside a PalaceChat data directory.
+const BAG_DIR_NAME: &str = "PropBag.bundle";
+
+/// The Windows profile subdirectory that holds the per-user AppData roots,
+/// and the two leaf names inside it. Used only when `%APPDATA%` /
+/// `%LOCALAPPDATA%` themselves are unset.
+const WINDOWS_APPDATA_SUBDIR: &str = "AppData";
+/// The roaming leaf under [`WINDOWS_APPDATA_SUBDIR`] (`%APPDATA%`).
+const WINDOWS_ROAMING_LEAF: &str = "Roaming";
+/// The local leaf under [`WINDOWS_APPDATA_SUBDIR`] (`%LOCALAPPDATA%`).
+const WINDOWS_LOCAL_LEAF: &str = "Local";
+
+/// A `PalaceChat*` scan is capped at this many directory names per AppData
+/// root, so a crafted directory tree cannot turn discovery into a long walk.
+const MAX_PALACE_CHAT_DIRS: usize = 4;
 
 /// First id of the client's synthetic built-in range, skipped by the catalog.
 const PLACEHOLDER_ID_START: u32 = 0x8000_0000;
@@ -114,10 +141,12 @@ pub struct PropCatalog {
 impl PropCatalog {
     /// Open the bag the environment selects.
     ///
-    /// Reads `PALACE_PROP_BAG` when it is set, otherwise
-    /// `~/.local/share/PalaceChat/PropBag.bundle`. Returns `None` when the
-    /// directory is missing or is not a readable `.pids`/`.props` pair; it
-    /// never panics and never creates directories.
+    /// Reads `PALACE_PROP_BAG` when it is set, otherwise follows the
+    /// per-platform defaults documented on `default_dir`: on Windows the
+    /// `PalaceChat*` data directories under `%APPDATA%` then `%LOCALAPPDATA%`,
+    /// on Unix `~/.local/share/PalaceChat/PropBag.bundle`. Returns `None` when
+    /// no readable `.pids`/`.props` pair is found; it never panics and never
+    /// creates directories.
     #[must_use]
     pub fn open_default() -> Option<Self> {
         let dir = std::env::var_os("PALACE_PROP_BAG")
@@ -247,9 +276,111 @@ impl PropCatalog {
     }
 }
 
+/// The default bundle directory for the host platform.
+///
+/// `PALACE_PROP_BAG` is checked by [`PropCatalog::open_default`] before this
+/// function is consulted, so the full candidate order is:
+///
+/// 1. `PALACE_PROP_BAG` (always wins, any platform);
+/// 2. **Windows:** the first `PropBag.bundle` inside a `PalaceChat*` directory
+///    under `%APPDATA%`, then the same under `%LOCALAPPDATA%`. The bare
+///    `PalaceChat` name (the current client) is tried first, then versioned
+///    names such as `PalaceChat 4` (the older 4.x client). `%APPDATA%` and
+///    `%LOCALAPPDATA%` are derived from `%USERPROFILE%\AppData\Roaming` and
+///    `%USERPROFILE%\AppData\Local` when the dedicated variables are unset.
+///    Returns `None` when no candidate exists;
+/// 3. **Unix only:** `$HOME/.local/share/PalaceChat/PropBag.bundle`, returned
+///    whether or not it exists, exactly as before — `open_dir` reports the
+///    miss as `None`.
 fn default_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(DEFAULT_BAG_SUBDIR))
+    if cfg!(windows) {
+        windows_default_dir(
+            std::env::var_os("APPDATA").map(PathBuf::from),
+            std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+            std::env::var_os("USERPROFILE").map(PathBuf::from),
+        )
+    } else {
+        unix_default_dir(std::env::var_os("HOME").map(PathBuf::from))
+    }
+}
+
+/// The Unix default: `$HOME/.local/share/PalaceChat/PropBag.bundle`.
+///
+/// Returns the path whether or not it exists, matching the pre-Windows
+/// behaviour; [`PropCatalog::open_dir`] turns a miss into `None`.
+fn unix_default_dir(home: Option<PathBuf>) -> Option<PathBuf> {
+    Some(home?.join(DEFAULT_BAG_SUBDIR))
+}
+
+/// The Windows default: the first `PropBag.bundle` under `%APPDATA%`, then
+/// under `%LOCALAPPDATA%` (first hit wins, roaming before local).
+///
+/// Each root is taken from its dedicated variable when set, otherwise derived
+/// from `user_profile` at the standard `AppData\Roaming` / `AppData\Local`
+/// location. Candidates are passed in rather than read from the environment so
+/// the Windows rung is testable from any host — the same idiom as
+/// `palace_client::runtime::cache_root_from`.
+fn windows_default_dir(
+    app_data: Option<PathBuf>,
+    local_app_data: Option<PathBuf>,
+    user_profile: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let roaming = app_data.or_else(|| derive_appdata(&user_profile, WINDOWS_ROAMING_LEAF));
+    let local = local_app_data.or_else(|| derive_appdata(&user_profile, WINDOWS_LOCAL_LEAF));
+    roaming
+        .as_deref()
+        .and_then(first_bag_under)
+        .or_else(|| local.as_deref().and_then(first_bag_under))
+}
+
+fn derive_appdata(user_profile: &Option<PathBuf>, leaf: &str) -> Option<PathBuf> {
+    user_profile
+        .as_ref()
+        .map(|profile| profile.join(WINDOWS_APPDATA_SUBDIR).join(leaf))
+}
+
+/// The first existing `PropBag.bundle` among the `PalaceChat*` directories of
+/// `root`, or `None` when the root is unreadable or holds no such bundle.
+fn first_bag_under(root: &Path) -> Option<PathBuf> {
+    for name in palace_chat_dir_names(root) {
+        let candidate = root.join(name).join(BAG_DIR_NAME);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The names of `PalaceChat*` directories directly under `root`.
+///
+/// PalaceChat's Windows data directory has had more than one name: the modern
+/// client uses the bare `PalaceChat`, the older 4.x client used a versioned
+/// name such as `PalaceChat 4`. Instead of hardcoding one, this lists every
+/// match, sorted so the bare name comes first and the versioned names follow
+/// in name order, capped at [`MAX_PALACE_CHAT_DIRS`]. Matching is ASCII
+/// case-insensitive because Windows file names are; an unreadable root yields
+/// an empty list.
+fn palace_chat_dir_names(root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.to_ascii_lowercase().starts_with("palacechat") {
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    names.sort();
+    names.truncate(MAX_PALACE_CHAT_DIRS);
+    names
 }
 
 /// Read every `*.favs` file in `dir`, splitting `Trash.favs` from the rest.
@@ -363,5 +494,163 @@ fn escape_json_into(text: &str, out: &mut String) {
             }
             other => out.push(other),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{encode_s20_blob, PropImage};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A temporary directory that deletes itself. Each test builds its own
+    /// synthetic bags here and never touches the user's real bag.
+    struct TempDir(PathBuf);
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "palace-catalog-default-{tag}-{}-{n}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            TempDir(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const SYNTHETIC_ID: u32 = 0x3a3a_d1f7;
+
+    /// Write a one-entry synthetic `PropBag.bundle` and return its path.
+    ///
+    /// The shape matches the real bag (16-byte big-endian `.pids` records, a
+    /// 32-byte opaque prefix before an S20 prop) but the bytes are built here,
+    /// never copied from any user's data.
+    fn write_synthetic_bag(bundle: &Path) -> PathBuf {
+        let image = PropImage::transparent(44, 44);
+        let prop = encode_s20_blob(&image, 0, 0, 0).expect("encode synthetic prop");
+        let mut blob = vec![0xa5u8; BAG_PREFIX_LEN];
+        blob.extend_from_slice(&prop);
+
+        let mut index = Vec::new();
+        index.extend_from_slice(&SYNTHETIC_ID.to_be_bytes());
+        index.extend_from_slice(&0xfeed_beefu32.to_be_bytes());
+        index.extend_from_slice(&0u32.to_be_bytes());
+        index.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+
+        std::fs::create_dir_all(bundle).expect("create bundle dir");
+        std::fs::write(bundle.join("Test.pids"), index).expect("write .pids");
+        std::fs::write(bundle.join("Test.props"), blob).expect("write .props");
+        bundle.to_path_buf()
+    }
+
+    /// A path assertion is only meaningful if the bag at that path opens.
+    fn assert_opens(bundle: &Path) {
+        let catalog = PropCatalog::open_dir(bundle).expect("synthetic bag opens");
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog.entries()[0].id, SYNTHETIC_ID);
+    }
+
+    #[test]
+    fn the_unix_default_is_the_unchanged_home_relative_path() {
+        let root = TempDir::new("unix");
+        let home = root.path().to_path_buf();
+        let expected = home.join(DEFAULT_BAG_SUBDIR);
+        assert_eq!(unix_default_dir(Some(home)), Some(expected));
+        assert_eq!(unix_default_dir(None), None);
+    }
+
+    #[test]
+    fn the_windows_default_prefers_appdata_over_local_appdata() {
+        let root = TempDir::new("win-order");
+        let roaming = root.path().join("roaming");
+        let local = root.path().join("local");
+        let in_roaming = write_synthetic_bag(&roaming.join("PalaceChat").join(BAG_DIR_NAME));
+        write_synthetic_bag(&local.join("PalaceChat").join(BAG_DIR_NAME));
+
+        let picked = windows_default_dir(Some(roaming), Some(local), None)
+            .expect("a bag exists in %APPDATA%");
+        assert_eq!(picked, in_roaming);
+        assert_opens(&picked);
+    }
+
+    #[test]
+    fn the_windows_default_finds_the_older_versioned_client() {
+        let root = TempDir::new("win-v4");
+        let roaming = root.path().join("roaming");
+        let versioned = write_synthetic_bag(&roaming.join("PalaceChat 4").join(BAG_DIR_NAME));
+
+        let picked = windows_default_dir(Some(roaming), None, None)
+            .expect("the 4.x directory is a candidate");
+        assert_eq!(picked, versioned);
+        assert_opens(&picked);
+    }
+
+    #[test]
+    fn the_windows_default_prefers_the_bare_palacechat_name() {
+        let root = TempDir::new("win-bare");
+        let roaming = root.path().join("roaming");
+        let modern = write_synthetic_bag(&roaming.join("PalaceChat").join(BAG_DIR_NAME));
+        write_synthetic_bag(&roaming.join("PalaceChat 4").join(BAG_DIR_NAME));
+
+        assert_eq!(
+            windows_default_dir(Some(roaming), None, None),
+            Some(modern),
+            "the current client's directory must win over a versioned one"
+        );
+    }
+
+    #[test]
+    fn the_windows_default_is_none_when_no_bundle_exists() {
+        let root = TempDir::new("win-none");
+        let roaming = root.path().join("roaming");
+        let local = root.path().join("local");
+        // A PalaceChat directory without a bundle inside must not count as a hit.
+        std::fs::create_dir_all(roaming.join("PalaceChat")).expect("create decoy");
+        std::fs::create_dir_all(&local).expect("create empty local root");
+
+        assert_eq!(windows_default_dir(Some(roaming), Some(local), None), None);
+        assert_eq!(windows_default_dir(None, None, None), None);
+    }
+
+    #[test]
+    fn the_windows_default_derives_appdata_roots_from_user_profile() {
+        let root = TempDir::new("win-profile");
+        let profile = root.path().to_path_buf();
+        let roaming_appdata = profile
+            .join(WINDOWS_APPDATA_SUBDIR)
+            .join(WINDOWS_ROAMING_LEAF);
+        let local_appdata = profile
+            .join(WINDOWS_APPDATA_SUBDIR)
+            .join(WINDOWS_LOCAL_LEAF);
+        let roaming_bag =
+            write_synthetic_bag(&roaming_appdata.join("PalaceChat").join(BAG_DIR_NAME));
+
+        assert_eq!(
+            windows_default_dir(None, None, Some(profile.clone())),
+            Some(roaming_bag),
+            "an unset %APPDATA% falls back to %USERPROFILE%\\AppData\\Roaming"
+        );
+
+        let local_bag = write_synthetic_bag(&local_appdata.join("PalaceChat").join(BAG_DIR_NAME));
+        std::fs::remove_dir_all(roaming_appdata.join("PalaceChat")).expect("remove roaming bag");
+        assert_eq!(
+            windows_default_dir(None, None, Some(profile)),
+            Some(local_bag),
+            "an unset %LOCALAPPDATA% falls back to %USERPROFILE%\\AppData\\Local"
+        );
     }
 }
