@@ -43,6 +43,27 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
+  windows:
+    name: tests (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # No system packages to install here. The Windows runner images already
+      # carry the MSVC toolchain and the WebView2 runtime, so unlike the Ubuntu
+      # jobs this one has no apt-get step before the toolchain.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # palace-app is excluded for the same reason the coverage job excludes
+      # it: it is a GUI shell whose behaviour lives in the crates below it, and
+      # building it needs the Tauri/webview toolchain a plain test run has not
+      # set up. Everything else in the workspace is headless and testable here,
+      # which is how Windows runtime behaviour gets its first real check.
+      - name: Tests
+        run: cargo test --workspace --exclude palace-app --locked
+
   coverage:
     name: coverage (>= 80% lines)
     runs-on: ubuntu-latest
