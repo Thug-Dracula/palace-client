@@ -77,7 +77,13 @@ input {
 
 .workspace {
   display: grid;
-  grid-template-columns: 232px minmax(0, 1fr) 208px;
+  /* Track sizes are inline custom properties set by `App.svelte` from the pure
+     layout module (`layout.ts`); the fallbacks are the docked sizes. A detached
+     panel collapses its track to the rail, giving the room the space back. */
+  grid-template-columns:
+    var(--col-rooms, 232px)
+    minmax(0, 1fr)
+    var(--col-users, 208px);
   min-height: 0;
   gap: 1px;
   background: var(--line);
@@ -85,7 +91,7 @@ input {
 
 .center {
   display: grid;
-  grid-template-rows: minmax(0, 1fr) 236px;
+  grid-template-rows: minmax(0, 1fr) var(--row-chat, 236px);
   min-height: 0;
   background: var(--bg-app);
 }
@@ -119,10 +125,72 @@ input {
   letter-spacing: 0.04em;
 }
 
+.panel-head-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
 .scroll {
   overflow-y: auto;
   min-height: 0;
   flex: 1;
+}
+
+/* ---------- Detached panel rails ---------- */
+
+/* A detached panel's slot does not vanish: it collapses to a slim rail that
+   keeps the re-attach affordance visible while the room takes the space back.
+   The panel host already renders the placeholder for this slot; these rules
+   adapt it to the narrow track. */
+.app .workspace > .panel-placeholder[data-panel] {
+  padding: var(--sp-2) 0;
+  gap: 0;
+}
+
+.app .workspace > .panel-placeholder[data-panel] p {
+  display: none;
+}
+
+.app .workspace > .panel-placeholder[data-panel] .btn {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  padding: var(--sp-3) 2px;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-1);
+}
+
+/* The chat rail is a horizontal strip, so its placeholder keeps its sentence. */
+.app .center > .panel-placeholder[data-panel="chat"] {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  padding: var(--sp-1) var(--sp-3);
+  border-top: 1px solid var(--line);
+}
+
+.app .center > .panel-placeholder[data-panel="chat"] p {
+  font-size: var(--fs-xs);
+}
+
+/* Subtle entrance for a collapsed slot. Opacity only: animating the grid
+   tracks would resize the room viewport frame by frame and flood its
+   ResizeObserver, which is what the task forbids. */
+.panel-placeholder[data-panel] {
+  animation: dock-in 160ms var(--ease);
+}
+
+@keyframes dock-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 /* ---------- Rows (room / user lists) ---------- */
@@ -216,7 +284,8 @@ input {
   border-top: 1px solid var(--line);
   min-height: 0;
   display: grid;
-  grid-template-rows: 1fr auto;
+  /* header / scrolling log / input row */
+  grid-template-rows: auto 1fr auto;
   background: var(--surface-1);
 }
 

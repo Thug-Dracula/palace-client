@@ -1,6 +1,7 @@
 <script lang="ts">
   import * as api from "../api";
   import { store } from "../store.svelte";
+  import DetachButton from "./DetachButton.svelte";
 
   async function enter(roomId: number) {
     if (!store.connected) {
@@ -10,10 +11,13 @@
   }
 </script>
 
-<div class="sidebar">
+<div class="sidebar" data-panel="rooms">
   <div class="panel-head">
     <span>Rooms</span>
-    <span class="count">{store.filteredRooms.length}/{store.rooms.length || "—"}</span>
+    <div class="panel-head-tools">
+      <span class="count">{store.filteredRooms.length}/{store.rooms.length || "—"}</span>
+      <DetachButton panel="rooms" />
+    </div>
   </div>
   <div class="filter">
     <input bind:value={store.roomFilter} placeholder="filter rooms…" spellcheck="false" aria-label="Filter rooms" />

@@ -5,6 +5,7 @@
   import RoomMenu from "./RoomMenu.svelte";
   import AvatarDialog from "./AvatarDialog.svelte";
   import PropBagDialog from "./PropBagDialog.svelte";
+  import DetachButton from "./DetachButton.svelte";
   import EditorDialog from "./editor/EditorDialog.svelte";
   import { layoutAvatars, type AvatarLayout } from "../avatarLayout";
   import {
@@ -227,7 +228,7 @@
   }
 </script>
 
-<div class="viewport-wrap">
+<div class="viewport-wrap" data-panel="room">
   <div class="toolbar">
     <div class="seg">
       <button class="btn" class:on={!store.native} type="button" onclick={() => (store.native = false)}>Fit</button>
@@ -242,6 +243,7 @@
 
     <span class="spacer"></span>
     {#if store.room}<span class="readout">{store.room.name}</span>{/if}
+    <DetachButton panel="room" />
   </div>
 
   <div

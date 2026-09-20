@@ -1,11 +1,15 @@
 <script lang="ts">
   import { faceColor, store } from "../store.svelte";
+  import DetachButton from "./DetachButton.svelte";
 </script>
 
-<div class="sidebar">
+<div class="sidebar" data-panel="users">
   <div class="panel-head">
     <span>In room</span>
-    <span class="count">{store.users.length}</span>
+    <div class="panel-head-tools">
+      <span class="count">{store.users.length}</span>
+      <DetachButton panel="users" />
+    </div>
   </div>
   <div class="scroll">
     {#each store.users as user (user.id)}

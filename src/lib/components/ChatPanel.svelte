@@ -1,6 +1,7 @@
 <script lang="ts">
   import * as api from "../api";
   import { store } from "../store.svelte";
+  import DetachButton from "./DetachButton.svelte";
 
   let draft = $state("");
   let log: HTMLDivElement | undefined = $state();
@@ -23,7 +24,14 @@
   }
 </script>
 
-<section class="chat">
+<section class="chat" data-panel="chat">
+  <div class="panel-head">
+    <span>Chat</span>
+    <div class="panel-head-tools">
+      <span class="count">{store.chat.length}</span>
+      <DetachButton panel="chat" />
+    </div>
+  </div>
   <div class="chat-log" bind:this={log}>
     {#each store.chat as line (line.seq)}
       <div class="line {line.kind}" class:pending={line.pending}>
