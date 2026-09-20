@@ -6,14 +6,54 @@
 //! The file is user-editable, so every read failure is non-fatal: the app falls
 //! back to defaults and says so once. No path here is ever split or normalised;
 //! a Windows drive letter has to survive a round trip untouched.
+//!
+//! # The file is shared
+//!
+//! The same `settings.json` is also read and written by the original
+//! PalaceChat client, so a write is an additive merge into whatever is already
+//! there rather than a rebuild from this struct: keys this build does not know
+//! keep their name, value and position, and the original file is copied to a
+//! `.bak` beside it before the first modified write. This client's own
+//! preferences live under one `prefs` object (see `PREFERENCES.md`); the
+//! legacy top level `puid` is migrated into the identity and never written
+//! back. [`read_document`], [`update_prefs`] and [`write_document`] are the
+//! merge layer; [`save`] writes the typed fields through it.
 
 use std::path::{Path, PathBuf};
 
 use palace_client::{ClientIdentity, Puid, RegistrationCode, Secret};
 use tauri::Manager;
 
+use crate::logging::{self, Level};
+
 /// The settings file's name inside the platform app-config directory.
 pub const CONFIG_FILE: &str = "settings.json";
+
+/// The block in the shared file that holds this client's own preferences.
+pub const PREFS_KEY: &str = "prefs";
+
+/// The key inside [`PREFS_KEY`] that records which schema wrote the block.
+pub const PREFS_SCHEMA_VERSION_KEY: &str = "schema_version";
+
+/// The schema version this build writes into the [`PREFS_KEY`] block.
+pub const PREFS_SCHEMA_VERSION: u64 = 1;
+
+/// Appended to the settings file's name for the one-time backup.
+pub const BACKUP_SUFFIX: &str = ".bak";
+
+/// The backup path for `path`: the full name with [`BACKUP_SUFFIX`] appended.
+#[must_use]
+pub fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(BACKUP_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Report a recoverable settings problem on stderr and in the diagnostic log.
+fn warn(message: &str) {
+    eprintln!("palace: {message}");
+    logging::log(Level::Warn, message);
+}
 
 /// The reference client's identity seed: the wall clock in milliseconds since
 /// the Unix epoch, truncated to 32 bits.
@@ -288,10 +328,10 @@ pub fn load(path: &Path) -> Option<Settings> {
         Ok(text) => text,
         Err(error) => {
             if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "palace: could not read settings at {}: {error}",
+                warn(&format!(
+                    "could not read settings at {}: {error}",
                     path.display()
-                );
+                ));
             }
             return None;
         }
@@ -299,28 +339,146 @@ pub fn load(path: &Path) -> Option<Settings> {
     match serde_json::from_str(&text) {
         Ok(settings) => Some(settings),
         Err(error) => {
-            eprintln!(
-                "palace: ignoring malformed settings at {}: {error}",
+            warn(&format!(
+                "ignoring malformed settings at {}: {error}",
                 path.display()
-            );
+            ));
             None
         }
     }
 }
 
-/// Write the settings to `path` atomically.
+/// Read a settings file as a JSON object, preserving key order.
 ///
-/// The JSON goes to a sibling temp file first and is renamed over the target, so
-/// a crash mid-write cannot leave a half-written config behind. `PathBuf`
-/// handles the separators, so this is safe with a Windows-style target path.
-pub fn save(path: &Path, settings: &Settings) -> Result<(), String> {
+/// The file is shared with the original PalaceChat client, so it is read as a
+/// generic map rather than through [`Settings`]: a key this client does not
+/// know must survive a later write. An absent file yields an empty map; an
+/// unreadable, malformed or non-object file yields an empty map and a warning,
+/// because a bad file must not stop the app from starting.
+#[must_use]
+pub fn read_document(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn(&format!(
+                    "could not read settings at {}: {error}",
+                    path.display()
+                ));
+            }
+            return serde_json::Map::new();
+        }
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(document)) => document,
+        Ok(_) => {
+            warn(&format!(
+                "ignoring settings at {}: the JSON is not an object",
+                path.display()
+            ));
+            serde_json::Map::new()
+        }
+        Err(error) => {
+            warn(&format!(
+                "ignoring malformed settings at {}: {error}",
+                path.display()
+            ));
+            serde_json::Map::new()
+        }
+    }
+}
+
+/// Read the [`PREFS_KEY`] block, preserving key order.
+///
+/// An absent block yields an empty map, so callers apply their defaults.
+#[must_use]
+pub fn read_prefs(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    read_document(path)
+        .get(PREFS_KEY)
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Additively merge `patch` into the [`PREFS_KEY`] block and write the file.
+///
+/// Only the keys named in `patch` change: nested objects are merged key by
+/// key, and everything else in the file — including keys another client wrote
+/// — is left in place and in order. The block is stamped with
+/// [`PREFS_SCHEMA_VERSION_KEY`] when it does not already carry one; an
+/// existing version is never overwritten, so a file written by a newer build
+/// is not downgraded. The write is atomic and the one-time backup applies as
+/// it does to [`save`].
+pub fn update_prefs(
+    path: &Path,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let mut document = read_document(path);
+    if !document
+        .get(PREFS_KEY)
+        .is_some_and(serde_json::Value::is_object)
+    {
+        document.insert(
+            PREFS_KEY.to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+    }
+    let prefs = document
+        .get_mut(PREFS_KEY)
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("the prefs block was just ensured to be an object");
+    merge_objects(prefs, patch);
+    if !prefs.contains_key(PREFS_SCHEMA_VERSION_KEY) {
+        prefs.insert(
+            PREFS_SCHEMA_VERSION_KEY.to_string(),
+            serde_json::Value::from(PREFS_SCHEMA_VERSION),
+        );
+    }
+    write_document(path, &document)
+}
+
+/// Merge `patch` into `base`: objects merge recursively, anything else
+/// replaces the value. The position of keys that are already present is kept.
+fn merge_objects(
+    base: &mut serde_json::Map<String, serde_json::Value>,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in patch {
+        match (base.get_mut(key), value) {
+            (Some(serde_json::Value::Object(nested)), serde_json::Value::Object(patch_nested)) => {
+                merge_objects(nested, patch_nested);
+            }
+            _ => {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Write a settings document atomically, with the one-time backup.
+///
+/// A document identical to what is already on disk is left untouched, so the
+/// shared file is only rewritten when something actually changed; a copy of
+/// the original is taken just before the first modified write and never
+/// replaced afterwards. The JSON goes to a sibling temp file first and is
+/// renamed over the target, so a crash mid-write cannot leave a half-written
+/// config behind. `PathBuf` handles the separators, so this is safe with a
+/// Windows-style target path.
+pub fn write_document(
+    path: &Path,
+    document: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
         }
     }
-    let json = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
+    let json = serde_json::to_string_pretty(document).map_err(|error| error.to_string())?;
+    if std::fs::read_to_string(path).is_ok_and(|existing| existing == json) {
+        return Ok(());
+    }
+    backup_once(path)?;
     let temp = path.with_extension("json.tmp");
     std::fs::write(&temp, json)
         .map_err(|error| format!("could not write {}: {error}", temp.display()))?;
@@ -328,6 +486,62 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), String> {
         let _ = std::fs::remove_file(&temp);
         format!("could not replace {}: {error}", path.display())
     })
+}
+
+/// Copy the original file next to itself once, before the first modified
+/// write. A file that does not exist yet has nothing to preserve; an existing
+/// backup is the earliest original and is never replaced.
+fn backup_once(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let backup = backup_path(path);
+    if backup.exists() {
+        return Ok(());
+    }
+    std::fs::copy(path, &backup).map(|_| ()).map_err(|error| {
+        format!(
+            "could not back up {} to {}: {error}",
+            path.display(),
+            backup.display()
+        )
+    })
+}
+
+/// Write the typed settings into `path` without disturbing anything else.
+///
+/// The file is shared with the original PalaceChat client, so it is rewritten
+/// as an additive merge: the existing document is read as a generic map, the
+/// fields this struct owns are replaced in place, and every other key — the
+/// sibling client's settings, future keys, keys this build does not know —
+/// survives with its name, value and position. It is never rebuilt from the
+/// struct alone. (Before the merge existed, a save silently dropped every key
+/// the struct did not declare.)
+///
+/// The legacy top level `puid` is dropped once an identity has been persisted,
+/// because the migration folded the PUID into the identity; while no identity
+/// exists the key is left alone, since it is then the only copy of the
+/// install's PUID. The credential is `#[serde(skip)]` and never reaches disk.
+/// The write goes through [`write_document`]: atomic, one-time backup, and a
+/// no-op when the merged document matches what is already there.
+pub fn save(path: &Path, settings: &Settings) -> Result<(), String> {
+    let mut document = read_document(path);
+    if settings.identity.is_some() && document.contains_key("puid") {
+        // Rebuild without the key so the position of the keys that stay is
+        // kept (a plain removal may move the last key into its slot).
+        document = document
+            .into_iter()
+            .filter(|(key, _)| key != "puid")
+            .collect();
+    }
+    let fields = serde_json::to_value(settings).map_err(|error| error.to_string())?;
+    let fields = fields
+        .as_object()
+        .expect("a serialized Settings is always a JSON object");
+    for (key, value) in fields {
+        document.insert(key.clone(), value.clone());
+    }
+    write_document(path, &document)
 }
 
 /// Check a chosen SoundFont path, returning the [`PathBuf`] to hand the engine.
@@ -633,6 +847,43 @@ mod tests {
         assert_eq!(reloaded.identity, Some(identity));
         assert_eq!(reloaded.puid, None);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn merging_prefs_keeps_unrelated_keys_and_merges_nested_objects() {
+        let mut base = serde_json::json!({
+            "appearance": {"theme": "crt-dark", "font_size_px": 13},
+            "mute": {"ignore_all": false}
+        })
+        .as_object()
+        .expect("the literal is an object")
+        .clone();
+        let patch = serde_json::json!({"appearance": {"font_size_px": 14}})
+            .as_object()
+            .expect("the literal is an object")
+            .clone();
+
+        merge_objects(&mut base, &patch);
+
+        assert_eq!(
+            base.get("appearance").and_then(|value| value.get("theme")),
+            Some(&serde_json::json!("crt-dark")),
+            "a key the patch does not name is untouched"
+        );
+        assert_eq!(
+            base.get("appearance")
+                .and_then(|value| value.get("font_size_px")),
+            Some(&serde_json::json!(14))
+        );
+        assert_eq!(
+            base.get("mute").and_then(|value| value.get("ignore_all")),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            base.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["appearance", "mute"],
+            "existing keys keep their position"
+        );
     }
 
     #[test]

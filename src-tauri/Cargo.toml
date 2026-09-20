@@ -41,7 +41,11 @@ image = { workspace = true, features = ["bmp", "webp"] }
 # embedded Liberation Sans Bold (SIL OFL 1.1) `palace-render` already bundles.
 fontdue = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `preserve_order` keeps the shared settings file's key order through the
+# read/merge/write cycle, so keys written by the original PalaceChat client
+# survive with their names, values and position intact (see `src/settings.rs`
+# and `PREFERENCES.md`).
+serde_json = { workspace = true, features = ["preserve_order"] }
 
 [dev-dependencies]
 # The animation-export test decodes the WebP this crate muxes to prove the

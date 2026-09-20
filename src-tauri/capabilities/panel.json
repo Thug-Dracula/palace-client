@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel",
+  "description": "Runtime-created detachable panel windows (labels starting `panel-`). A panel is a peer view of the one shared session: it needs to listen on the single `palace://event` channel. It deliberately gets no window/webview create, close or destroy permission — the only way a window is opened or closed is the Rust `open_panel`/`close_panel` commands, whose input is validated against a closed enum.",
+  "windows": ["panel-*"],
+  "permissions": ["core:event:default"]
+}

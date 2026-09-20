@@ -10,6 +10,7 @@ pub mod editor;
 pub mod logging;
 pub mod protocol;
 pub mod settings;
+pub mod windows;
 
 pub use settings::Settings;
 
@@ -197,6 +198,47 @@ pub fn start_client(
     Ok(handle)
 }
 
+/// The app-wide window-event handler.
+///
+/// A panel window's `CloseRequested` must never tear down the shared session:
+/// it only asks `main` to re-dock the panel, and the panel's own window is
+/// destroyed afterwards. Only the `main` window disconnects — the pre-existing
+/// single-window behaviour, now guarded by label because other windows exist.
+pub fn handle_window_event<R: tauri::Runtime>(
+    window: &tauri::Window<R>,
+    event: &tauri::WindowEvent,
+) {
+    let label = window.label();
+    match event {
+        tauri::WindowEvent::CloseRequested { .. } => match windows::close_action(label) {
+            windows::CloseAction::ReattachPanel => {
+                logging::log(Level::Info, format!("panel close requested label={label}"));
+                windows::panel_close_requested(window.app_handle(), label);
+            }
+            windows::CloseAction::DisconnectMain => {
+                logging::log(Level::Info, "window close requested; disconnecting");
+                if let Some(state) = window.try_state::<AppState>() {
+                    if let Ok(guard) = state.client.lock() {
+                        if let Some(client) = guard.as_ref() {
+                            client.disconnect();
+                            std::thread::sleep(Duration::from_millis(150));
+                        }
+                    }
+                }
+            }
+            windows::CloseAction::Ignore => {}
+        },
+        tauri::WindowEvent::Destroyed => {
+            logging::log_window(
+                label,
+                logging::WindowMilestone::Destroyed,
+                "os window destroyed",
+            );
+        }
+        _ => {}
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     if let Err(error) = logging::init() {
@@ -346,10 +388,17 @@ pub fn run() {
             editor::editor_guide_geometry,
             editor::editor_onion_neighbours,
             editor::editor_snap_point,
+            windows::open_panel,
+            windows::close_panel,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
             logging::log(Level::Info, "palace-app starting");
+            logging::log_window(
+                windows::MAIN_LABEL,
+                logging::WindowMilestone::Created,
+                "config window",
+            );
             let saved = settings::config_path(&handle).and_then(|path| settings::load(&path));
             let mut settings = Settings::resolve(defaults, saved, args.into_iter());
             if settings.ensure_identity() {
@@ -396,19 +445,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
-                logging::log(Level::Info, "window close requested; disconnecting");
-                if let Some(state) = window.try_state::<AppState>() {
-                    if let Ok(guard) = state.client.lock() {
-                        if let Some(client) = guard.as_ref() {
-                            client.disconnect();
-                            std::thread::sleep(Duration::from_millis(150));
-                        }
-                    }
-                }
-            }
-        })
+        .on_window_event(handle_window_event)
         .run(tauri::generate_context!())
         .unwrap_or_else(|error| {
             logging::log(Level::Error, format!("fatal: {error}"));
