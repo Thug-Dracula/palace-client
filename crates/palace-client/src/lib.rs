@@ -33,13 +33,14 @@ pub mod secret;
 pub mod session;
 pub mod state;
 pub mod trace;
+pub mod type1;
 pub mod xtlk;
 
 pub use avatar_images::{encode_face_cell, AvatarImageStore};
 pub use avatars::{AvatarArt, AvatarPartState, AvatarRoster, AvatarState};
 pub use error::{ClientError, Result};
 pub use frame::{FrameStore, ScreenState, ViewGeometry};
-pub use palace_wire::messages::{ClientIdentity, Puid};
+pub use palace_wire::messages::{AvatarHash, ClientIdentity, ExtendedInfoAvatar, Puid};
 pub use palace_wire::registration::RegistrationCode;
 pub use runtime::{
     ClientCommand, ClientConfig, ClientEvent, ClientEventStream, ClientHandle, ClientRuntime,
@@ -47,4 +48,8 @@ pub use runtime::{
 pub use secret::Secret;
 pub use state::{ChatKind, ChatLine, ConnectionStatus, RoomInfo, ServerBanner, UserInfo};
 pub use trace::Tracer;
+pub use type1::{
+    content_hash, export_prop_as_type1, image_dimensions, validate_type1, Type1AvatarError,
+    Type1AvatarLimits, Type1Format,
+};
 pub use xtlk::{decrypt, encrypt};

@@ -1,19 +1,26 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { store } from "../store.svelte";
+  import { propLabel, type PickedProp } from "../propPick";
 
   let {
     x,
     y,
+    prop = null,
     onclose,
     onchooseavatar,
     onprops,
+    ongather = () => {},
   }: {
     x: number;
     y: number;
+    /** The worn prop under the cursor, when the right-click landed on one. */
+    prop?: PickedProp | null;
     onclose: () => void;
     onchooseavatar: () => void;
     onprops: () => void;
+    /** Gather the picked prop, optionally wearing it straight after. */
+    ongather?: (andWear: boolean) => void;
   } = $props();
 
   const MARGIN = 8;
@@ -79,6 +86,38 @@
   oncontextmenu={(event) => event.preventDefault()}
   onkeydown={onKeydown}
 >
+  {#if prop}
+    <div class="ctx-head">{propLabel(prop.id)}</div>
+
+    <button
+      class="ctx-item"
+      type="button"
+      role="menuitem"
+      onclick={() => {
+        onclose();
+        ongather(false);
+      }}
+    >
+      <span class="ctx-check" aria-hidden="true"></span>
+      <span>Gather</span>
+    </button>
+
+    <button
+      class="ctx-item"
+      type="button"
+      role="menuitem"
+      onclick={() => {
+        onclose();
+        ongather(true);
+      }}
+    >
+      <span class="ctx-check" aria-hidden="true"></span>
+      <span>Gather &amp; Wear</span>
+    </button>
+
+    <div class="ctx-sep" role="separator"></div>
+  {/if}
+
   <button
     class="ctx-item"
     type="button"
@@ -149,3 +188,15 @@
     <span>Take off avatar</span>
   </button>
 </div>
+
+<style>
+  /* A non-interactive caption, so the gather actions read as one prop's menu. */
+  .ctx-head {
+    padding: var(--sp-1) var(--sp-2);
+    color: var(--text-3);
+    font-size: var(--fs-xs);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+</style>

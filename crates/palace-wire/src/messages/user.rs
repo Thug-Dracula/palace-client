@@ -4,6 +4,7 @@
 use crate::byteorder::{ByteOrder, Reader, Writer};
 use crate::error::{Result, WireError};
 use crate::frame::Frame;
+use crate::messages::avatar::{AvatarHash, AT_AVATAR, AVATAR_HASH_LEN};
 use crate::opcode;
 
 /// A signed 16-bit screen coordinate pair.
@@ -138,6 +139,48 @@ impl UserRec {
         w.write_i16(self.open_to_msgs);
         w.write_i16(self.nbr_props);
         w.write_str31(&self.name);
+    }
+
+    /// The record's `avatarType`, which reuses the offset the 1999 reference
+    /// calls `awayFlag`.
+    ///
+    /// `UserRec` in the PP SDK declares `sint16 avatarType` at this offset
+    /// (`mansion.h:315`), and the compiled server's debug table agrees
+    /// (`UserRec:t110 avatarType:8,688,16`). The protocol reference still labels
+    /// it `awayFlag` and marks it unused (`PalaceProtocolRef.txt:2084,2102`).
+    #[must_use]
+    pub fn avatar_type(&self) -> i16 {
+        self.away_flag
+    }
+
+    /// The record's `avatarFlags`, which reuses the offset the 1999 reference
+    /// calls `openToMsgs` (`mansion.h:316`; debug `avatarFlags:9,704,16`).
+    #[must_use]
+    pub fn avatar_flags(&self) -> u16 {
+        self.open_to_msgs as u16
+    }
+
+    /// The Type 1 avatar hash carried by a `UserRecAvatar`, when this record is
+    /// one.
+    ///
+    /// `UserRecAvatar` keeps the 124-byte size and replaces the 72-byte
+    /// `propSpec` region with `filler[52] + hash[20]` (`mansion.h:322-328`;
+    /// debug `filler:114=ar1;0;51;11,64,416; hash:100,480,160`). So the hash is
+    /// the last 20 bytes of the re-encoded prop region. `None` unless
+    /// `avatarType == AT_AVATAR`.
+    #[must_use]
+    pub fn type1_hash(&self) -> Option<AvatarHash> {
+        if self.avatar_type() != AT_AVATAR {
+            return None;
+        }
+        let mut w = Writer::with_capacity(ByteOrder::Little, AssetSpec::USER_PROP_SLOTS * 8);
+        for slot in &self.prop_spec {
+            slot.encode(&mut w);
+        }
+        let raw = w.into_vec();
+        let mut hash = [0u8; AVATAR_HASH_LEN];
+        hash.copy_from_slice(&raw[52..72]);
+        Some(AvatarHash::new(hash))
     }
 }
 
@@ -787,5 +830,50 @@ mod tests {
             assert_eq!(UserProp::decode(msg.user_id, &mut r).unwrap(), msg);
             assert!(r.is_empty());
         }
+    }
+
+    #[test]
+    fn a_type1_user_record_yields_its_hash_from_the_prop_region() {
+        // `UserRecAvatar` replaces the 72-byte propSpec region with
+        // filler[52] + hash[20], so the hash lands at bytes 52..72 of that
+        // region (debug struct `t113`: hash at bit 480 = byte 60 of the record).
+        let hash = [0xABu8; AVATAR_HASH_LEN];
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let mut w = Writer::new(order);
+            w.write_i32(3);
+            Point::new(162, 367).encode(&mut w);
+            w.write_bytes(&[0u8; 52]);
+            w.write_bytes(&hash);
+            w.write_i16(901);
+            w.write_i16(0);
+            w.write_i16(0);
+            w.write_i16(AT_AVATAR);
+            w.write_u16(0);
+            w.write_i16(0);
+            w.write_str31("Rico");
+            let bytes = w.into_vec();
+            assert_eq!(bytes.len(), UserRec::LEN);
+
+            let mut r = Reader::new(&bytes, order);
+            let rec = UserRec::decode(&mut r).unwrap();
+            assert!(r.is_empty());
+            assert_eq!(rec.avatar_type(), AT_AVATAR);
+            assert_eq!(
+                rec.type1_hash(),
+                Some(AvatarHash::new(hash)),
+                "the hash is the last 20 bytes of the prop region"
+            );
+        }
+    }
+
+    #[test]
+    fn a_classic_user_record_has_no_type1_hash() {
+        let mut w = Writer::new(ByteOrder::Little);
+        sample_user(&mut w, 3, "Rico");
+        let bytes = w.into_vec();
+        let mut r = Reader::new(&bytes, ByteOrder::Little);
+        let rec = UserRec::decode(&mut r).unwrap();
+        assert_eq!(rec.avatar_type(), crate::messages::avatar::AT_PROP);
+        assert_eq!(rec.type1_hash(), None);
     }
 }

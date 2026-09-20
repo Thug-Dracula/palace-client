@@ -10,7 +10,8 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
-    "test": "vitest run"
+    "test": "vitest run",
+    "ui:visual": "bash tools/ui-visual-check/capture.sh"
   },
   "license": "GPL-3.0-or-later",
   "dependencies": {

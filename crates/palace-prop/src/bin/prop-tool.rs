@@ -19,6 +19,8 @@
 //!                                       [--h-offset N] [--v-offset N]
 //! prop-tool encode-batch <in-dir> <out-dir> [--head] [--ghost]
 //!                                       [--h-offset N] [--v-offset N]
+//! prop-tool crc-repair <file.prp> [--out <repaired.prp>] [--dump <png-dir>]
+//!                                       audit stale Prop CRCs; optionally write a copy
 //! ```
 //!
 //! `inventory` accepts directories (recursed for `*.bin`) and `.prp` files. It
@@ -36,6 +38,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 
+use palace_prop::crc_repair::{self as crc_repair_lib, CrcAudit, CrcMismatch};
+use palace_prop::prp::Roster as PrpRoster;
 use palace_prop::{
     decode, decode_header, encode_s20_blob, PropBag, PropEndian, PropError, PropFormat, PropImage,
     FLAG_GHOST, FLAG_HEAD,
@@ -57,6 +61,7 @@ fn main() -> ExitCode {
         "bag" => bag(&args[1..]),
         "encode" => encode(&args[1..]),
         "encode-batch" => encode_batch(&args[1..]),
+        "crc-repair" => crc_repair(&args[1..]),
         "help" | "--help" | "-h" => {
             usage();
             ExitCode::SUCCESS
@@ -81,7 +86,21 @@ fn usage() {
          prop-tool bag list <bundle> [--limit N] [--stride N]\n  \
          prop-tool bag extract <bundle> <outdir> [--limit N] [--stride N] [--format NAME]\n  \
          prop-tool encode <in.png> <out.prop> [--head] [--ghost] [--h-offset N] [--v-offset N]\n  \
-         prop-tool encode-batch <in-dir> <out-dir> [--head] [--ghost] [--h-offset N] [--v-offset N]"
+         prop-tool encode-batch <in-dir> <out-dir> [--head] [--ghost] [--h-offset N] [--v-offset N]\n  \
+         prop-tool crc-repair <file.prp> [--out <repaired.prp>] [--dump <png-dir>]"
+    );
+    eprintln!(
+        "\n\
+         crc-repair audits every Prop record's payload CRC and never writes the source.\n\
+         crc_unvalidated counts records the server does not validate: every non-Prop\n\
+         record, plus a Prop blob too short to carry a payload.\n\
+         Exit status: 0 when the file is clean or --out wrote a repaired copy; 1 when\n\
+         stale Prop CRCs are found and no --out was given, so a script can gate on it.\n\
+         --out is refused when it resolves to the source. --dump writes one decoded PNG\n\
+         per stale record; a record that does not decode is reported and skipped.\n\
+         A repair is mechanical: it cannot tell an author's edit from corrupted bytes.\n\
+         Review the --dump images before trusting a repaired copy. A payload that\n\
+         decodes to nonsense is corruption, not an edit -- do not repair it."
     );
 }
 
@@ -591,6 +610,185 @@ fn extract(args: &[String]) -> ExitCode {
     }
     println!("extracted {written} props to {outdir}");
     ExitCode::SUCCESS
+}
+
+/// `crc-repair <file.prp> [--out <repaired.prp>] [--dump <png-dir>]`.
+///
+/// Audit only unless `--out` is given: a mismatch exits non-zero so a script can
+/// gate on it, and the source is only ever read (the library has no in-place
+/// mode and refuses a destination that resolves to the source).
+fn crc_repair(args: &[String]) -> ExitCode {
+    let mut source: Option<&String> = None;
+    let mut out: Option<&String> = None;
+    let mut dump: Option<&String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" | "--dump" => {
+                let name = args[i].clone();
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("{name} needs a path");
+                    usage();
+                    return ExitCode::from(2);
+                };
+                let slot = if name == "--out" { &mut out } else { &mut dump };
+                if slot.is_some() {
+                    eprintln!("{name} given more than once");
+                    usage();
+                    return ExitCode::from(2);
+                }
+                *slot = Some(value);
+                i += 2;
+                continue;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                eprintln!("unknown option {other:?}");
+                usage();
+                return ExitCode::from(2);
+            }
+            _ => {
+                if source.is_some() {
+                    eprintln!("crc-repair takes exactly one .prp path");
+                    usage();
+                    return ExitCode::from(2);
+                }
+                source = Some(&args[i]);
+            }
+        }
+        i += 1;
+    }
+    let Some(source) = source else {
+        eprintln!("crc-repair needs a .prp path");
+        usage();
+        return ExitCode::from(2);
+    };
+    let bytes = match std::fs::read(source) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("{source}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let roster = match PrpRoster::parse(&bytes) {
+        Ok(roster) => roster,
+        Err(e) => {
+            eprintln!("{source}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let audit = crc_repair_lib::audit(&roster);
+    print_crc_audit(source, &roster, &audit);
+
+    if let Some(dir) = dump {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("{dir}: {e}");
+            return ExitCode::FAILURE;
+        }
+        for mismatch in &audit.mismatches {
+            dump_mismatch(dir, &roster, mismatch);
+        }
+    }
+
+    match out {
+        Some(destination) => {
+            match crc_repair_lib::repair_file(Path::new(source), Path::new(destination)) {
+                Ok(report) => {
+                    println!(
+                        "crc-repair: wrote {} bytes to {} (source: {} bytes)",
+                        report.bytes_written,
+                        report.destination.display(),
+                        bytes.len()
+                    );
+                    println!(
+                        "crc-repair: rewrote {} stale Prop CRC field(s); the source was not modified",
+                        report.audit.repaired_count()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("crc-repair: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        None if audit.is_clean() => {
+            println!("crc-repair: clean: every Prop payload matches its stored CRC");
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!(
+                "crc-repair: {} stale Prop CRC(s); pass --out <path> to write a repaired copy \
+                 (the source is never modified)",
+                audit.repaired_count()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn print_crc_audit(source: &str, roster: &PrpRoster, audit: &CrcAudit) {
+    println!("crc-repair: {source}");
+    println!("records: {}", roster.len());
+    println!("crc_checked: {}", audit.checked);
+    println!("crc_unvalidated: {}", audit.unvalidated);
+    println!("crc_failures: {}", audit.repaired_count());
+    for mismatch in &audit.mismatches {
+        println!("  {}", describe_mismatch(mismatch));
+    }
+}
+
+fn describe_mismatch(mismatch: &CrcMismatch) -> String {
+    let name = match &mismatch.name {
+        Some(name) => format!("{name:?}"),
+        None => "(unnamed)".to_string(),
+    };
+    format!(
+        "record[{}] id={} name={name} blob={} prop_flags=0x{:04x} \
+         stored_crc=0x{:08x} computed_crc=0x{:08x}",
+        mismatch.index,
+        mismatch.key.id,
+        mismatch.data_size,
+        mismatch.prop_flags,
+        mismatch.stored_crc,
+        mismatch.computed_crc
+    )
+}
+
+/// Write one mismatching record's decoded pixels to `<dir>` as a PNG.
+///
+/// A record that will not decode is reported and skipped, never fatal: the whole
+/// point of the audit is to surface props that cannot be served, and an
+/// undecodable payload is one of the things the user must see for themselves.
+fn dump_mismatch(dir: &str, roster: &PrpRoster, mismatch: &CrcMismatch) {
+    let file = Path::new(dir).join(format!(
+        "record_{}_id_{}.png",
+        mismatch.index, mismatch.key.id
+    ));
+    let Some(record) = roster.records().get(mismatch.index) else {
+        println!(
+            "  record[{}] id={} has no blob at that index; no PNG written",
+            mismatch.index, mismatch.key.id
+        );
+        return;
+    };
+    match decode(&record.blob) {
+        Ok(prop) => match prop.image.write_png(&file) {
+            Ok(()) => println!(
+                "  record[{}] id={} -> {}",
+                mismatch.index,
+                mismatch.key.id,
+                file.display()
+            ),
+            Err(e) => println!(
+                "  record[{}] id={} PNG write failed: {e}",
+                mismatch.index, mismatch.key.id
+            ),
+        },
+        Err(e) => println!(
+            "  record[{}] id={} does not decode ({e}); no PNG written",
+            mismatch.index, mismatch.key.id
+        ),
+    }
 }
 
 /// The argument after `--name`, if present.

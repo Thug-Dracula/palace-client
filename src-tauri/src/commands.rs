@@ -2,10 +2,19 @@
 //! channels and return immediately, so the UI thread is never held by network
 //! or compositing work.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use palace_client::ClientHandle;
 use tauri::{AppHandle, LogicalSize, Manager, State};
 
+use crate::bag::{
+    BagCollectionInfo, BagKey, BagOutcome, BagOutfit, BagOutfitApplication, BagPropEntry,
+    BagService, BagShelfInfo, BagTrashEntry, FavouriteResult, GatherResult, PurgeResult,
+    ThumbnailRebuild, ThumbnailRebuildAll,
+};
 use crate::logging::{self, Level};
+use crate::protocol::BagSlot;
 use crate::settings;
 use crate::{start_client, AppState, Settings};
 
@@ -138,6 +147,399 @@ pub fn set_avatar(state: State<'_, AppState>, face: i16, color: i16) -> Result<(
 #[tauri::command]
 pub fn set_props(state: State<'_, AppState>, props: Vec<u32>) -> Result<(), String> {
     with_client(&state, |client| client.set_props(props))
+}
+
+/// Set the signed-in user's Type 1 avatar from raw image bytes.
+///
+/// The runtime validates the bytes against the server's advertised limits and
+/// reports a refusal as an error chat line.
+#[tauri::command]
+pub fn set_type1_avatar(state: State<'_, AppState>, bytes: Vec<u8>) -> Result<(), String> {
+    with_client(&state, |client| client.set_type1_avatar(bytes))
+}
+
+/// Clear the signed-in user's Type 1 avatar, returning to a prop avatar.
+#[tauri::command]
+pub fn clear_type1_avatar(state: State<'_, AppState>) -> Result<(), String> {
+    with_client(&state, |client| client.clear_type1_avatar())
+}
+
+/// The server's Type 1 avatar limits, or `None` before its `'AVAT'` reply.
+#[tauri::command]
+pub fn type1_avatar_limits(
+    state: State<'_, AppState>,
+) -> Result<Option<palace_client::Type1AvatarLimits>, String> {
+    let guard = state.client.lock().map_err(|error| error.to_string())?;
+    Ok(guard
+        .as_ref()
+        .and_then(palace_client::ClientHandle::avatar_limits))
+}
+
+/// Run a bag operation on the blocking pool, so bag file I/O never sits on the
+/// UI thread.
+async fn bag_task<T, F>(state: &State<'_, AppState>, task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&BagService) -> Result<T, String> + Send + 'static,
+{
+    let service = state.bag.clone();
+    tauri::async_runtime::spawn_blocking(move || task(&service))
+        .await
+        .map_err(|error| format!("bag task failed: {error}"))?
+}
+
+/// Every bag collection: My Bag first, then the shelves.
+#[tauri::command]
+pub async fn bag_collections(state: State<'_, AppState>) -> Result<Vec<BagCollectionInfo>, String> {
+    bag_task(&state, |service| service.collections()).await
+}
+
+/// The shelf health list from the current snapshot.
+#[tauri::command]
+pub fn bag_shelves(slot: State<'_, BagSlot>) -> Vec<BagShelfInfo> {
+    slot.get()
+        .map(|snapshot| snapshot.shelves.clone())
+        .unwrap_or_default()
+}
+
+/// The bag catalog entries from the current snapshot.
+#[tauri::command]
+pub fn bag_catalog(slot: State<'_, BagSlot>) -> Vec<BagPropEntry> {
+    slot.get()
+        .map(|snapshot| snapshot.entries())
+        .unwrap_or_default()
+}
+
+/// Forget and regenerate one bag prop's cached thumbnail.
+///
+/// The cache is keyed by `(id, crc)`. This drops that entry's cached PNG and
+/// decodes the prop again, mirroring PalaceChat's "Rebuild thumbnail". It does
+/// not change the catalog, so the snapshot slot is left untouched.
+#[tauri::command]
+pub async fn bag_rebuild_thumbnail(
+    state: State<'_, AppState>,
+    id: u32,
+    crc: u32,
+) -> Result<ThumbnailRebuild, String> {
+    bag_task(&state, move |service| {
+        let png = service.rebuild_thumbnail(id, crc)?;
+        Ok(ThumbnailRebuild {
+            id,
+            crc,
+            rebuilt: png.is_some(),
+            bytes: png.map_or(0, |bytes| bytes.len()),
+        })
+    })
+    .await
+}
+
+/// Drop every cached bag thumbnail; they regenerate lazily on the next request.
+#[tauri::command]
+pub async fn bag_rebuild_thumbnails(
+    state: State<'_, AppState>,
+) -> Result<ThumbnailRebuildAll, String> {
+    bag_task(&state, move |service| service.rebuild_thumbnails())
+        .await
+        .map(|removed| ThumbnailRebuildAll { removed })
+}
+
+/// Add a prop blob to My Bag; the CRC must match the blob's payload.
+#[tauri::command]
+pub async fn bag_add(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+    id: u32,
+    crc: u32,
+    blob: Vec<u8>,
+    name: Option<String>,
+) -> Result<BagOutcome, String> {
+    let slot = slot.inner().clone();
+    let (outcome, snapshot) = bag_task(&state, move |service| {
+        let outcome = service.add_prop(id, crc, &blob, name.as_deref())?;
+        Ok((outcome, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(outcome)
+}
+
+/// Remove one `(id, crc)` from My Bag.
+#[tauri::command]
+pub async fn bag_remove(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+    id: u32,
+    crc: u32,
+) -> Result<BagOutcome, String> {
+    let slot = slot.inner().clone();
+    let (outcome, snapshot) = bag_task(&state, move |service| {
+        let outcome = service.remove_prop(id, crc)?;
+        Ok((outcome, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(outcome)
+}
+
+/// Move a prop between two writable collections.
+#[tauri::command]
+pub async fn bag_move(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+    from: String,
+    to: String,
+    id: u32,
+    crc: u32,
+) -> Result<BagOutcome, String> {
+    let slot = slot.inner().clone();
+    let (outcome, snapshot) = bag_task(&state, move |service| {
+        let outcome = service.move_prop(&PathBuf::from(from), &PathBuf::from(to), id, crc)?;
+        Ok((outcome, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(outcome)
+}
+
+/// Copy a prop from any readable collection into My Bag.
+#[tauri::command]
+pub async fn bag_duplicate(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+    from: String,
+    id: u32,
+    crc: u32,
+    name: Option<String>,
+) -> Result<BagOutcome, String> {
+    let slot = slot.inner().clone();
+    let (outcome, snapshot) = bag_task(&state, move |service| {
+        let outcome = service.duplicate_prop(&PathBuf::from(from), id, crc, name.as_deref())?;
+        Ok((outcome, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(outcome)
+}
+
+/// Set (or clear) one My Bag record's name.
+#[tauri::command]
+pub async fn bag_rename(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+    id: u32,
+    crc: u32,
+    name: Option<String>,
+) -> Result<BagOutcome, String> {
+    let slot = slot.inner().clone();
+    let (outcome, snapshot) = bag_task(&state, move |service| {
+        let outcome = service.rename_prop(id, crc, name.as_deref())?;
+        Ok((outcome, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(outcome)
+}
+
+/// Create My Bag as a valid empty collection.
+#[tauri::command]
+pub async fn bag_create_collection(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+) -> Result<BagOutcome, String> {
+    let slot = slot.inner().clone();
+    let (outcome, snapshot) = bag_task(&state, move |service| {
+        let outcome = service.create_my_bag()?;
+        Ok((outcome, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(outcome)
+}
+
+/// Delete My Bag.
+#[tauri::command]
+pub async fn bag_delete_collection(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+) -> Result<BagOutcome, String> {
+    let slot = slot.inner().clone();
+    let (outcome, snapshot) = bag_task(&state, move |service| {
+        let outcome = service.delete_my_bag()?;
+        Ok((outcome, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(outcome)
+}
+
+/// Add or remove one `(id, crc)` in My Bag's favourite record.
+#[tauri::command]
+pub async fn bag_favourite(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+    id: u32,
+    crc: u32,
+    favourite: bool,
+) -> Result<FavouriteResult, String> {
+    let slot = slot.inner().clone();
+    let (result, snapshot) = bag_task(&state, move |service| {
+        let result = service.set_favourite(id, crc, favourite)?;
+        Ok((result, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(result)
+}
+
+/// Move one My Bag prop to the trash.
+#[tauri::command]
+pub async fn bag_trash(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+    id: u32,
+    crc: u32,
+) -> Result<BagOutcome, String> {
+    let slot = slot.inner().clone();
+    let (outcome, snapshot) = bag_task(&state, move |service| {
+        let outcome = service.trash_prop(id, crc)?;
+        Ok((outcome, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(outcome)
+}
+
+/// The trashed props, oldest first.
+#[tauri::command]
+pub async fn bag_trash_list(state: State<'_, AppState>) -> Result<Vec<BagTrashEntry>, String> {
+    bag_task(&state, |service| Ok(service.trash_list())).await
+}
+
+/// Restore one trashed prop into My Bag.
+#[tauri::command]
+pub async fn bag_trash_restore(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+    id: u32,
+    crc: u32,
+) -> Result<BagOutcome, String> {
+    let slot = slot.inner().clone();
+    let (outcome, snapshot) = bag_task(&state, move |service| {
+        let outcome = service.trash_restore(id, crc)?;
+        Ok((outcome, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(outcome)
+}
+
+/// Discard every trashed prop.
+#[tauri::command]
+pub async fn bag_trash_purge(state: State<'_, AppState>) -> Result<PurgeResult, String> {
+    bag_task(&state, |service| service.trash_purge()).await
+}
+
+/// Gather a room prop's bytes from the live asset intake into My Bag.
+///
+/// The bytes come from the client's own received-prop store, never from a
+/// parallel source. `crc` is optional: when omitted it is computed from the
+/// blob. A prop the intake does not hold is reported as rejected, not an error.
+#[tauri::command]
+pub async fn gather_prop(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+    id: u32,
+    crc: Option<u32>,
+    name: Option<String>,
+) -> Result<GatherResult, String> {
+    let blob = with_client(&state, |client| client.prop_blob(id))?;
+    let Some(blob) = blob else {
+        return Ok(GatherResult::Rejected {
+            reason: format!(
+                "prop {id} is not in the live asset intake; open the room that shows it first"
+            ),
+        });
+    };
+    if blob.len() < palace_prop::HEADER_LEN {
+        return Ok(GatherResult::Rejected {
+            reason: format!(
+                "prop {id} is {} bytes, too short to carry a prop header",
+                blob.len()
+            ),
+        });
+    }
+    let crc = crc.unwrap_or_else(|| palace_prop::asset_crc(&blob[palace_prop::HEADER_LEN..]));
+    let slot = slot.inner().clone();
+    let (result, snapshot) = bag_task(&state, move |service| {
+        let result = service.gather(id, crc, &blob, name.as_deref())?;
+        Ok((result, service.snapshot()))
+    })
+    .await?;
+    slot.set(Arc::new(snapshot));
+    Ok(result)
+}
+
+/// Every stored outfit.
+#[tauri::command]
+pub async fn outfits_list(state: State<'_, AppState>) -> Result<Vec<BagOutfit>, String> {
+    bag_task(&state, |service| Ok(service.outfits())).await
+}
+
+/// Record the worn keys as the outfit `name`.
+#[tauri::command]
+pub async fn outfits_save(
+    state: State<'_, AppState>,
+    name: String,
+    props: Vec<BagKey>,
+) -> Result<Vec<BagOutfit>, String> {
+    bag_task(&state, move |service| service.outfit_save(&name, &props)).await
+}
+
+/// Split an outfit into what the bag can wear and what it is missing.
+#[tauri::command]
+pub async fn outfits_apply(
+    state: State<'_, AppState>,
+    slot: State<'_, BagSlot>,
+    name: String,
+) -> Result<BagOutfitApplication, String> {
+    let snapshot = slot.get();
+    bag_task(&state, move |service| match &snapshot {
+        Some(snapshot) => service.outfit_apply(&name, snapshot),
+        None => Ok(BagOutfitApplication::default()),
+    })
+    .await
+}
+
+/// Rename an outfit.
+#[tauri::command]
+pub async fn outfits_rename(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<Vec<BagOutfit>, String> {
+    bag_task(&state, move |service| service.outfit_rename(&from, &to)).await
+}
+
+/// Delete an outfit.
+#[tauri::command]
+pub async fn outfits_delete(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<Vec<BagOutfit>, String> {
+    bag_task(&state, move |service| service.outfit_delete(&name)).await
+}
+
+/// Duplicate an outfit under a new name.
+#[tauri::command]
+pub async fn outfits_duplicate(
+    state: State<'_, AppState>,
+    source: String,
+    target: String,
+) -> Result<Vec<BagOutfit>, String> {
+    bag_task(&state, move |service| {
+        service.outfit_duplicate(&source, &target)
+    })
+    .await
 }
 
 /// Report the viewport size, device pixel ratio, zoom and scale mode.

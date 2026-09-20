@@ -4,7 +4,9 @@
 //! frame, draws the chrome around it, and forwards input. All protocol,
 //! asset and compositing work lives in `palace-client` on worker threads.
 
+pub mod bag;
 pub mod commands;
+pub mod editor;
 pub mod logging;
 pub mod protocol;
 pub mod settings;
@@ -30,6 +32,8 @@ pub struct AppState {
     pub audio: Mutex<AudioEngine>,
     /// The vendored font `settings.soundfont` falls back to when it is `None`.
     pub bundled_soundfont: Option<PathBuf>,
+    /// The prop bag folder and the operations the shell exposes over it.
+    pub bag: bag::BagService,
 }
 
 /// Split a search path using the platform's own separator.
@@ -83,8 +87,19 @@ pub fn config_for(settings: &Settings) -> ClientConfig {
             .unwrap_or_default(),
         seed_media: seed_media(),
         seed_props: seed_props(),
+        allow_avatar_upload: avatar_upload_allowed(),
         ..ClientConfig::default()
     }
+}
+
+/// Whether the user has explicitly opted into Type 1 avatar uploads.
+///
+/// Off unless `PALACE_ALLOW_AVATAR_UPLOAD=1`: writing an avatar to a server is
+/// a deliberate act that needs the server owner's permission, so the default is
+/// to validate and display locally without uploading.
+#[must_use]
+fn avatar_upload_allowed() -> bool {
+    std::env::var_os("PALACE_ALLOW_AVATAR_UPLOAD").is_some_and(|value| value == "1")
 }
 
 /// The SoundFont vendored into the bundle, relative to the resource directory.
@@ -206,6 +221,20 @@ pub fn run() {
         ),
     }
     let handler_catalog = catalog_slot.clone();
+    let bag_slot = protocol::BagSlot::default();
+    let handler_bag = bag_slot.clone();
+    let editor_slot = editor::EditorSlot::default();
+    let bag_service = bag::BagService::discover();
+    let initial_bag = bag_service.snapshot();
+    logging::log(
+        Level::Info,
+        format!(
+            "bag catalog loaded: {} entries, {} shelves",
+            initial_bag.catalog.len(),
+            initial_bag.shelves.len()
+        ),
+    );
+    bag_slot.set(Arc::new(initial_bag));
     let defaults = Settings::from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -214,11 +243,14 @@ pub fn run() {
         .manage(slot)
         .manage(catalog_slot)
         .manage(image_slot)
+        .manage(bag_slot)
+        .manage(editor_slot)
         .register_asynchronous_uri_scheme_protocol("palace", move |_ctx, request, responder| {
             protocol::handle(
                 &handler_slot,
                 &handler_catalog,
                 &handler_images,
+                &handler_bag,
                 &request,
                 responder,
             );
@@ -235,6 +267,9 @@ pub fn run() {
             commands::set_visibility,
             commands::set_avatar,
             commands::set_props,
+            commands::set_type1_avatar,
+            commands::clear_type1_avatar,
+            commands::type1_avatar_limits,
             commands::set_viewport,
             commands::set_ui_scale,
             commands::refresh,
@@ -242,6 +277,75 @@ pub fn run() {
             commands::set_soundfont,
             commands::set_audio_enabled,
             commands::set_volume,
+            commands::bag_collections,
+            commands::bag_shelves,
+            commands::bag_catalog,
+            commands::bag_rebuild_thumbnail,
+            commands::bag_rebuild_thumbnails,
+            commands::bag_add,
+            commands::bag_remove,
+            commands::bag_move,
+            commands::bag_duplicate,
+            commands::bag_rename,
+            commands::bag_create_collection,
+            commands::bag_delete_collection,
+            commands::bag_favourite,
+            commands::bag_trash,
+            commands::bag_trash_list,
+            commands::bag_trash_restore,
+            commands::bag_trash_purge,
+            commands::gather_prop,
+            commands::outfits_list,
+            commands::outfits_save,
+            commands::outfits_apply,
+            commands::outfits_rename,
+            commands::outfits_delete,
+            commands::outfits_duplicate,
+            editor::editor_open_blank,
+            editor::editor_open_bag_prop,
+            editor::editor_open_image,
+            editor::editor_state,
+            editor::editor_frame_png,
+            editor::editor_undo,
+            editor::editor_redo,
+            editor::editor_add_frame,
+            editor::editor_duplicate_frame,
+            editor::editor_delete_frame,
+            editor::editor_move_frame,
+            editor::editor_select_frame,
+            editor::editor_copy_frame,
+            editor::editor_paste_frame,
+            editor::editor_paint_stroke,
+            editor::editor_erase_stroke,
+            editor::editor_begin_stroke,
+            editor::editor_extend_stroke,
+            editor::editor_flood_fill,
+            editor::editor_pick_color,
+            editor::editor_clear_frame,
+            editor::editor_flip,
+            editor::editor_rotate,
+            editor::editor_crop,
+            editor::editor_crop_square,
+            editor::editor_shape_crop,
+            editor::editor_resize,
+            editor::editor_adjust_brightness_contrast,
+            editor::editor_adjust_colour,
+            editor::editor_remove_background,
+            editor::editor_sample_key_color,
+            editor::editor_save_prop,
+            editor::editor_export_png,
+            editor::editor_export_webp,
+            editor::editor_add_text,
+            editor::editor_import_overlay,
+            editor::editor_update_layer,
+            editor::editor_move_layer,
+            editor::editor_delete_layer,
+            editor::editor_guide_state,
+            editor::editor_set_guide_toggles,
+            editor::editor_set_onion_radius,
+            editor::editor_guide_geometry,
+            editor::editor_onion_neighbours,
+            editor::editor_snap_point,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -274,6 +378,7 @@ pub fn run() {
                 settings: Mutex::new(settings.clone()),
                 audio: Mutex::new(audio),
                 bundled_soundfont: bundled,
+                bag: bag_service.clone(),
             });
             match start_client(&handle, &settings, audio_handle) {
                 Ok(client) => {

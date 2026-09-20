@@ -1,0 +1,138 @@
+/*
+ * Shared chrome for the prop editor and the prop bag.
+ *
+ * Imported by `EditorDialog.svelte` and `PropBagDialog.svelte`. Plain CSS (not
+ * a Svelte <style> block) so the rules reach child components: the editor's
+ * panels and the bag's tiles are separate components, and a scoped selector
+ * would not cross that boundary.
+ *
+ * Only cross-cutting concerns live here — focus visibility, disabled states,
+ * headers, and loading/error/notice presentation — so the two dialogs read as
+ * one surface while each keeps its own layout.
+ */
+
+/* ---------- Focus ---------- */
+
+/* A single visible focus ring for every control in both dialogs. Individual
+   components must not set `outline: none` on `:focus-visible` or the ring
+   disappears for keyboard users. */
+.editor-dialog :focus-visible,
+.bag-dialog :focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+/* The canvas fills its box and clips overflow, so keep its ring inside. */
+.editor-dialog .canvas-box:focus-visible {
+  outline-offset: -3px;
+}
+
+/* Beat the app-wide `outline: none` on these controls so keyboard focus is
+   never invisible inside the two dialogs. */
+.editor-dialog .dialog-x:focus-visible,
+.bag-dialog .dialog-x:focus-visible,
+.editor-dialog input[type="range"]:focus-visible,
+.bag-dialog input[type="range"]:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+/* ---------- Disabled ---------- */
+
+.editor-dialog :disabled,
+.bag-dialog :disabled {
+  cursor: not-allowed;
+}
+
+.editor-dialog input:disabled,
+.editor-dialog select:disabled,
+.editor-dialog textarea:disabled,
+.bag-dialog input:disabled,
+.bag-dialog select:disabled {
+  opacity: 0.5;
+}
+
+/* ---------- Dialog headers ---------- */
+
+.editor-dialog .editor-menubar,
+.bag-dialog .dialog-head {
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.editor-dialog .editor-title,
+.bag-dialog .dialog-head > span:first-child {
+  color: var(--amber);
+}
+
+/* ---------- Loading ---------- */
+
+.ui-loading {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--text-1);
+}
+
+.ui-loading::before {
+  content: "";
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--amber);
+  border-radius: 50%;
+  animation: ui-spin 700ms linear infinite;
+}
+
+@keyframes ui-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-loading::before {
+    animation: none;
+  }
+}
+
+/* ---------- Errors and notices ---------- */
+
+.ui-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+}
+
+.ui-alert.error {
+  background: rgba(255, 107, 107, 0.1);
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.ui-alert.warn {
+  background: rgba(255, 180, 84, 0.1);
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.ui-alert.notice {
+  background: var(--cyan-soft);
+  border-color: var(--cyan);
+  color: var(--cyan);
+}
+
+.ui-alert .ui-alert-text {
+  min-width: 0;
+}

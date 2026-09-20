@@ -51,6 +51,10 @@ pub struct AvatarState {
     pub is_self: bool,
     /// True when the avatar is marked away (idle / not interacting).
     pub away: bool,
+    /// The user's `avatarType`: [`AT_PROP`](palace_wire::messages::AT_PROP) for a
+    /// classic prop avatar, [`AT_AVATAR`](palace_wire::messages::AT_AVATAR) for a
+    /// Type 1 single-image avatar.
+    pub avatar_type: i16,
     /// The artwork layers that make up the drawn avatar, back to front.
     pub parts: Vec<AvatarPartState>,
 }
@@ -91,6 +95,16 @@ pub enum AvatarArt {
     Prop {
         /// Identifier of the prop artwork to draw.
         id: u32,
+    },
+    /// A Type 1 avatar: one server-hosted image, identified by its hash.
+    ///
+    /// Distinct from [`AvatarArt::Prop`] on purpose: a Type 1 avatar is a single
+    /// image the server stores and serves, not a 44x44 tile from the prop
+    /// library. `hash` is the 20-byte content hash as lowercase hex, which is
+    /// the key the `palace://type1-avatar/` route serves.
+    Type1 {
+        /// The content hash, lowercase hex.
+        hash: String,
     },
 }
 
@@ -138,6 +152,7 @@ mod tests {
                     color: 5,
                     is_self: true,
                     away: false,
+                    avatar_type: palace_wire::messages::AT_PROP,
                     parts: vec![AvatarPartState {
                         art: AvatarArt::Face { face: 3, color: 5 },
                         dx: 0,
@@ -156,6 +171,7 @@ mod tests {
                     color: 2,
                     is_self: false,
                     away: true,
+                    avatar_type: palace_wire::messages::AT_PROP,
                     parts: vec![
                         AvatarPartState {
                             art: AvatarArt::Face { face: 1, color: 2 },
@@ -229,5 +245,32 @@ mod tests {
         assert_eq!(bo_parts[1]["art"]["id"], json!(900));
         assert_placement(&bo_parts[0]);
         assert_placement(&bo_parts[1]);
+    }
+
+    #[test]
+    fn a_type1_avatar_is_one_tagged_image_layer_not_prop_tiles() {
+        let hash = "a9993e364706816aba3e25717850c26c9cd0d89d";
+        let mut roster = roster();
+        roster.avatars[0].avatar_type = palace_wire::messages::AT_AVATAR;
+        roster.avatars[0].parts = vec![AvatarPartState {
+            art: AvatarArt::Type1 {
+                hash: hash.to_string(),
+            },
+            dx: 0,
+            dy: 0,
+            alpha: 1.0,
+            w: 132,
+            h: 132,
+        }];
+
+        let value = serde_json::to_value(&roster).expect("roster serializes");
+        let ada = &value["avatars"][0];
+        assert_eq!(ada["avatar_type"], json!(palace_wire::messages::AT_AVATAR));
+        let parts = ada["parts"].as_array().expect("parts is an array");
+        assert_eq!(parts.len(), 1, "a Type 1 avatar is a single layer");
+        assert_eq!(parts[0]["art"]["kind"], json!("type1"));
+        assert_eq!(parts[0]["art"]["hash"], json!(hash));
+        assert_eq!(parts[0]["w"], json!(132));
+        assert_placement(&parts[0]);
     }
 }

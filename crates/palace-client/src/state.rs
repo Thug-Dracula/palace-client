@@ -6,7 +6,7 @@
 //! recorded as an error chat line and ignored. That makes it the unit the
 //! recorded-fixture tests drive.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use palace_asset::ScriptFetch;
 use palace_host::ScriptEvent;
@@ -14,7 +14,10 @@ use palace_render::{DrawList, RoomDesc};
 use palace_room::{LooseProp, LoosePropSpec};
 use palace_wire::byteorder::ByteOrder;
 use palace_wire::frame::{navr_frame, Frame};
-use palace_wire::messages::{self, authresponse_frame, AssetSpec, Message, Point, UserRec};
+use palace_wire::messages::{
+    self, authresponse_frame, AssetSpec, AvatarHash, AvatarQuery, AvatarSend, Message, Point,
+    UserRec, AT_AVATAR, AT_PROP,
+};
 use palace_wire::opcode;
 use serde::Serialize;
 
@@ -22,6 +25,7 @@ use crate::runtime::{
     move_spot_in_room, remove_local_hotspot, set_local_spot_state, set_pic_offset_in_room,
 };
 use crate::secret::Secret;
+use crate::type1::Type1AvatarLimits;
 use crate::xtlk;
 
 /// A door hotspot's `state` field is its lock: `HS_Unlock` is 0 and `HS_Lock`
@@ -74,6 +78,12 @@ pub struct UserInfo {
     pub props: Vec<u32>,
     pub away: bool,
     pub is_self: bool,
+    /// `AT_PROP` for a classic prop avatar, `AT_AVATAR` for a Type 1 avatar.
+    pub avatar_type: i16,
+    /// `AF_*` flags for a Type 1 avatar.
+    pub avatar_flags: u16,
+    /// The Type 1 avatar's 20-byte content hash, lowercase hex, when it has one.
+    pub avatar_hash: Option<String>,
 }
 
 /// The flavour of a chat line.
@@ -124,6 +134,10 @@ pub struct Applied {
     pub chat: Vec<ChatLine>,
     pub render: bool,
     pub media_base: bool,
+    /// The server advertised (or changed) its Type 1 avatar limits.
+    pub avatar_limits: bool,
+    /// An inbound `sAva`: the runtime caches its bytes or URL by hash.
+    pub avatar_send: Option<AvatarSend>,
     pub outbound: Vec<Frame>,
     /// Script events this frame asks the host to run, in decode order.
     ///
@@ -199,6 +213,11 @@ pub struct SessionState {
     last_error: Option<String>,
     /// The credential that answers an `auth` challenge, when one is configured.
     credential: Option<Credential>,
+    /// The server's Type 1 avatar limits from its `'AVAT'` block, once asked for.
+    pub avatar_limits: Option<Type1AvatarLimits>,
+    /// Hashes a `qAva` has already been sent for, so a repeated user record does
+    /// not spam the server with the same query.
+    requested_avatars: HashSet<AvatarHash>,
 }
 
 impl SessionState {
@@ -236,6 +255,8 @@ impl SessionState {
             chat_seq: 0,
             last_error: None,
             credential: None,
+            avatar_limits: None,
+            requested_avatars: HashSet::new(),
         }
     }
 
@@ -329,8 +350,15 @@ impl SessionState {
             x: rec.room_pos.h,
             y: rec.room_pos.v,
             props,
-            away: rec.away_flag != 0,
+            // The field the protocol reference calls `awayFlag` is `avatarType`
+            // in the PP SDK and the compiled server (`mansion.h:315`,
+            // `UserRec:t110 avatarType:8,688,16`). A Type 1 user is not away,
+            // so only a classic record's nonzero value means away.
+            away: rec.away_flag != 0 && rec.avatar_type() != AT_AVATAR,
             is_self: rec.user_id == self.banner.user_id,
+            avatar_type: rec.avatar_type(),
+            avatar_flags: rec.avatar_flags(),
+            avatar_hash: rec.type1_hash().map(|hash| hash.to_hex()),
         }
     }
 
@@ -464,6 +492,9 @@ impl SessionState {
                             props: Vec::new(),
                             away: false,
                             is_self: rec.user_id == self.banner.user_id,
+                            avatar_type: AT_PROP,
+                            avatar_flags: 0,
+                            avatar_hash: None,
                         });
                 }
                 applied.users = true;
@@ -472,6 +503,10 @@ impl SessionState {
                 self.room_users = list.users.iter().map(|u| u.user_id).collect();
                 for rec in &list.users {
                     let entry = self.user_info_from_record(rec);
+                    if let Some(hash) = entry.avatar_hash.as_deref().and_then(AvatarHash::from_hex)
+                    {
+                        self.queue_avatar_query(rec.user_id, hash, &mut applied);
+                    }
                     self.users.insert(rec.user_id, entry);
                 }
                 self.merge_room_users();
@@ -481,6 +516,9 @@ impl SessionState {
             Message::UserNew(new) => {
                 let rec = &new.record;
                 let entry = self.user_info_from_record(rec);
+                if let Some(hash) = entry.avatar_hash.as_deref().and_then(AvatarHash::from_hex) {
+                    self.queue_avatar_query(rec.user_id, hash, &mut applied);
+                }
                 self.users.insert(rec.user_id, entry);
                 if !self.room_users.contains(&rec.user_id) {
                     self.room_users.push(rec.user_id);
@@ -523,6 +561,9 @@ impl SessionState {
                         props: Vec::new(),
                         away: false,
                         is_self: false,
+                        avatar_type: AT_PROP,
+                        avatar_flags: 0,
+                        avatar_hash: None,
                     });
                     entry.x = mv.position.h;
                     entry.y = mv.position.v;
@@ -583,6 +624,64 @@ impl SessionState {
                         spot: None,
                     });
                 }
+            }
+            Message::UserPropAvatar(prop) => {
+                let changed = self.set_user_avatar_identity(
+                    prop.user_id,
+                    prop.avatar_type,
+                    prop.avatar_flags,
+                    prop.hash,
+                );
+                if changed {
+                    applied.users = true;
+                    applied.render = true;
+                    applied.scripts.push(ScriptStimulus {
+                        event: ScriptEvent::PropChange,
+                        spot: None,
+                    });
+                }
+                self.queue_avatar_query(prop.user_id, prop.hash, &mut applied);
+            }
+            Message::UserDescAvatar(desc) => {
+                let face = self.set_user_face(desc.user_id, desc.face_nbr);
+                let color = self.set_user_color(desc.user_id, desc.color_nbr);
+                let avatar = self.set_user_avatar_identity(
+                    desc.user_id,
+                    desc.avatar_type,
+                    desc.avatar_flags,
+                    desc.hash,
+                );
+                if face || color || avatar {
+                    applied.users = true;
+                    applied.render = true;
+                }
+                self.queue_avatar_query(desc.user_id, desc.hash, &mut applied);
+            }
+            Message::ExtendedInfo(reply) => {
+                if let Some(info) = reply.avatar(order) {
+                    let limits = Type1AvatarLimits::from_info(info);
+                    if self.avatar_limits != Some(limits) {
+                        self.avatar_limits = Some(limits);
+                        applied.avatar_limits = true;
+                    }
+                }
+            }
+            Message::AvatarFlags(flags) => {
+                if let Some(user) = self.users.get_mut(&flags.user_id) {
+                    if user.avatar_flags != flags.flags {
+                        user.avatar_flags = flags.flags;
+                        applied.users = true;
+                        applied.render = true;
+                    }
+                }
+            }
+            Message::AvatarSend(send) => {
+                applied.avatar_send = Some(send);
+            }
+            Message::AvatarQuery(_) => {
+                // A server-to-client `qAva` asks whether we hold another user's
+                // avatar. We do not relay cached avatars back to the server yet;
+                // the runtime answers inbound `sAva` by caching it for display.
             }
             Message::UserDesc(desc) => {
                 let face = self.set_user_face(desc.user_id, desc.face_nbr);
@@ -908,6 +1007,66 @@ impl SessionState {
         true
     }
 
+    /// Set a user's Type 1 avatar identity: type, flags and hash together.
+    ///
+    /// Assigns the hash as hex so it survives JSON; a `AT_PROP` update clears
+    /// it. Returns whether anything changed.
+    fn set_user_avatar_identity(
+        &mut self,
+        user_id: i32,
+        avatar_type: i16,
+        avatar_flags: u16,
+        hash: AvatarHash,
+    ) -> bool {
+        let Some(user) = self.known_user_mut(user_id) else {
+            return false;
+        };
+        let hex = (avatar_type == AT_AVATAR && !hash.is_zero()).then(|| hash.to_hex());
+        if user.avatar_type == avatar_type
+            && user.avatar_flags == avatar_flags
+            && user.avatar_hash == hex
+        {
+            return false;
+        }
+        user.avatar_type = avatar_type;
+        user.avatar_flags = avatar_flags;
+        user.avatar_hash = hex;
+        true
+    }
+
+    /// Set the signed-in user's Type 1 avatar to `hash`.
+    pub(crate) fn set_self_avatar_hash(&mut self, hash: AvatarHash) -> bool {
+        let user_id = self.banner.user_id;
+        self.set_user_avatar_identity(user_id, AT_AVATAR, 0, hash)
+    }
+
+    /// Return the signed-in user to a classic prop avatar.
+    pub(crate) fn clear_self_avatar_hash(&mut self) -> bool {
+        let user_id = self.banner.user_id;
+        self.set_user_avatar_identity(user_id, AT_PROP, 0, AvatarHash::ZERO)
+    }
+
+    /// Queue one `qAva` for a hash we do not hold, so the server sends its bytes.
+    ///
+    /// Only remote users are queried: our own avatar's bytes are cached the
+    /// moment we set them. Each hash is queried at most once per session.
+    fn queue_avatar_query(&mut self, user_id: i32, hash: AvatarHash, applied: &mut Applied) {
+        if hash.is_zero() || user_id == self.banner.user_id {
+            return;
+        }
+        if !self.requested_avatars.insert(hash) {
+            return;
+        }
+        if let Ok(frame) = (AvatarQuery { hash }).frame(self.byte_order()) {
+            applied.outbound.push(frame);
+        }
+    }
+
+    /// Remember that we hold a hash, so a later record does not re-query it.
+    pub(crate) fn mark_avatar_known(&mut self, hash: AvatarHash) {
+        self.requested_avatars.insert(hash);
+    }
+
     /// Append a loose prop to the room.
     ///
     /// The index later `PROPMOVE`/`PROPDEL` address is the list length before
@@ -1017,6 +1176,9 @@ impl SessionState {
                 props: Vec::new(),
                 away: false,
                 is_self: true,
+                avatar_type: AT_PROP,
+                avatar_flags: 0,
+                avatar_hash: None,
             },
         );
         if !self.room_users.contains(&id) {
@@ -1055,6 +1217,9 @@ impl SessionState {
                 props: Vec::new(),
                 away: false,
                 is_self: true,
+                avatar_type: AT_PROP,
+                avatar_flags: 0,
+                avatar_hash: None,
             },
         );
         true
@@ -1120,6 +1285,9 @@ mod tests {
                 props: Vec::new(),
                 away: false,
                 is_self: id == SELF,
+                avatar_type: AT_PROP,
+                avatar_flags: 0,
+                avatar_hash: None,
             },
         );
     }
@@ -1151,6 +1319,9 @@ mod tests {
             props: Vec::new(),
             away: false,
             is_self: id == SELF,
+            avatar_type: AT_PROP,
+            avatar_flags: 0,
+            avatar_hash: None,
         }
     }
 

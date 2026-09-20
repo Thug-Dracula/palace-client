@@ -10,6 +10,7 @@
 import {
   faceCellUrl,
   propImageUrl,
+  type1AvatarUrl,
   type AvatarArt,
   type AvatarRoster,
 } from "./api";
@@ -47,8 +48,16 @@ export interface AvatarLayout {
   names: PositionedName[];
 }
 
-const artUrl = (art: AvatarArt): string =>
-  art.kind === "face" ? faceCellUrl(art.face, art.color) : propImageUrl(art.id);
+const artUrl = (art: AvatarArt): string => {
+  switch (art.kind) {
+    case "face":
+      return faceCellUrl(art.face, art.color);
+    case "prop":
+      return propImageUrl(art.id);
+    case "type1":
+      return type1AvatarUrl(art.hash);
+  }
+};
 
 export const layoutAvatars = (roster: AvatarRoster): AvatarLayout => {
   const g = roster.geometry;

@@ -9,6 +9,7 @@
 //! opcode: it returns [`Message::Unknown`] so the caller can log and skip.
 
 mod asset;
+mod avatar;
 mod chat;
 mod draw;
 mod lists;
@@ -21,6 +22,14 @@ mod spots;
 mod user;
 
 pub use asset::PropUpload;
+pub use avatar::{
+    extended_info_request_frame, AvatarFlags, AvatarHash, AvatarQuery, AvatarSend,
+    ExtendedInfoAvatar, ExtendedInfoEntry, ExtendedInfoReply, UserDescAvatar, UserPropAvatar,
+    AF_HORIZONTAL_FLIP, AF_INHIBIT_ANIMATION, AF_VALID_FLAGS, AF_VERTICAL_FLIP, AT_AVATAR, AT_PROP,
+    AVATAR_HASH_LEN, AVATAR_SEND_DATA, AVATAR_SEND_URL, AVFORM_FLASH, AVFORM_GIF, AVFORM_JPEG,
+    AVFORM_MNG, AVFORM_PNG99A, SI_AVATAR, SI_AVATAR_URL, SI_HTTP_URL, SI_INF_AURL, SI_INF_AVATAR,
+    SI_INF_HURL,
+};
 pub use chat::{Talk, Whisper};
 pub use draw::Draw;
 pub use lists::{RoomList, RoomListRec, RoomUserList, UserList, UserListRec};
@@ -86,8 +95,20 @@ pub enum Message {
     UserName(UserName),
     /// `usrP` — a user's complete worn prop list.
     UserProp(UserProp),
+    /// `usrP` in its Type 1 form: no worn props, an avatar hash instead.
+    UserPropAvatar(UserPropAvatar),
     /// `usrD` — a user's face, colour and props together.
     UserDesc(UserDesc),
+    /// `usrD` in its Type 1 form: face, colour and an avatar hash.
+    UserDescAvatar(UserDescAvatar),
+    /// `sInf` — an `EXTENDEDINFO` reply, including the `'AVAT'` avatar limits.
+    ExtendedInfo(ExtendedInfoReply),
+    /// `fAva` — a user's Type 1 avatar flags.
+    AvatarFlags(AvatarFlags),
+    /// `qAva` — a query for a 20-byte avatar hash.
+    AvatarQuery(AvatarQuery),
+    /// `sAva` — an avatar image or URL.
+    AvatarSend(AvatarSend),
     /// `uSta` — own user status flags.
     UserStatus(UserStatus),
     /// `room` — room description.
@@ -179,8 +200,22 @@ impl Message {
             opcode::USERFACE => Message::UserFace(UserFace::decode(ref_num, r)?),
             opcode::USERCOLOR => Message::UserColor(UserColor::decode(ref_num, r)?),
             opcode::USERNAME => Message::UserName(UserName::decode(ref_num, r)?),
-            opcode::USERPROP => Message::UserProp(UserProp::decode(ref_num, r)?),
-            opcode::USERDESC => Message::UserDesc(UserDesc::decode(ref_num, r)?),
+            opcode::USERPROP => {
+                match UserPropAvatar::from_payload(ref_num, r.remaining_slice(), r.order()) {
+                    Some(avatar) => Message::UserPropAvatar(avatar),
+                    None => Message::UserProp(UserProp::decode(ref_num, r)?),
+                }
+            }
+            opcode::USERDESC => {
+                match UserDescAvatar::from_payload(ref_num, r.remaining_slice(), r.order()) {
+                    Some(avatar) => Message::UserDescAvatar(avatar),
+                    None => Message::UserDesc(UserDesc::decode(ref_num, r)?),
+                }
+            }
+            opcode::EXTENDEDINFO => Message::ExtendedInfo(ExtendedInfoReply::decode(r)?),
+            opcode::AVATARFLAGS => Message::AvatarFlags(AvatarFlags::decode(ref_num, r)?),
+            opcode::AVATARQUERY => Message::AvatarQuery(AvatarQuery::decode(ref_num, r)?),
+            opcode::AVATARSEND => Message::AvatarSend(AvatarSend::decode(r)?),
             opcode::USERSTATUS => Message::UserStatus(UserStatus::decode(ref_num, r)?),
             opcode::ROOMDESC => Message::RoomDescription(RoomDescription::decode(r)?),
             opcode::PROPNEW => Message::PropNew(PropNew::decode(r)?),
@@ -265,12 +300,40 @@ impl Message {
                 p.user_id,
                 summarize_asset_specs(&p.props)
             ),
+            Message::UserPropAvatar(p) => format!(
+                "user avatar: id={} type={} flags={:#06x} hash={}",
+                p.user_id, p.avatar_type, p.avatar_flags, p.hash
+            ),
             Message::UserDesc(d) => format!(
                 "user desc: id={} face={} color={} props={}",
                 d.user_id,
                 d.face_nbr,
                 d.color_nbr,
                 summarize_asset_specs(&d.props)
+            ),
+            Message::UserDescAvatar(d) => format!(
+                "user desc avatar: id={} face={} color={} flags={:#06x} hash={}",
+                d.user_id, d.face_nbr, d.color_nbr, d.avatar_flags, d.hash
+            ),
+            Message::ExtendedInfo(info) => format!(
+                "extended info: {} entry(ies) [{}]",
+                info.entries.len(),
+                info.entries
+                    .iter()
+                    .map(ExtendedInfoEntry::key)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Message::AvatarFlags(f) => format!(
+                "avatar flags: id={} flags={:#06x} uploadCaps={:?}",
+                f.user_id, f.flags, f.upload_caps
+            ),
+            Message::AvatarQuery(q) => format!("avatar query: hash={}", q.hash),
+            Message::AvatarSend(s) => format!(
+                "avatar send: hash={} flags={} bytes={}",
+                s.hash,
+                s.flags,
+                s.data.len()
             ),
             Message::UserStatus(s) => format!(
                 "user status: user_id={} flags={:#06x} ({}) raw_len={}",

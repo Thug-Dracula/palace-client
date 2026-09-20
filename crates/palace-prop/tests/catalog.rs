@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use palace_prop::catalog::Provenance;
 use palace_prop::{encode_s20_blob, PropCatalog, PropImage, BAG_PREFIX_LEN};
 
 /// The real 32-byte prefix of id `976933367`, truncated by the fixed prefix
@@ -138,13 +139,35 @@ fn the_catalog_parses_the_fixture_and_skips_placeholders_and_duplicates() {
     assert_eq!(known.flags, 0x0200);
     assert!(known.favorite, "the known id is in PalaceChat.favs");
     assert!(!known.trash);
+    assert!(
+        known.provenance.is_cache(),
+        "the bundle reader is a cache source, not a bag source"
+    );
 
     let nameless = &catalog.entries()[1];
     assert_eq!(nameless.id, NAMELESS_ID);
     assert_eq!(nameless.name, None);
     assert!(!nameless.favorite);
     assert!(nameless.trash, "the nameless id is in Trash.favs");
+    assert!(nameless.provenance.is_cache());
 
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_bundle_reader_is_a_cache_source_and_lists_no_bag_entries() {
+    let (catalog, dir) = open_fixture("cache-source");
+    let expected_origin = dir.display().to_string();
+    for entry in catalog.entries() {
+        match &entry.provenance {
+            Provenance::Cache { origin } => assert_eq!(origin, &expected_origin),
+            other => panic!("bundle entry tagged {other:?}, expected Cache"),
+        }
+    }
+    assert!(
+        catalog.bag_entries().is_empty(),
+        "PalaceChat's bundle must never satisfy a bag listing"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

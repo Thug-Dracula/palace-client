@@ -9,11 +9,13 @@
 //!
 //! Nothing here needs the 700 MB corpus or the network.
 
+use std::mem::offset_of;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use palace_prop::{decode, Prop, PropFormat};
+use palace_prop::prp::{AssetRec, Roster};
+use palace_prop::{decode, Prop, PropFormat, FLAG_FORMAT_20BIT};
 
 const BIN: &str = env!("CARGO_BIN_EXE_prop-tool");
 
@@ -886,4 +888,316 @@ fn bag_extract_without_an_outdir_exits_two() {
     let out = run(&["bag", "extract", "/tmp/whatever"]);
     assert_eq!(code(&out), 2);
     assert!(stderr(&out).contains("usage:"));
+}
+
+// ---------------------------------------------------------------------------
+// crc-repair
+// ---------------------------------------------------------------------------
+
+/// The one stale `Prop` CRC in `real_palace_hidden.prp`, a real audit finding:
+/// record 0's stored CRC belongs to a different payload (task-37 evidence).
+const ALLBLACK_ID: i32 = 1_675_473_842;
+const ALLBLACK_STORED: u32 = 0x5051_93c2;
+const ALLBLACK_COMPUTED: u32 = 0x3048_93ad;
+
+/// The sha256 of `fixtures/prp/real_palace_hidden.prp`, pinned in its README.
+const REAL_HIDDEN_SHA256: &str = "a06ad1fc76616d2011d3bf1cc4cfa6c478937aac4c40121af9d584ffbb3fd789";
+
+fn prp_fixture(name: &str) -> PathBuf {
+    fixture("prp").join(name)
+}
+
+/// `sha256sum <path>`, when coreutils provides it. `None` means the hash could
+/// not be taken, so the caller skips the hash assertion rather than failing.
+fn sha256(path: &Path) -> Option<String> {
+    let output = Command::new("sha256sum").arg(path).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+fn independent_reader_path() -> PathBuf {
+    std::env::var_os("PALACE_INDEPENDENT_READER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("validation/independent_reader.py")
+        })
+}
+
+fn python_command() -> Option<&'static str> {
+    ["python3", "python", "py"].into_iter().find(|candidate| {
+        Command::new(candidate)
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Run the crate's independent `.prp` validator over `path` and require ACCEPT.
+fn assert_reader_accepts(path: &Path, records: usize, unvalidated: usize) {
+    let reader = independent_reader_path();
+    assert!(
+        reader.is_file(),
+        "the independent reader is missing at {}",
+        reader.display()
+    );
+    let Some(python) = python_command() else {
+        eprintln!("skipping the independent-reader assertion: no python interpreter on PATH");
+        return;
+    };
+    let output = Command::new(python)
+        .arg(&reader)
+        .arg("--verbose")
+        .arg(path)
+        .output()
+        .expect("run the independent reader");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the independent reader rejected {}:\n{stdout}\nstderr: {stderr}",
+        path.display()
+    );
+    assert!(stdout.contains("result: ACCEPT"), "{stdout}");
+    assert!(stdout.contains("crc_failures: 0"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("crc_unvalidated: {unvalidated}")),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&format!("records: {records}")), "{stdout}");
+}
+
+/// Overwrite record `index`'s 4-byte CRC field, using the offsets the file
+/// itself declares. `crc_repair.rs`'s tests carry the same helper.
+fn patch_crc(bytes: &mut [u8], roster: &Roster, index: usize, crc: u32) {
+    let at = roster.file_header().asset_map_offset as usize
+        + roster.map_header().recs_offset as usize
+        + index * std::mem::size_of::<AssetRec>()
+        + offset_of!(AssetRec, crc);
+    bytes[at..at + 4].copy_from_slice(&crc.to_le_bytes());
+}
+
+#[test]
+fn crc_repair_on_a_clean_roster_reports_no_mismatches_and_exits_zero() {
+    let out = run(&["crc-repair", prp_fixture("prop_fave.prp").to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("crc_checked: 1"), "{text}");
+    assert!(text.contains("crc_unvalidated: 1"), "{text}");
+    assert!(text.contains("crc_failures: 0"), "{text}");
+    assert!(text.contains("clean"), "{text}");
+}
+
+#[test]
+fn crc_repair_reports_the_stale_allblack_crc_and_gates_with_exit_one() {
+    let dir = TempDir::new("crc-repair-audit");
+    let source = dir.path("source.prp");
+    std::fs::copy(prp_fixture("real_palace_hidden.prp"), &source).expect("stage the source");
+
+    let out = run(&["crc-repair", source.to_str().unwrap()]);
+    // A mismatch without --out is a non-zero exit, so a script can gate on it.
+    assert_eq!(code(&out), 1, "stderr: {}", stderr(&out));
+    let entries = std::fs::read_dir(&dir.0).expect("list temp dir").count();
+    assert_eq!(entries, 1, "an audit-only run must write nothing");
+    let text = stdout(&out);
+    assert!(text.contains("records: 76"), "{text}");
+    assert!(text.contains("crc_checked: 75"), "{text}");
+    assert!(text.contains("crc_unvalidated: 1"), "{text}");
+    assert!(text.contains("crc_failures: 1"), "{text}");
+    assert!(text.contains("record[0]"), "{text}");
+    assert!(text.contains(&format!("id={ALLBLACK_ID}")), "{text}");
+    assert!(text.contains("name=\"ALLBLACK\""), "{text}");
+    assert!(text.contains("blob=2080"), "{text}");
+    assert!(text.contains("prop_flags=0x0000"), "{text}");
+    assert!(
+        text.contains(&format!("stored_crc=0x{ALLBLACK_STORED:08x}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("computed_crc=0x{ALLBLACK_COMPUTED:08x}")),
+        "{text}"
+    );
+    assert!(
+        stderr(&out).contains("--out"),
+        "the gate message must point at --out: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn crc_repair_out_writes_a_copy_that_passes_the_independent_reader() {
+    let dir = TempDir::new("crc-repair-out");
+    let source = prp_fixture("real_palace_hidden.prp");
+    let destination = dir.path("repaired.prp");
+    let source_size = std::fs::metadata(&source).expect("stat source").len() as usize;
+    let before_bytes = std::fs::read(&source).expect("read the source");
+    let before_hash = sha256(&source);
+
+    let out = run(&[
+        "crc-repair",
+        source.to_str().unwrap(),
+        "--out",
+        destination.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains(&format!("wrote {source_size} bytes")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("(source: {source_size} bytes)")),
+        "{text}"
+    );
+    assert!(text.contains("1 stale Prop CRC field(s)"), "{text}");
+    assert_eq!(
+        std::fs::metadata(&destination).expect("stat copy").len() as usize,
+        source_size,
+        "repair must not resize the roster"
+    );
+
+    // The source is read-only for this command; its bytes and hash are intact.
+    assert_eq!(
+        std::fs::read(&source).expect("read the source again"),
+        before_bytes,
+        "the source must be byte-identical after repair"
+    );
+    if let (Some(before), Some(after)) = (before_hash, sha256(&source)) {
+        assert_eq!(before, after, "the source sha256 must be unchanged");
+        assert_eq!(before, REAL_HIDDEN_SHA256, "the fixture is the known copy");
+    }
+
+    assert_reader_accepts(&destination, 76, 1);
+
+    let again = run(&["crc-repair", destination.to_str().unwrap()]);
+    assert_eq!(code(&again), 0, "stderr: {}", stderr(&again));
+    assert!(
+        stdout(&again).contains("crc_failures: 0"),
+        "{}",
+        stdout(&again)
+    );
+}
+
+#[test]
+fn crc_repair_refuses_out_that_resolves_to_the_source_and_writes_nothing() {
+    let dir = TempDir::new("crc-repair-in-place");
+    let source = dir.path("source.prp");
+    std::fs::copy(prp_fixture("real_palace_hidden.prp"), &source).expect("stage the source");
+    let before = std::fs::read(&source).expect("read the source");
+
+    let out = run(&[
+        "crc-repair",
+        source.to_str().unwrap(),
+        "--out",
+        source.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 1, "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("refusing"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        std::fs::read(&source).expect("read the source again"),
+        before,
+        "a refused in-place repair must not touch the file"
+    );
+    // No temp file survives, so the directory still holds exactly the source.
+    let entries = std::fs::read_dir(&dir.0).expect("list temp dir").count();
+    assert_eq!(
+        entries, 1,
+        "expected only the source, found {entries} entries"
+    );
+}
+
+#[test]
+fn crc_repair_dump_writes_pngs_and_reports_a_record_that_does_not_decode() {
+    let dir = TempDir::new("crc-repair-dump");
+    let staged = dir.path("staged.prp");
+    let mut bytes = std::fs::read(prp_fixture("single_type.prp")).expect("read the fixture");
+    let roster = Roster::parse(&bytes).expect("the fixture parses");
+    assert_eq!(roster.records().len(), 2);
+
+    // Record 0: corrupt the payload and point the header flags at a zlib
+    // encoding, so the blob no longer decodes and its stored CRC is stale.
+    let blob_at =
+        roster.file_header().data_offset as usize + roster.records()[0].rec.data_offset as usize;
+    bytes[blob_at + 12] ^= 0xff;
+    bytes[blob_at + 10..blob_at + 12].copy_from_slice(&FLAG_FORMAT_20BIT.to_le_bytes());
+    // Record 1: leave its payload decodable, but give it a wrong stored CRC.
+    patch_crc(&mut bytes, &roster, 1, 0xdead_beef);
+    std::fs::write(&staged, &bytes).expect("stage the patched roster");
+
+    let outdir = dir.path("pngs");
+    let out = run(&[
+        "crc-repair",
+        staged.to_str().unwrap(),
+        "--dump",
+        outdir.to_str().unwrap(),
+    ]);
+    // Two mismatches and no --out: the run still gates with a non-zero exit.
+    assert_eq!(code(&out), 1, "stdout: {}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("crc_failures: 2"), "{text}");
+    assert!(
+        text.contains("record[1] id=976933367 -> "),
+        "the decodable mismatch must be dumped: {text}"
+    );
+    assert!(
+        text.contains("does not decode"),
+        "the undecodable mismatch must be reported: {text}"
+    );
+
+    let pngs: Vec<PathBuf> = std::fs::read_dir(&outdir)
+        .expect("list dump dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(
+        pngs.len(),
+        1,
+        "only the decodable record is dumped: {pngs:?}"
+    );
+    assert_eq!(
+        pngs[0].file_name().unwrap().to_string_lossy(),
+        "record_1_id_976933367.png"
+    );
+    let png = std::fs::read(&pngs[0]).expect("read the dump");
+    assert!(png_size(&png).is_some(), "the dump must be a real PNG");
+}
+
+#[test]
+fn crc_repair_without_a_path_exits_two_with_usage() {
+    let out = run(&["crc-repair"]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("usage:"));
+}
+
+#[test]
+fn crc_repair_rejects_an_unknown_option_and_a_missing_value() {
+    let out = run(&["crc-repair", "x.prp", "--frobnicate"]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("unknown option"), "{}", stderr(&out));
+
+    let out = run(&[
+        "crc-repair",
+        prp_fixture("prop_fave.prp").to_str().unwrap(),
+        "--out",
+    ]);
+    assert_eq!(code(&out), 2);
+    assert!(stderr(&out).contains("needs a path"), "{}", stderr(&out));
+}
+
+#[test]
+fn help_mentions_the_crc_repair_subcommand_and_its_exit_code() {
+    let out = run(&["help"]);
+    assert_eq!(code(&out), 0);
+    let text = stderr(&out);
+    assert!(text.contains("prop-tool crc-repair"), "{text}");
+    assert!(text.contains("Exit status"), "{text}");
 }

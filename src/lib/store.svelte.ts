@@ -1,9 +1,16 @@
 import type {
   AudioState,
   AvatarRoster,
+  BagCollectionInfo,
+  BagKey,
+  BagOutfit,
+  BagPropEntry,
+  BagShelfInfo,
+  BagTrashEntry,
   ChatLine,
   ClientEvent,
   ConnectionStatus,
+  GatherResult,
   RoomInfo,
   ScreenState,
   ServerBanner,
@@ -64,6 +71,14 @@ class PalaceStore {
     soundfont_exists: false,
   });
   roomFilter = $state("");
+
+  bagCollections = $state<BagCollectionInfo[]>([]);
+  bagShelves = $state<BagShelfInfo[]>([]);
+  bagCatalog = $state<BagPropEntry[]>([]);
+  bagTrash = $state<BagTrashEntry[]>([]);
+  outfits = $state<BagOutfit[]>([]);
+  bagError = $state<string | null>(null);
+  bagLoaded = $state(false);
 
   scale = $state(1);
   native = $state(false);
@@ -130,6 +145,127 @@ class PalaceStore {
       self.props = [];
     }
     this.setProps([]);
+  }
+
+  /**
+   * Wear or take off one bag entry.
+   *
+   * The bag identity is `(id, crc)`: the crc selects which variant the bag
+   * showed, while the protocol wears props by id, so `set_props` carries the
+   * id. This reuses the existing `toggleProp` path, so `MAX_PROPS` and
+   * `takeOffAvatar` are unchanged.
+   */
+  toggleBagProp(entry: BagPropEntry): TogglePropResult {
+    return this.toggleProp(entry.id);
+  }
+
+  /** Wear every entry, stopping at the first refusal (e.g. the 9-prop limit). */
+  wearBagEntries(entries: BagPropEntry[]): TogglePropResult {
+    for (const entry of entries) {
+      const result = this.toggleProp(entry.id);
+      if (!result.ok) {
+        return result;
+      }
+    }
+    return { ok: true };
+  }
+
+  /** Replace the worn set with an outfit, through the same `set_props` path. */
+  async applyOutfit(name: string): Promise<TogglePropResult> {
+    const self = this.self;
+    if (!self) {
+      return { ok: false, error: "You are not in a room yet, so there is nothing to wear." };
+    }
+    const application = await api.outfitsApply(name);
+    if (application.worn.length > MAX_PROPS) {
+      return {
+        ok: false,
+        error: `That outfit has ${application.worn.length} props; you can wear at most ${MAX_PROPS}.`,
+      };
+    }
+    const next = application.worn.map((key) => key.id);
+    self.props = next;
+    this.setProps(next);
+    return { ok: true };
+  }
+
+  /** Reload every bag surface from the backend. */
+  async loadBag(): Promise<void> {
+    try {
+      const [collections, shelves, catalog, trash, outfits] = await Promise.all([
+        api.bagCollections(),
+        api.bagShelves(),
+        api.bagCatalog(),
+        api.bagTrashList(),
+        api.outfitsList(),
+      ]);
+      this.bagCollections = collections;
+      this.bagShelves = shelves;
+      this.bagCatalog = catalog;
+      this.bagTrash = trash;
+      this.outfits = outfits;
+      this.bagError = null;
+    } catch (error) {
+      this.bagError = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.bagLoaded = true;
+    }
+  }
+
+  /** Gather a room prop into My Bag; reloads the catalog when it landed. */
+  async gatherProp(id: number, crc: number | null = null): Promise<GatherResult> {
+    const result = await api.gatherProp(id, crc);
+    if (result.outcome === "added") {
+      await this.loadBag();
+    }
+    return result;
+  }
+
+  async setBagFavourite(entry: BagPropEntry, favourite: boolean): Promise<void> {
+    await api.bagFavourite(entry.id, entry.crc, favourite);
+    await this.loadBag();
+  }
+
+  async trashBagProp(entry: BagPropEntry): Promise<void> {
+    await api.bagTrash(entry.id, entry.crc);
+    await this.loadBag();
+  }
+
+  async restoreBagTrash(entry: BagTrashEntry): Promise<void> {
+    await api.bagTrashRestore(entry.id, entry.crc);
+    await this.loadBag();
+  }
+
+  async purgeBagTrash(): Promise<void> {
+    await api.bagTrashPurge();
+    await this.loadBag();
+  }
+
+  /** Save the currently worn props as an outfit, resolving each id's crc. */
+  async saveOutfit(name: string): Promise<void> {
+    const self = this.self;
+    const worn: BagKey[] = [];
+    if (self) {
+      for (const id of self.props) {
+        const entry = this.bagCatalog.find((candidate) => candidate.id === id);
+        if (entry) {
+          worn.push({ id: entry.id, crc: entry.crc });
+        }
+      }
+    }
+    this.outfits = await api.outfitsSave(name, worn);
+  }
+
+  async renameOutfit(from: string, to: string): Promise<void> {
+    this.outfits = await api.outfitsRename(from, to);
+  }
+
+  async deleteOutfit(name: string): Promise<void> {
+    this.outfits = await api.outfitsDelete(name);
+  }
+
+  async duplicateOutfit(source: string, target: string): Promise<void> {
+    this.outfits = await api.outfitsDuplicate(source, target);
   }
 
   setScale(value: number): void {

@@ -5,15 +5,42 @@
   import RoomMenu from "./RoomMenu.svelte";
   import AvatarDialog from "./AvatarDialog.svelte";
   import PropBagDialog from "./PropBagDialog.svelte";
+  import EditorDialog from "./editor/EditorDialog.svelte";
   import { layoutAvatars, type AvatarLayout } from "../avatarLayout";
+  import {
+    formatGatherOutcome,
+    pickPropAt,
+    planWear,
+    propLabel,
+    type PickedProp,
+    type WearResult,
+  } from "../propPick";
 
   let element: HTMLDivElement | undefined = $state();
   const last = { width: 0, height: 0, dpr: 0, native: false };
 
-  let menu = $state<{ x: number; y: number } | null>(null);
+  let menu = $state<{ x: number; y: number; prop: PickedProp | null } | null>(null);
   let avatarOpen = $state(false);
   let propsOpen = $state(false);
+  let editorOpen = $state(false);
   let pointer = $state<{ x: number; y: number } | null>(null);
+
+  // Gather feedback lives next to the artwork, not in a blocking dialog: a
+  // short status line that clears itself.
+  let feedback = $state<string | null>(null);
+  let feedbackTimer: ReturnType<typeof setTimeout> | null = null;
+  const FEEDBACK_MS = 6000;
+
+  function showFeedback(text: string) {
+    feedback = text;
+    if (feedbackTimer) {
+      clearTimeout(feedbackTimer);
+    }
+    feedbackTimer = setTimeout(() => {
+      feedback = null;
+      feedbackTimer = null;
+    }, FEEDBACK_MS);
+  }
 
   // The webview fires mousemove far faster than the runtime needs it. Coalesce
   // to one report per animation frame and drop repeats of the same CSS pixel,
@@ -24,7 +51,47 @@
 
   function onContextMenu(event: MouseEvent) {
     event.preventDefault();
-    menu = { x: event.clientX, y: event.clientY };
+    // The roster already carries every worn prop's sprite box, so a right-click
+    // can be answered from the data on screen. A miss leaves the menu without a
+    // prop, and it shows the room options exactly as before.
+    let prop: PickedProp | null = null;
+    const roster = store.avatars;
+    if (element && roster) {
+      const rect = element.getBoundingClientRect();
+      prop = pickPropAt(roster, {
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+      });
+    }
+    menu = { x: event.clientX, y: event.clientY, prop };
+  }
+
+  // Gather one prop into My Bag, optionally wearing it afterwards. The wear
+  // reuses the store's existing prop path; a prop that is already worn is left
+  // alone, because the path toggles and toggling it would take it off.
+  async function gather(picked: PickedProp, andWear: boolean): Promise<void> {
+    const label = propLabel(picked.id);
+    try {
+      const result = await store.gatherProp(picked.id, picked.crc);
+      let wear: WearResult | null = null;
+      if (result.outcome !== "rejected") {
+        const plan = planWear(andWear, store.self?.props.includes(picked.id) ?? false);
+        if (plan.action === "already") {
+          wear = { state: "already" };
+        } else if (plan.action === "wear") {
+          const entry = store.bagCatalog.find((candidate) => candidate.id === picked.id);
+          const worn = entry ? store.toggleBagProp(entry) : store.toggleProp(picked.id);
+          wear = worn.ok
+            ? { state: "worn" }
+            : { state: "refused", error: worn.error ?? "the store refused it" };
+        }
+      }
+      showFeedback(formatGatherOutcome(result, label, wear));
+    } catch (error) {
+      showFeedback(
+        `Could not gather ${label}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   function push() {
@@ -59,6 +126,10 @@
       if (moveFrame) {
         cancelAnimationFrame(moveFrame);
         moveFrame = 0;
+      }
+      if (feedbackTimer) {
+        clearTimeout(feedbackTimer);
+        feedbackTimer = null;
       }
     };
   });
@@ -165,6 +236,10 @@
       </button>
     </div>
 
+    <button class="btn" type="button" onclick={() => (editorOpen = true)} title="Open the prop editor">
+      Editor
+    </button>
+
     <span class="spacer"></span>
     {#if store.room}<span class="readout">{store.room.name}</span>{/if}
   </div>
@@ -250,15 +325,26 @@
     {#if store.tooltip}
       <div class="tooltip" style="left:{tooltipAt.x}px; top:{tooltipAt.y}px;">{store.tooltip}</div>
     {/if}
+
+    {#if feedback}
+      <div class="gather-toast" role="status" aria-live="polite">{feedback}</div>
+    {/if}
   </div>
 
   {#if menu}
+    {@const picked = menu.prop}
     <RoomMenu
       x={menu.x}
       y={menu.y}
+      prop={picked}
       onclose={() => (menu = null)}
       onchooseavatar={() => (avatarOpen = true)}
       onprops={() => (propsOpen = true)}
+      ongather={(andWear) => {
+        if (picked) {
+          void gather(picked, andWear);
+        }
+      }}
     />
   {/if}
 
@@ -268,6 +354,10 @@
 
   {#if propsOpen}
     <PropBagDialog onclose={() => (propsOpen = false)} />
+  {/if}
+
+  {#if editorOpen}
+    <EditorDialog onclose={() => (editorOpen = false)} />
   {/if}
 </div>
 
@@ -318,5 +408,25 @@
   .board-layer {
     image-rendering: pixelated;
     image-rendering: crisp-edges;
+  }
+
+  /* A gather result, announced politely and never blocking the next click. */
+  .gather-toast {
+    position: absolute;
+    left: 50%;
+    bottom: var(--sp-3);
+    z-index: 5;
+    max-width: min(420px, calc(100% - var(--sp-5)));
+    transform: translateX(-50%);
+    padding: var(--sp-1) var(--sp-3);
+    font-size: var(--fs-xs);
+    line-height: 1.5;
+    color: var(--text-0);
+    text-align: center;
+    background: rgba(5, 7, 10, 0.92);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-sm);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+    pointer-events: none;
   }
 </style>

@@ -1,6 +1,6 @@
 # STATUS.md — where this project stands
 
-**Last updated:** 2026-09-18
+**Last updated:** 2026-09-20
 **Version:** 0.2.0 (declared). Next intended: **0.3.0 as a pre-release** — see "Version" below.
 
 This is the single place to look for the state of the project. If this file and
@@ -39,12 +39,13 @@ misleading once. The test is whether the user can click a button and have it wor
 | **Door/room navigation** | Clicking `Aud` navigates `#31743 → #5009 → #7774` (verified headless) |
 | **Crash-safe logging** | `~/.local/share/org.palace.client/logs/palace-client.log` — written live, flushed per line, panic hook installed |
 | **Test suite** | ~500 tests green across the affected crates; wire byte-exact oracle tests intact |
+| **Avatars drawn as sprites, not baked** | Room split into base/mid/top layers plus a small avatar roster; the webview draws bodies, props, faces and name tags over the picture. A layer's version only changes when its content does — measured live: the base version held at `1` across repeated composes and ticked to `2` only on a real change |
 
 ## What is broken — open
 
 | Thing | Symptom | Status |
 |---|---|---|
-| **Own avatar movement lags** | User: "my position actually updates on the palacechat client before it updates on the tauri client." Our own move is not applied locally — it waits for the server round trip and loses the race to the relay | Being fixed; **must** come back with timestamp evidence that the local move happens before the network send |
+| **Movement re-sent the whole room** | Every movement re-encoded and re-sent the entire room picture (measured **3,146,804 bytes** at dpr 2, essentially incompressible), and other players were interpolated over ~120 ms so they *slid* to a new spot instead of appearing there | **Fixed 2026-09-19** (`5a75f64`) — avatars are drawn separately from the board, and a remote move is drawn at the position the server reported, at once. The live *feel* is not yet re-confirmed by the user |
 | **Clicks miss hotspots** | Every click logs `hit no hotspot` and walks instead. Screen reports `scale 1.073 dpr 2`; a click→room-coordinate mapping error (~7% offset) is suspected but NOT proven | Being investigated; a headless click at (180,170) *does* hit hotspot 16, so hotspots load and some coordinates work |
 | **5 corpus scripts fail** | `stack underflow` in arena scripts (`144_hs1`, `144_hs2`, `5308_hs4`, `889_hs0`, `9211_hs2`). Suspected class: a word used as a variable that is also a command (proven for `mousex`/`mousey`) | Audited; residual under investigation |
 
@@ -53,6 +54,9 @@ misleading once. The test is whether the user can click a button and have it wor
 - Whether the app is usable end-to-end for the Colosseum flow. **It is not, today.**
 - Whether the click-mapping offset is real. The headless tool shares the same mapping code, so its agreement with the app does **not** clear it — a shared bug looks like agreement.
 - The 4 parse failures (`11054_hs1`, `13009_hs0`, `7665_hs0`, `9211_hs29`) are genuinely malformed source. Accepted residual, not ours to fix.
+- Whether the new movement path *feels* right. The behaviour is pinned by tests and a live trace, but only the user can judge the feel — not yet reported.
+- Why the arena (`#31747`) produces a full-room, **opaque top layer** (3,146,804 bytes there, `0` everywhere else). Not diagnosed. Anything that changes in that band would re-send it. Prime suspect: the arena's fetched interface overlay.
+- Whether the rollback switch works. `PALACE_BAKE_AVATARS=1` restores baked avatars; untested end-to-end.
 
 ## Version
 
@@ -291,5 +295,139 @@ the original symptom. Escape requires a second account on the server.
   appearance (the numeric core is verified).
 - Two decisions for the user: the KWin `input-tool` allowlist, and whether to make a
   save point on the remaining uncommitted files.
+
+---
+
+## Update — 2026-09-19
+
+### Movement no longer re-sends the room
+
+**The complaint:** clicking around still felt laggy, and other players *slid* to a
+new spot instead of appearing there.
+
+**Measured cause** (live trace, `PALACE_TRACE`):
+- Every movement re-sent the **whole room picture** — 3,146,804 bytes at dpr 2,
+  essentially incompressible. The frame store bumped the base version on *every*
+  compose, so the display re-fetched a picture that had not changed.
+- Other players' positions were **interpolated over ~120 ms** ("glide"). That was our
+  invention, not PalaceChat's — PalaceChat jumps.
+
+**What changed** (`5a75f64`):
+- Avatars are **cut out of the board**. A room is now three layers — base, mid, top —
+  plus a small **avatar roster** (who, where, face, props). The webview draws the
+  bodies, props, faces and plain-text name tags *over* the picture.
+- A layer's version only changes when its content changes. Measured live: the base
+  held at version `1` across repeated composes, and ticked to `2` only when a new
+  image genuinely arrived.
+- The glide is **deleted, not disabled**: a remote move is drawn at the reported
+  position immediately, and the roster is published on the very frame that moved the
+  user. That publish step is load-bearing — without it, removing the glide would have
+  frozen other players on screen. It has its own regression test.
+- The animation trace log is now capped (16 MiB + one archive), like the app log.
+
+**One thing that is NOT a bug:** when *someone else* moves, our client and PalaceChat
+update at the same instant. Both are waiting on the same server relay. For *your own*
+move we apply locally first and should beat PalaceChat — already proven on
+2026-09-18 (`walk: local apply` precedes `walk: sent`).
+
+### Verified
+
+- `palace-client` **246** tests, `palace-render` **139**, display **13**; svelte-check
+  0 errors; `clippy -D warnings` clean; release build succeeds.
+- The live trace above (unchanged picture not re-fetched).
+- Two new regression tests lock the behaviour, including
+  `a_remote_move_reaches_the_roster_at_the_reported_position_without_a_glide`.
+
+### Not verified
+
+- **The feel.** Only the user can judge whether it now matches PalaceChat.
+- The arena's heavy top layer (see "Not proven / unknown" above).
+- The rollback switch.
+
+### Open, next
+
+1. **Stage 2 — draw chat text in the webview** instead of baking it into the picture,
+   so a chat line can never invalidate a whole layer. This is the likely cure for the
+   arena's heavy top layer.
+2. Find what paints a full-room picture into the arena's top band.
+3. Prove the rollback switch, then plan its removal.
+
+### Prop bag & prop editor (2026-09-20)
+
+**Shipped and verified** (plan: `.omo/plans/prop-bag.md`; 39 tasks).
+
+- **`.prp` read + write** — a no-op parse→write is **byte-identical over all 15 real
+  collections** (including Palace.prp, 66,885 records / 74 MB). Record order is
+  preserved by default; sorting is an explicit `canonicalise()`. An independently
+  written reader (`crates/palace-prop/validation/independent_reader.py`, authored
+  from `PRP-FORMAT.md`) accepts our output.
+- **Bag folder** in our own data dir (`~/.local/share/org.palace.client/props`):
+  a writable **My Bag**, read-only **shelves**, a portable outfits file, favourites
+  and trash. Writes are atomic (temp → fsync → rename). Any path under the
+  PalaceChat data trees or `$MEDIA/Prop Files/` is **refused for writing**
+  (test-enforced), and those sources were sha256-unchanged across every run.
+- **Cache separation** — the bag lists only `.prp`-sourced props; PalaceChat's live
+  bundle and auto-fetched props are never listed (asserted).
+- **Gather** — right-click a room prop → a byte-exact copy into My Bag.
+- **Editor** — paint by mouse **and** by typed coordinates, transform, crop, shape
+  crop, brightness/contrast/saturation, background removal by sampled colour, text,
+  overlays, layers, frames and guides. Saves go through the writer + encoding
+  policy; multi-frame save is refused.
+- **Animated props** — decoded and rendered (frame 0 for thumbnails). **Authoring is
+  NO-GO** until three unpinned fields are determined (`$CORPUS/PRP-ANIMATED.md`).
+- **Type 1 avatars** — implemented (`$CORPUS/TYPE1-AVATARS.md`); sending one to
+  a server is **permission-gated and off by default**.
+- **`.prp` CRC repair** — non-destructive: repairs a **copy**, never the original.
+  A real audit found **2 genuinely stale Prop CRCs** across all 15 collections. The
+  other 31 of the originally reported "33 mismatches" were non-`Prop` records, which
+  the server does not validate — our reader was wrong, not the data. Forensics
+  (`.omo/evidence/task-37-crc-forensics.txt`):
+  - **`Palace.prp` id 969004551 — safe to repair.** Its payload is byte-identical
+    (sha256) to four independent canonical server rosters; only the CRC *field* is
+    stale. Correct value `0xc5185c86`. (The prop itself does not decode in any copy —
+    a pre-existing malformed prop — so the repair fixes the checksum, not the image.)
+  - **`Palace - Hidden.PRP` id 1675473842 "ALLBLACK" — do NOT repair.** No
+    trustworthy reference exists, and it decodes to noise rather than the black
+    square the name implies: it looks like corrupted data, and recomputing the CRC
+    would bless the corruption. **The user decides** whether to keep, delete or
+    restore it.
+  - General rule: a CRC repair cannot distinguish "the author edited the pixels" from
+    "the bytes were corrupted", so it must be applied per-record with evidence.
+
+**Budgets:** bag listing peak ≤ 512 MB (measured 213 MB on the 66k-record
+collection); first catalog page ≤ 500 ms (measured 0.036 ms).
+
+**Fixed during verification:** favourites were being written into the `Prop`
+section instead of a `Fave` section, so the server would have tried to validate an
+8-byte favourites entry as a prop. Now covered by type-table assertions.
+
+**Needs a human — exact steps** (nothing here can be automated; the client must
+never be driven by an agent):
+
+1. **Prop bag dialog.** Connect to a room, right-click anywhere in the room, and
+   choose **Props**. Check: the collection list (My Bag marked writable, shelves
+   read-only), the All / Favourites / Trash filters, search, sort, the thumbnail
+   grid, and `WORN n / 9`.
+2. **Prop editor.** Click **Editor** in the room toolbar. Check: the seven tabs
+   (Paint, Transform, Adjust, Size, Frames, Text, Guides), and that dragging on the
+   canvas actually paints (Brush/Eraser/Fill from the Tool selector).
+3. **Live gather.** Right-click a prop on someone's avatar and choose **Gather**
+   (and **Gather & Wear**). Check it lands in My Bag and survives a restart. Then
+   try favourite, trash and restore.
+4. **Decide on `ALLBLACK`** in `Palace - Hidden.PRP` — keep, delete, or restore from
+   a backup. Do **not** CRC-repair it (see the CRC-repair entry above).
+
+For reference, `tools/ui-visual-check/capture.sh` writes screenshots of all four
+surfaces to `tools/ui-visual-check/out/` — that shows what they *render* like, but
+not what they *feel* like.
+
+### Parked
+
+- Colosseum arena-bench work — fixed and tabled (`COLOSSEUM-2026-09-19.md`).
+
+### Save point
+
+`5a75f64` — 21 files, the whole avatar change (3,474 insertions, 564 deletions).
+Previous save point: `8e494f2`. Not published; this repository does not auto-publish.
 
 

@@ -1,4 +1,4 @@
-//! A read-only catalog over the user's local PalaceChat prop bag.
+//! A read-only catalog over the props the client can render.
 //!
 //! This module turns the on-disk [`crate::bag::PropBag`] into a flat list of
 //! browsable entries plus the two binary endpoints a picker needs: a JSON
@@ -8,6 +8,17 @@
 //! directory under `%APPDATA%`/`%LOCALAPPDATA%` on Windows). A missing or
 //! malformed bag yields `None` rather than a panic or an error the caller has
 //! to handle.
+//!
+//! # Cache, not bag
+//!
+//! PalaceChat's `PropBag.bundle` is the client's **cache**, not the user's bag:
+//! it holds whatever the client downloaded to render rooms, including props the
+//! user never collected. Every entry this reader produces is therefore tagged
+//! [`Provenance::Cache`] and can never satisfy a bag query. A bag listing goes
+//! through [`bag_listing`] (or [`PropCatalog::bag_entries`]) and returns only
+//! [`Provenance::Bag`] entries, which the bag folder's own `.prp` collections
+//! supply. The bundle reader itself is unchanged and remains a rendering
+//! source for these props.
 //!
 //! # Discovery
 //!
@@ -77,6 +88,8 @@ use std::path::{Path, PathBuf};
 
 use crate::bag::{BagEntry, PropBag, BAG_INDEX_RECORD_LEN, BAG_PREFIX_LEN};
 
+pub use crate::provenance::{bag_listing, merge_entries, Provenance};
+
 /// Bundle path under the user's home on Unix when `PALACE_PROP_BAG` is unset.
 const DEFAULT_BAG_SUBDIR: &str = ".local/share/PalaceChat/PropBag.bundle";
 
@@ -123,13 +136,20 @@ pub struct CatalogEntry {
     pub favorite: bool,
     /// Whether the id appears in `Trash.favs`.
     pub trash: bool,
+    /// Where the entry came from: a user-owned bag collection or the cache.
+    ///
+    /// Assigned by the source that produced the entry, at load time; it is
+    /// never recomputed from `id`/`crc`. Entries from PalaceChat's bundle are
+    /// [`Provenance::Cache`], so [`bag_listing`] excludes them.
+    pub provenance: Provenance,
 }
 
-/// A parsed, read-only view of the user's prop bag.
+/// A parsed, read-only view of the props one source supplies.
 ///
-/// Holds the bag's blobs in memory (about 10 MB for the live bag) and a flat,
-/// deduplicated entry list. Cheap lookups by id; no filesystem access after
-/// construction.
+/// Holds the source's blobs in memory (about 10 MB for the live bundle) and a
+/// flat, deduplicated entry list. Every entry carries the [`Provenance`] of the
+/// source that produced it, so a catalog built by this module's bundle reader
+/// is cache-only. Cheap lookups by id; no filesystem access after construction.
 #[derive(Debug)]
 pub struct PropCatalog {
     bag: PropBag,
@@ -164,10 +184,16 @@ impl PropCatalog {
         let dir = dir.as_ref();
         let bag = PropBag::open_dir(dir).ok()?;
         let (favorites, trash) = read_favs(dir);
-        Some(Self::from_bag(bag, &favorites, &trash))
+        let provenance = Provenance::cache(dir.display().to_string());
+        Some(Self::from_bag(bag, &favorites, &trash, provenance))
     }
 
-    fn from_bag(bag: PropBag, favorites: &HashSet<u32>, trash: &HashSet<u32>) -> Self {
+    fn from_bag(
+        bag: PropBag,
+        favorites: &HashSet<u32>,
+        trash: &HashSet<u32>,
+        provenance: Provenance,
+    ) -> Self {
         let mut seen = HashSet::new();
         let mut entries = Vec::new();
         let mut bag_index = Vec::new();
@@ -192,6 +218,7 @@ impl PropCatalog {
                 flags: header.flags,
                 favorite: favorites.contains(&id),
                 trash: trash.contains(&id),
+                provenance: provenance.clone(),
             });
             bag_index.push(index);
         }
@@ -203,9 +230,23 @@ impl PropCatalog {
     }
 
     /// The entries, in `.pids` order.
+    ///
+    /// This is the renderer's view: it includes cache entries. A bag listing
+    /// must use [`PropCatalog::bag_entries`] instead.
     #[must_use]
     pub fn entries(&self) -> &[CatalogEntry] {
         &self.entries
+    }
+
+    /// Only the bag-sourced entries, in `.pids` order.
+    ///
+    /// Cache entries are a rendering source and never appear here, so a caller
+    /// that lists a bag from this catalog cannot leak a cached prop. The
+    /// current catalog is built from PalaceChat's bundle, so this is empty;
+    /// bag-folder catalogs fill it.
+    #[must_use]
+    pub fn bag_entries(&self) -> Vec<&CatalogEntry> {
+        bag_listing(&self.entries)
     }
 
     /// Number of catalogued entries.
@@ -241,32 +282,12 @@ impl PropCatalog {
 
     /// The whole catalog as the picker's JSON payload.
     ///
-    /// The shape is one object with a `props` array; each entry carries `id`,
-    /// `crc`, optional `name`, `w`, `h`, `flags`, `fav` and `trash`. `name` is
-    /// omitted entirely when unknown. Values are hand-built (the crate has no
-    /// JSON dependency) and strings are escaped.
+    /// This is the renderer's view and includes cache entries. A bag listing
+    /// must be serialised from [`PropCatalog::bag_entries`] (or from
+    /// [`bag_listing`]) through [`entries_json`], which is the shape below.
     #[must_use]
     pub fn catalog_json(&self) -> String {
-        let mut out = String::with_capacity(self.entries.len() * 96 + 16);
-        out.push_str("{\"props\":[");
-        for (index, entry) in self.entries.iter().enumerate() {
-            if index > 0 {
-                out.push(',');
-            }
-            let _ = write!(out, "{{\"id\":{},\"crc\":{}", entry.id, entry.crc);
-            if let Some(name) = &entry.name {
-                out.push_str(",\"name\":\"");
-                escape_json_into(name, &mut out);
-                out.push('"');
-            }
-            let _ = write!(
-                out,
-                ",\"w\":{},\"h\":{},\"flags\":{},\"fav\":{},\"trash\":{}}}",
-                entry.width, entry.height, entry.flags, entry.favorite, entry.trash
-            );
-        }
-        out.push_str("]}");
-        out
+        entries_json(self.entries.iter())
     }
 
     fn bag_entry(&self, id: u32) -> Option<&BagEntry> {
@@ -274,6 +295,45 @@ impl PropCatalog {
         let index = *self.bag_index.get(position)?;
         self.bag.entries().get(index)
     }
+}
+
+/// Serialise `entries` as the picker's JSON payload.
+///
+/// The shape is one object with a `props` array; each entry carries `id`,
+/// `crc`, optional `name`, `w`, `h`, `flags`, `fav` and `trash`, and a
+/// bag-sourced entry additionally carries `collection`. `name` is omitted
+/// entirely when unknown, and a cache entry carries no `collection` — a cached
+/// prop must never look bag-owned. Values are hand-built (the crate has no JSON
+/// dependency) and strings are escaped.
+#[must_use]
+pub fn entries_json<'a>(entries: impl IntoIterator<Item = &'a CatalogEntry>) -> String {
+    let entries = entries.into_iter();
+    let mut out = String::with_capacity(entries.size_hint().0 * 96 + 16);
+    out.push_str("{\"props\":[");
+    for (index, entry) in entries.enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{{\"id\":{},\"crc\":{}", entry.id, entry.crc);
+        if let Some(name) = &entry.name {
+            out.push_str(",\"name\":\"");
+            escape_json_into(name, &mut out);
+            out.push('"');
+        }
+        let _ = write!(
+            out,
+            ",\"w\":{},\"h\":{},\"flags\":{},\"fav\":{},\"trash\":{}",
+            entry.width, entry.height, entry.flags, entry.favorite, entry.trash
+        );
+        if let Provenance::Bag { collection, .. } = &entry.provenance {
+            out.push_str(",\"collection\":\"");
+            escape_json_into(collection, &mut out);
+            out.push('"');
+        }
+        out.push('}');
+    }
+    out.push_str("]}");
+    out
 }
 
 /// The default bundle directory for the host platform.
@@ -562,6 +622,52 @@ mod tests {
         let catalog = PropCatalog::open_dir(bundle).expect("synthetic bag opens");
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog.entries()[0].id, SYNTHETIC_ID);
+        assert_eq!(
+            catalog.entries()[0].provenance,
+            Provenance::cache(bundle.display().to_string()),
+            "the bundle reader is a cache source, not a bag source"
+        );
+        assert!(
+            catalog.bag_entries().is_empty(),
+            "a cache-only catalog must list no bag entries"
+        );
+    }
+
+    #[test]
+    fn entries_json_marks_bag_entries_with_their_collection_and_leaves_cache_untagged() {
+        let bag = CatalogEntry {
+            id: 7,
+            crc: 9,
+            name: Some("My Prop".to_string()),
+            width: 44,
+            height: 44,
+            flags: 0x0200,
+            favorite: false,
+            trash: false,
+            provenance: Provenance::bag_with_id("My Bag", 7, 9),
+        };
+        let cache = CatalogEntry {
+            id: 8,
+            crc: 10,
+            name: None,
+            width: 1,
+            height: 2,
+            flags: 0,
+            favorite: false,
+            trash: false,
+            provenance: Provenance::cache("PropBag.bundle:/tmp/example"),
+        };
+        let json = entries_json([&bag, &cache]);
+        assert_eq!(
+            json,
+            concat!(
+                "{\"props\":[",
+                "{\"id\":7,\"crc\":9,\"name\":\"My Prop\",\"w\":44,\"h\":44,\"flags\":512,",
+                "\"fav\":false,\"trash\":false,\"collection\":\"My Bag\"},",
+                "{\"id\":8,\"crc\":10,\"w\":1,\"h\":2,\"flags\":0,\"fav\":false,\"trash\":false}",
+                "]}"
+            )
+        );
     }
 
     #[test]

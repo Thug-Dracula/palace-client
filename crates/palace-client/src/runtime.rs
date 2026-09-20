@@ -8,7 +8,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -33,8 +33,10 @@ use palace_wire::byteorder::Writer;
 use palace_wire::error::WireError;
 use palace_wire::frame::{user_color_frame, user_face_frame, user_move_frame, Frame};
 use palace_wire::messages::{
-    authenticating_logon_record_with_identity, client_logon_record_with_identity, AssetSpec,
-    AuxRegistrationRec, ClientIdentity, Point, Talk, UserProp,
+    authenticating_logon_record_with_identity, client_logon_record_with_identity,
+    extended_info_request_frame, AssetSpec, AuxRegistrationRec, AvatarHash, AvatarSend,
+    ClientIdentity, Point, Talk, UserProp, AT_AVATAR, AT_PROP, AVATAR_SEND_DATA, SI_AVATAR,
+    SI_AVATAR_URL, SI_HTTP_URL,
 };
 use palace_wire::opcode;
 use serde::Serialize;
@@ -53,6 +55,7 @@ use crate::state::{
     ChatKind, ChatLine, ConnectionStatus, RoomInfo, ScriptStimulus, ServerBanner, SessionState,
     UserInfo, HS_LOCK, HS_UNLOCK,
 };
+use crate::type1::{content_hash, validate_type1, Type1AvatarLimits};
 
 const MEDIA_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const PROP_REQUEST_BUDGET: usize = 80;
@@ -121,6 +124,12 @@ pub struct ClientConfig {
     /// the PUID. A server treats two sessions with the same identity as one
     /// user and drops one of them.
     pub identity: ClientIdentity,
+    /// Whether a Type 1 avatar upload may be sent to the server.
+    ///
+    /// Defaults to `false`: the feature validates, caches and displays locally
+    /// but never writes an avatar to a server until the user explicitly opts in.
+    /// The app sets this from `PALACE_ALLOW_AVATAR_UPLOAD=1`.
+    pub allow_avatar_upload: bool,
 }
 
 impl Default for ClientConfig {
@@ -135,6 +144,7 @@ impl Default for ClientConfig {
             seed_props: Vec::new(),
             password: None,
             identity: ClientIdentity::default(),
+            allow_avatar_upload: false,
         }
     }
 }
@@ -230,6 +240,17 @@ pub enum ClientCommand {
     SetProps {
         props: Vec<u32>,
     },
+    /// Set the signed-in user's Type 1 avatar from raw image bytes.
+    ///
+    /// The bytes are validated against the server's advertised limits; an
+    /// over-limit or wrong-format image is refused with a note and nothing is
+    /// sent. The upload itself only reaches the server when the config allows it
+    /// ([`ClientConfig::allow_avatar_upload`]).
+    SetType1Avatar {
+        bytes: Vec<u8>,
+    },
+    /// Clear the signed-in user's Type 1 avatar, returning to a prop avatar.
+    ClearType1Avatar,
     RunScript(String),
     SetViewport {
         width: f64,
@@ -362,6 +383,12 @@ struct Shared {
     /// `PALACE_BAKE_AVATARS=1`, read once at startup: bake avatars and name tags
     /// into the single base frame instead of serving the three-layer board.
     bake_avatars: bool,
+    /// The session's received-prop directory, set once a session opens. A
+    /// gather reads a prop's bytes from here, the same file the renderer uses.
+    props_dir: Mutex<Option<PathBuf>>,
+    /// The server's Type 1 avatar limits, once its `'AVAT'` reply arrives. Shared
+    /// so a UI command can show a user what the server accepts.
+    avatar_limits: Mutex<Option<Type1AvatarLimits>>,
 }
 
 impl Shared {
@@ -412,6 +439,34 @@ impl Shared {
 
     fn transform(&self) -> Option<ViewTransform> {
         match self.transform.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn set_props_dir(&self, dir: PathBuf) {
+        match self.props_dir.lock() {
+            Ok(mut guard) => *guard = Some(dir),
+            Err(poisoned) => *poisoned.into_inner() = Some(dir),
+        }
+    }
+
+    fn props_dir(&self) -> Option<PathBuf> {
+        match self.props_dir.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn set_avatar_limits(&self, limits: Type1AvatarLimits) {
+        match self.avatar_limits.lock() {
+            Ok(mut guard) => *guard = Some(limits),
+            Err(poisoned) => *poisoned.into_inner() = Some(limits),
+        }
+    }
+
+    fn avatar_limits(&self) -> Option<Type1AvatarLimits> {
+        match self.avatar_limits.lock() {
             Ok(guard) => *guard,
             Err(poisoned) => *poisoned.into_inner(),
         }
@@ -502,6 +557,25 @@ impl ClientHandle {
         self.avatar_images.clone()
     }
 
+    /// The directory the live asset intake writes received props to, once a
+    /// session has opened.
+    #[must_use]
+    pub fn props_dir(&self) -> Option<PathBuf> {
+        self.shared.props_dir()
+    }
+
+    /// A prop's bytes from the live asset intake, or `None` when it has not
+    /// been received.
+    ///
+    /// A room prop the client has received is stored as `<id>.bin`; this reads
+    /// exactly that file, so a gather copies the bytes the renderer drew rather
+    /// than re-fetching or re-encoding anything.
+    #[must_use]
+    pub fn prop_blob(&self, id: u32) -> Option<Vec<u8>> {
+        let dir = self.shared.props_dir()?;
+        read_prop_blob(&dir, id)
+    }
+
     /// Send a command, ignoring a closed runtime.
     pub fn send(&self, command: ClientCommand) {
         let _ = self.tx.send(command);
@@ -551,6 +625,25 @@ impl ClientHandle {
     /// Replace the signed-in user's worn props, locally and on the server.
     pub fn set_props(&self, props: Vec<u32>) {
         self.send(ClientCommand::SetProps { props });
+    }
+
+    /// Set the signed-in user's Type 1 avatar from raw image bytes.
+    ///
+    /// Validated against the server's advertised limits; the runtime reports a
+    /// refusal as an error chat line and sends nothing.
+    pub fn set_type1_avatar(&self, bytes: Vec<u8>) {
+        self.send(ClientCommand::SetType1Avatar { bytes });
+    }
+
+    /// Clear the signed-in user's Type 1 avatar, returning to a prop avatar.
+    pub fn clear_type1_avatar(&self) {
+        self.send(ClientCommand::ClearType1Avatar);
+    }
+
+    /// The server's Type 1 avatar limits, once its `'AVAT'` reply has arrived.
+    #[must_use]
+    pub fn avatar_limits(&self) -> Option<Type1AvatarLimits> {
+        self.shared.avatar_limits()
     }
 
     /// Report the pointer position, in viewport pixels.
@@ -650,6 +743,8 @@ impl ClientRuntime {
             mouse: Mutex::new((0, 0)),
             room_size: Mutex::new((512.0, 384.0)),
             bake_avatars: bake_avatars_from_env(),
+            props_dir: Mutex::new(None),
+            avatar_limits: Mutex::new(None),
         });
 
         let handle = ClientHandle {
@@ -771,6 +866,7 @@ fn run_session(
     let cfg = &shared.cfg;
     let session_root = session_cache_dir(cfg);
     let mut workspace = AssetWorkspace::new(&session_root)?;
+    shared.set_props_dir(workspace.props_dir().to_path_buf());
 
     let (media_tx, media_rx) = mpsc::channel::<MediaJob>();
     let (media_done_tx, media_done_rx) = mpsc::channel::<MediaResult>();
@@ -860,6 +956,12 @@ fn run_session(
     conn.send(&record.logon_frame(order))?;
     let _ = conn.send(&Frame::empty(opcode::LISTOFALLROOMS, 0));
     let _ = conn.send(&Frame::empty(opcode::LISTOFALLUSERS, 0));
+    // Ask once for the server's Type 1 avatar limits (spec §5). The reply's
+    // `'AVAT'` block is what `SetType1Avatar` validates against.
+    let _ = conn.send(&extended_info_request_frame(
+        SI_AVATAR | SI_AVATAR_URL | SI_HTTP_URL,
+        order,
+    ));
 
     state.set_status(ConnectionStatus::Connected);
     shared.emit(ClientEvent::Status {
@@ -930,6 +1032,18 @@ fn run_session(
                             "props: kept the first {MAX_WORN_PROPS} worn props, ignored {}",
                             outcome.dropped
                         ));
+                    }
+                }
+                ClientCommand::SetType1Avatar { bytes } => {
+                    if set_self_type1_avatar(&mut state, &mut conn, shared, bytes)? {
+                        dirty_render = true;
+                        emit_avatar_roster(&state, &mut builder, shared);
+                    }
+                }
+                ClientCommand::ClearType1Avatar => {
+                    if clear_self_type1_avatar(&mut state, &mut conn, shared)? {
+                        dirty_render = true;
+                        emit_avatar_roster(&state, &mut builder, shared);
                     }
                 }
                 ClientCommand::RunScript(source) => run_source_pending = Some(source),
@@ -1307,6 +1421,24 @@ fn run_session(
                 for outbound in &applied.outbound {
                     let _ = conn.send(outbound);
                 }
+                if applied.avatar_limits {
+                    if let Some(limits) = state.avatar_limits {
+                        shared.set_avatar_limits(limits);
+                        emit_avatar_roster(&state, &mut builder, shared);
+                    }
+                }
+                if let Some(send) = applied.avatar_send.as_ref() {
+                    let images = shared.avatar_images();
+                    if send.is_url() {
+                        if let Some(url) = send.url() {
+                            images.cache_type1_url(send.hash, url);
+                        }
+                    } else {
+                        images.cache_type1(send.hash, &send.data);
+                    }
+                    state.mark_avatar_known(send.hash);
+                    emit_avatar_roster(&state, &mut builder, shared);
+                }
                 let mut drain = DrainCtx {
                     props_received: &mut props_received,
                     dirty_render: &mut dirty_render,
@@ -1655,6 +1787,11 @@ fn run_session(
             dirty_geom = false;
         }
     }
+}
+
+/// Read a received prop's `<id>.bin` out of the live intake directory.
+fn read_prop_blob(dir: &Path, id: u32) -> Option<Vec<u8>> {
+    std::fs::read(dir.join(format!("{}.bin", id as i32))).ok()
 }
 
 fn build_scene_builder(workspace: &AssetWorkspace, cfg: &ClientConfig) -> SceneBuilder {
@@ -2369,23 +2506,26 @@ fn avatar_roster(
             color: user.color,
             is_self: user.is_self,
             away: user.away,
-            parts: avatar
-                .parts
-                .iter()
-                .map(|part| AvatarPartState {
-                    art: match part.art {
-                        palace_render::AvatarPartArt::Face { face, color } => {
-                            AvatarArt::Face { face, color }
-                        }
-                        palace_render::AvatarPartArt::Prop { id } => AvatarArt::Prop { id },
-                    },
-                    dx: part.dx,
-                    dy: part.dy,
-                    alpha: part.alpha,
-                    w: part.image.width(),
-                    h: part.image.height(),
-                })
-                .collect(),
+            avatar_type: user.avatar_type,
+            parts: type1_roster_parts(state, images, user).unwrap_or_else(|| {
+                avatar
+                    .parts
+                    .iter()
+                    .map(|part| AvatarPartState {
+                        art: match part.art {
+                            palace_render::AvatarPartArt::Face { face, color } => {
+                                AvatarArt::Face { face, color }
+                            }
+                            palace_render::AvatarPartArt::Prop { id } => AvatarArt::Prop { id },
+                        },
+                        dx: part.dx,
+                        dy: part.dy,
+                        alpha: part.alpha,
+                        w: part.image.width(),
+                        h: part.image.height(),
+                    })
+                    .collect()
+            }),
         })
         .collect();
 
@@ -2404,6 +2544,58 @@ fn avatar_roster(
         name_tags_visible: scene.name_tags_visible,
         avatars,
     }
+}
+
+/// The single sprite layer for a Type 1 avatar, or `None` for a classic one.
+///
+/// A Type 1 avatar is one server-hosted image, so it replaces the face and prop
+/// layers entirely rather than stacking on them. It is centred on the avatar
+/// anchor; the size comes from the cached image header, falling back to the
+/// server's cap and then the 44px classic size. `None` when the user is a
+/// classic avatar or has no hash yet.
+fn type1_roster_parts(
+    state: &SessionState,
+    images: &AvatarImageStore,
+    user: &UserInfo,
+) -> Option<Vec<AvatarPartState>> {
+    if user.avatar_type != AT_AVATAR {
+        return None;
+    }
+    let hash = AvatarHash::from_hex(user.avatar_hash.as_deref()?)?;
+    let (w, h) = images.type1_dims(&hash).unwrap_or_else(|| {
+        state.avatar_limits.map_or_else(
+            || {
+                (
+                    palace_render::AVATAR_SIZE as u32,
+                    palace_render::AVATAR_SIZE as u32,
+                )
+            },
+            |limits| {
+                (
+                    if limits.max_width != 0 {
+                        u32::from(limits.max_width)
+                    } else {
+                        132
+                    },
+                    if limits.max_height != 0 {
+                        u32::from(limits.max_height)
+                    } else {
+                        132
+                    },
+                )
+            },
+        )
+    });
+    Some(vec![AvatarPartState {
+        art: AvatarArt::Type1 {
+            hash: hash.to_hex(),
+        },
+        dx: -(w as i32) / 2,
+        dy: -(h as i32) / 2,
+        alpha: 1.0,
+        w,
+        h,
+    }])
 }
 
 /// Decide which roster to publish.
@@ -3780,6 +3972,9 @@ fn self_row(user_id: i32, props: Vec<u32>) -> UserInfo {
         props,
         away: false,
         is_self: true,
+        avatar_type: AT_PROP,
+        avatar_flags: 0,
+        avatar_hash: None,
     }
 }
 
@@ -3870,6 +4065,73 @@ fn set_self_props(
         send_self_props(state, conn)?;
     }
     Ok(outcome)
+}
+
+/// Validate, cache and adopt a Type 1 avatar, uploading it only when allowed.
+///
+/// The checks follow the server's own `'AVAT'` limits exactly (spec §2/§3). A
+/// refusal is an error chat line and nothing is written. The bytes are cached
+/// locally so the roster can draw them immediately; the `sAva` upload goes out
+/// only when [`ClientConfig::allow_avatar_upload`] is set, because writing an
+/// avatar to a server needs the user's explicit permission.
+fn set_self_type1_avatar(
+    state: &mut SessionState,
+    conn: &mut Connection,
+    shared: &Arc<Shared>,
+    bytes: Vec<u8>,
+) -> Result<bool> {
+    let Some(limits) = state.avatar_limits else {
+        shared.chat(
+            ChatKind::Error,
+            "type1 avatar: this server has not advertised its avatar limits yet",
+        );
+        return Ok(false);
+    };
+    let (format, width, height) = match validate_type1(&bytes, &limits) {
+        Ok(valid) => valid,
+        Err(error) => {
+            shared.chat(ChatKind::Error, format!("type1 avatar refused: {error}"));
+            return Ok(false);
+        }
+    };
+    let hash = content_hash(&bytes);
+    let _ = shared.avatar_images().cache_type1(hash, &bytes);
+    state.mark_avatar_known(hash);
+    let changed = state.set_self_avatar_hash(hash);
+    if shared.cfg.allow_avatar_upload {
+        let send = AvatarSend {
+            hash,
+            flags: AVATAR_SEND_DATA,
+            data: bytes,
+        };
+        conn.send(&send.frame(state.byte_order())?)?;
+        shared.note(format!(
+            "type1 avatar: uploaded {format} {width}x{height} ({})",
+            hash.to_hex()
+        ));
+    } else {
+        shared.note(
+            "type1 avatar: shown locally; upload is disabled until the server owner permits it \
+             (PALACE_ALLOW_AVATAR_UPLOAD=1)",
+        );
+    }
+    Ok(changed)
+}
+
+/// Return the signed-in user to a classic prop avatar.
+///
+/// The local model and roster change either way; the classic `USERPROP` that
+/// tells the server is held back with the same upload permission as setting one.
+fn clear_self_type1_avatar(
+    state: &mut SessionState,
+    conn: &mut Connection,
+    shared: &Arc<Shared>,
+) -> Result<bool> {
+    let changed = state.clear_self_avatar_hash();
+    if changed && shared.cfg.allow_avatar_upload {
+        send_self_props(state, conn)?;
+    }
+    Ok(changed)
 }
 
 /// `(x, y)` as a wire `Point`, which stores `(v, h)` = `(y, x)`.
@@ -4481,6 +4743,23 @@ mod tests {
     use palace_wire::byteorder::ByteOrder;
 
     #[test]
+    fn the_live_intake_reads_a_received_prop_by_its_id_file() {
+        let dir = std::env::temp_dir().join(format!("palace-intake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp intake dir");
+        std::fs::write(dir.join("42.bin"), [1u8, 2, 3]).expect("write received prop");
+
+        assert_eq!(read_prop_blob(&dir, 42), Some(vec![1, 2, 3]));
+        assert_eq!(
+            read_prop_blob(&dir, 7),
+            None,
+            "an unreceived prop is absent"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn animation_frames_are_capped_at_the_minimum_interval() {
         let last = Instant::now();
         let interval = Duration::from_millis(33);
@@ -4720,6 +4999,9 @@ mod tests {
             props,
             away: false,
             is_self: false,
+            avatar_type: AT_PROP,
+            avatar_flags: 0,
+            avatar_hash: None,
         }
     }
 
@@ -5809,6 +6091,9 @@ mod tests {
                 props: Vec::new(),
                 away: false,
                 is_self: true,
+                avatar_type: AT_PROP,
+                avatar_flags: 0,
+                avatar_hash: None,
             },
         );
         state
@@ -5828,6 +6113,9 @@ mod tests {
                 props: Vec::new(),
                 away: false,
                 is_self: false,
+                avatar_type: AT_PROP,
+                avatar_flags: 0,
+                avatar_hash: None,
             },
         );
     }
@@ -5881,6 +6169,8 @@ mod tests {
             mouse: Mutex::new((0, 0)),
             room_size: Mutex::new((512.0, 384.0)),
             bake_avatars,
+            props_dir: Mutex::new(None),
+            avatar_limits: Mutex::new(None),
         })
     }
 
@@ -7428,6 +7718,9 @@ mod tests {
                 props: Vec::new(),
                 away: false,
                 is_self: true,
+                avatar_type: AT_PROP,
+                avatar_flags: 0,
+                avatar_hash: None,
             },
         );
         harness.shared.set_mouse(272, 364);

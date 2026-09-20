@@ -1,0 +1,5 @@
+# Screenshots and run logs produced by the harness
+out/
+
+# Python bytecode
+__pycache__/

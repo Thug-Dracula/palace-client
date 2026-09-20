@@ -35,6 +35,7 @@ const roster = (version = 5): AvatarRoster => ({
       color: 4,
       is_self: false,
       away: false,
+      avatar_type: 0,
       parts: [
         { art: { kind: "face", face: 3, color: 4 }, dx: 1, dy: 2, alpha: 0.5, w: 3, h: 4 },
       ],

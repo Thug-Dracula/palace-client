@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   faceCellUrl,
   propImageUrl,
+  type1AvatarUrl,
   type AvatarRoster,
   type AvatarState,
   type ViewGeometry,
@@ -36,6 +37,7 @@ const avatar = (over: Partial<AvatarState> = {}): AvatarState => ({
   color: 0,
   is_self: false,
   away: false,
+  avatar_type: 0,
   parts: [],
   ...over,
 });
@@ -105,6 +107,26 @@ describe("layoutAvatars", () => {
       height: 12,
       alpha: 1,
     });
+  });
+
+  it("serves a Type 1 avatar from its hash, not a prop tile", () => {
+    const hash = "a9993e364706816aba3e25717850c26c9cd0d89d";
+    const result = layoutAvatars(
+      roster({
+        avatars: [
+          avatar({
+            id: 12,
+            avatar_type: 1,
+            parts: [
+              { art: { kind: "type1", hash }, dx: -66, dy: -66, alpha: 1, w: 132, h: 132 },
+            ],
+          }),
+        ],
+      }),
+    );
+
+    expect(result.sprites).toHaveLength(1);
+    expect(result.sprites[0].url).toBe(type1AvatarUrl(hash));
   });
 
   it("emits only the prop sprite for a head-prop avatar with no face part", () => {

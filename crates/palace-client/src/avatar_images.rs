@@ -18,16 +18,25 @@ use std::sync::{Mutex, MutexGuard};
 
 use palace_prop::PropImage;
 use palace_render::{smiley_cell, COLOR_VARIANTS, FACE_VARIANTS};
+use palace_wire::messages::AvatarHash;
+
+use crate::type1::{image_dimensions, Type1Format};
 
 /// A shared cache of encoded avatar art.
 ///
 /// Worn props are keyed by their art id; face cells by their `(face, color)`
 /// pair. Both maps are filled lazily and never re-encoded for a key already
 /// present.
+///
+/// Type 1 avatars are cached too, keyed by their content hash: either the raw
+/// server bytes (`type1`), a URL the server sent instead (`type1_urls`), or both.
 #[derive(Debug, Default)]
 pub struct AvatarImageStore {
     props: Mutex<HashMap<u32, Vec<u8>>>,
     faces: Mutex<HashMap<(i16, i16), Vec<u8>>>,
+    type1: Mutex<HashMap<AvatarHash, Vec<u8>>>,
+    type1_urls: Mutex<HashMap<AvatarHash, String>>,
+    type1_dims: Mutex<HashMap<AvatarHash, (u32, u32)>>,
 }
 
 impl AvatarImageStore {
@@ -82,6 +91,54 @@ impl AvatarImageStore {
     #[must_use]
     pub fn has_face_cell(&self, face: i16, color: i16) -> bool {
         lock(&self.faces).contains_key(&(face, color))
+    }
+
+    /// Cache a Type 1 avatar's server bytes under its content hash.
+    ///
+    /// The dimensions are read from the image header so a later roster can size
+    /// the sprite without decoding the pixels; an unreadable header stores no
+    /// dimensions and the roster falls back to the server's cap. Returns the
+    /// dimensions when they were read.
+    pub fn cache_type1(&self, hash: AvatarHash, bytes: &[u8]) -> Option<(u32, u32)> {
+        let dims = Type1Format::sniff(bytes).and_then(|format| image_dimensions(bytes, format));
+        let mut store = lock(&self.type1);
+        store.insert(hash, bytes.to_vec());
+        drop(store);
+        if let Some(size) = dims {
+            lock(&self.type1_dims).insert(hash, size);
+        }
+        dims
+    }
+
+    /// The bytes and MIME type for a cached Type 1 avatar.
+    #[must_use]
+    pub fn type1(&self, hash: &AvatarHash) -> Option<(Vec<u8>, &'static str)> {
+        let bytes = lock(&self.type1).get(hash).cloned()?;
+        let mime = Type1Format::sniff(&bytes).map_or("application/octet-stream", Type1Format::mime);
+        Some((bytes, mime))
+    }
+
+    /// Whether a Type 1 avatar's bytes are cached.
+    #[must_use]
+    pub fn has_type1(&self, hash: &AvatarHash) -> bool {
+        lock(&self.type1).contains_key(hash)
+    }
+
+    /// Remember a Type 1 avatar's URL, when the server sent a URL instead of bytes.
+    pub fn cache_type1_url(&self, hash: AvatarHash, url: String) {
+        lock(&self.type1_urls).insert(hash, url);
+    }
+
+    /// The URL for a Type 1 avatar, when one was recorded.
+    #[must_use]
+    pub fn type1_url(&self, hash: &AvatarHash) -> Option<String> {
+        lock(&self.type1_urls).get(hash).cloned()
+    }
+
+    /// The cached dimensions for a Type 1 avatar, when they were read.
+    #[must_use]
+    pub fn type1_dims(&self, hash: &AvatarHash) -> Option<(u32, u32)> {
+        lock(&self.type1_dims).get(hash).copied()
     }
 }
 
@@ -161,5 +218,42 @@ mod tests {
         assert_eq!(store.prop_png(5).as_deref(), Some(first.as_slice()));
         assert!(store.has_prop(5));
         assert!(store.prop_png(6).is_none(), "an id never cached is absent");
+    }
+
+    fn tiny_gif() -> Vec<u8> {
+        let mut out = b"GIF89a".to_vec();
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&3u16.to_le_bytes());
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x3B]);
+        out
+    }
+
+    #[test]
+    fn a_type1_avatar_is_cached_with_its_bytes_mime_and_dimensions() {
+        let store = AvatarImageStore::new();
+        let hash = AvatarHash::new([0x11; 20]);
+        assert!(!store.has_type1(&hash));
+
+        let dims = store.cache_type1(hash, &tiny_gif());
+        assert_eq!(dims, Some((2, 3)));
+        assert!(store.has_type1(&hash));
+        assert_eq!(store.type1_dims(&hash), Some((2, 3)));
+
+        let (bytes, mime) = store.type1(&hash).expect("the avatar is served");
+        assert_eq!(bytes, tiny_gif());
+        assert_eq!(mime, "image/gif");
+    }
+
+    #[test]
+    fn a_type1_url_is_kept_when_the_server_sends_no_bytes() {
+        let store = AvatarImageStore::new();
+        let hash = AvatarHash::new([0x22; 20]);
+        assert_eq!(store.type1(&hash), None);
+        store.cache_type1_url(hash, "https://example.test/a.gif".to_string());
+        assert_eq!(
+            store.type1_url(&hash).as_deref(),
+            Some("https://example.test/a.gif")
+        );
+        assert!(store.type1(&hash).is_none(), "a URL is not image bytes");
     }
 }

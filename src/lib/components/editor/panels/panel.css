@@ -1,0 +1,230 @@
+/* Shared placeholder chrome for the editor panels.
+   Imported by each stub so the seven placeholder bodies stay visually
+   consistent without duplicating a <style> block in every component. */
+
+.panel-stub {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+}
+
+.panel-stub h3 {
+  margin: 0;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--amber);
+}
+
+.panel-note {
+  margin: 0;
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  color: var(--text-1);
+}
+
+.panel-facts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: 0;
+  padding: var(--sp-2);
+  background: var(--bg-void);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+
+.panel-facts > div {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  font-size: var(--fs-xs);
+}
+
+.panel-facts dt {
+  color: var(--text-3);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.panel-facts dd {
+  margin: 0;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.panel-future {
+  margin: 0;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--text-3);
+}
+
+/* ---------- Working panels ---------- */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+}
+
+.panel h3 {
+  margin: 0;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--amber);
+}
+
+.panel-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-2);
+  background: var(--bg-void);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+
+.panel-section > h4 {
+  margin: 0;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+
+.panel-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  justify-content: space-between;
+  font-size: var(--fs-xs);
+  color: var(--text-1);
+}
+
+.panel-row > label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.panel-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-2);
+}
+
+.panel-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+}
+
+.panel-field input,
+.panel-field select {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--surface-1);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  padding: 3px var(--sp-1);
+  color: var(--text-0);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-field input:focus,
+.panel-field select:focus {
+  border-color: var(--amber-dim);
+  box-shadow: 0 0 0 2px var(--amber-soft);
+}
+
+.panel-field input[type="color"] {
+  height: 26px;
+  padding: 2px;
+}
+
+.panel-row input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--amber);
+}
+
+.panel-value {
+  min-width: 3.2em;
+  text-align: right;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1);
+}
+
+.panel-buttons .btn {
+  flex: 1 1 auto;
+}
+
+.panel-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  font-size: var(--fs-xs);
+  color: var(--text-1);
+}
+
+.panel-note.warn {
+  color: var(--amber);
+}
+
+.panel-note.error {
+  color: var(--red);
+}
+
+.panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.panel-list button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: 3px var(--sp-2);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  color: var(--text-1);
+  font-size: var(--fs-xs);
+  text-align: left;
+}
+
+.panel-list button:hover:not(:disabled) {
+  background: var(--surface-3);
+  color: var(--text-0);
+}
+
+.panel-list button.on {
+  background: var(--amber-soft);
+  border-color: var(--amber-dim);
+  color: var(--amber);
+}
+
+.panel-tag {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}

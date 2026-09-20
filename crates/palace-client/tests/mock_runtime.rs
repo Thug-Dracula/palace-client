@@ -22,15 +22,16 @@ use std::time::{Duration, Instant};
 use palace_client::runtime::ClientRuntime;
 use palace_client::trace::{self, Tracer};
 use palace_client::{
-    ChatKind, ClientConfig, ClientEvent, ClientHandle, ConnectionStatus, RoomInfo, ScreenState,
-    ServerBanner, UserInfo,
+    content_hash, AvatarArt, ChatKind, ClientConfig, ClientEvent, ClientHandle, ConnectionStatus,
+    RoomInfo, ScreenState, ServerBanner, UserInfo,
 };
 use palace_wire::byteorder::{ByteOrder, Reader, Writer};
 use palace_wire::fixture::{default_fixture_dir, Fixture};
 use palace_wire::frame::{user_move_frame, Frame};
 use palace_wire::messages::{
-    aux_flags, client_logon_record_with_identity, reference_logon_record, AssetSpec,
-    ClientIdentity, Message, Point, RoomRec, UserProp, UserRec,
+    aux_flags, client_logon_record_with_identity, reference_logon_record, AssetSpec, AvatarSend,
+    ClientIdentity, Message, Point, RoomRec, UserProp, UserRec, AT_AVATAR, AT_PROP,
+    AVATAR_SEND_DATA, AVFORM_GIF, AVFORM_JPEG, AVFORM_PNG99A, SI_INF_AVATAR,
 };
 use palace_wire::opcode;
 use tokio::sync::mpsc::{error::TryRecvError, UnboundedReceiver};
@@ -579,6 +580,16 @@ fn config_for(port: u16, cache_root: PathBuf, seed_media: PathBuf) -> ClientConf
         seed_props: Vec::new(),
         password: None,
         identity: ClientIdentity::default(),
+        allow_avatar_upload: false,
+    }
+}
+
+/// Like [`config_for`], but opts into avatar uploads so a test can observe the
+/// `sAva` frame a real server would receive.
+fn config_for_upload(port: u16, cache_root: PathBuf, seed_media: PathBuf) -> ClientConfig {
+    ClientConfig {
+        allow_avatar_upload: true,
+        ..config_for(port, cache_root, seed_media)
     }
 }
 
@@ -7064,4 +7075,459 @@ fn with_tracing_unset_the_session_runs_and_creates_no_trace_file() {
         !trace::enabled() && trace::tracer().is_none(),
         "nothing turned tracing on during the session"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Type 1 avatars
+// ---------------------------------------------------------------------------
+
+/// An `sInf` reply advertising the live server's Type 1 limits: formats 0x7,
+/// 14 KB, 132x132 (spec note §2/§6).
+fn limits_frame(order: ByteOrder) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i32(SI_INF_AVATAR);
+    w.write_i32(12);
+    w.write_u32(AVFORM_GIF | AVFORM_JPEG | AVFORM_PNG99A);
+    w.write_u16(14);
+    w.write_u16(132);
+    w.write_u16(132);
+    w.write_u16(0);
+    Frame::new(opcode::EXTENDEDINFO, 0, w.into_vec())
+        .encode(order)
+        .expect("sInf encodes")
+}
+
+/// A PNG of the requested size, for the limit tests.
+fn png_sized(width: u32, height: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("png header");
+        writer
+            .write_image_data(&vec![0x40u8; (width * height * 4) as usize])
+            .expect("png data");
+    }
+    out
+}
+
+/// The first `sAva` the client sent, decoded.
+fn sent_avatar_send(server: &MockServer, order: ByteOrder) -> Option<AvatarSend> {
+    server
+        .received_frames(order)
+        .iter()
+        .find(|frame| frame.opcode == opcode::AVATARSEND)
+        .and_then(|frame| {
+            match Message::decode(frame.opcode, frame.ref_num, &frame.payload, order) {
+                Ok(Message::AvatarSend(send)) => Some(send),
+                _ => None,
+            }
+        })
+}
+
+/// Start a session whose mock server has advertised the live Type 1 limits and
+/// whose config allows an upload.
+fn start_room_with_limits(
+    fixture: &Fixture,
+    tag: &str,
+) -> (
+    MockServer,
+    ClientHandle,
+    UnboundedReceiver<ClientEvent>,
+    ScreenState,
+    PathBuf,
+    PathBuf,
+) {
+    let order = fixture.byte_order;
+    let room = room_desc(fixture);
+    let mut frames = room_only_frames(fixture);
+    frames.push(self_user_frame(order));
+    frames.push(limits_frame(order));
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir(&format!("{tag}-cache"));
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for_upload(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            handle.avatar_limits().is_some()
+                && screens(collected)
+                    .iter()
+                    .any(|screen| screen.room_id == 901 && screen.avatars >= 1)
+        },
+        Duration::from_secs(20),
+    );
+    let screen = screens(&events)
+        .into_iter()
+        .find(|screen| screen.room_id == 901 && screen.avatars >= 1)
+        .expect("a frame with the self user was composed for room 901")
+        .clone();
+    (server, handle, rx, screen, cache, seed)
+}
+
+#[test]
+fn a_type1_avatar_over_the_limit_is_refused_and_never_uploaded() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, mut rx, _screen, cache, seed) =
+        start_room_with_limits(&fixture, "type1-limit");
+
+    // 200x200 is over the server's 132x132 cap; the payload is small.
+    handle.set_type1_avatar(png_sized(200, 200));
+    let events = collect_events(
+        &mut rx,
+        |collected| !error_chats(collected).is_empty(),
+        Duration::from_secs(5),
+    );
+    assert!(
+        error_chats(&events)
+            .iter()
+            .any(|text| text.contains("132") && text.contains("wide")),
+        "the refusal names the server's 132-pixel limit: {:?}",
+        error_chats(&events)
+    );
+    assert!(
+        !server
+            .received_frames(order)
+            .iter()
+            .any(|frame| frame.opcode == opcode::AVATARSEND),
+        "an over-limit image must never reach the wire"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_type1_avatar_that_is_not_an_image_is_refused() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, mut rx, _screen, cache, seed) =
+        start_room_with_limits(&fixture, "type1-format");
+
+    handle.set_type1_avatar(b"definitely not an image".to_vec());
+    let events = collect_events(
+        &mut rx,
+        |collected| !error_chats(collected).is_empty(),
+        Duration::from_secs(5),
+    );
+    assert!(
+        error_chats(&events)
+            .iter()
+            .any(|text| text.contains("GIF, JPEG or PNG")),
+        "the refusal says what formats are accepted: {:?}",
+        error_chats(&events)
+    );
+    assert!(
+        !server
+            .received_frames(order)
+            .iter()
+            .any(|frame| frame.opcode == opcode::AVATARSEND),
+        "a non-image must never reach the wire"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn setting_and_clearing_a_type1_avatar_round_trips() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, mut rx, _screen, cache, seed) =
+        start_room_with_limits(&fixture, "type1-roundtrip");
+
+    let bytes = tiny_png();
+    let hash = content_hash(&bytes);
+    let hash_hex = hash.to_hex();
+    handle.set_type1_avatar(bytes.clone());
+
+    assert!(
+        wait_for(
+            || sent_avatar_send(&server, order).is_some(),
+            Duration::from_secs(5)
+        ),
+        "the sAva upload reached the server"
+    );
+    let send = sent_avatar_send(&server, order).expect("an sAva frame");
+    assert_eq!(send.hash, hash, "the hash is the image's content hash");
+    assert_eq!(send.flags, AVATAR_SEND_DATA, "the body carries image bytes");
+    assert_eq!(send.data, bytes, "the exact bytes are uploaded");
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            avatar_rosters(collected).iter().any(|roster| {
+                roster.avatars.iter().any(|avatar| {
+                    avatar.is_self
+                        && avatar.avatar_type == AT_AVATAR
+                        && avatar
+                            .parts
+                            .iter()
+                            .any(|part| matches!(&part.art, AvatarArt::Type1 { hash } if hash == &hash_hex))
+                })
+            })
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        avatar_rosters(&events).iter().any(|roster| {
+            roster.avatars.iter().any(|avatar| {
+                avatar.is_self
+                    && avatar.avatar_type == AT_AVATAR
+                    && avatar.parts.len() == 1
+                    && matches!(&avatar.parts[0].art, AvatarArt::Type1 { .. })
+            })
+        }),
+        "the Type 1 avatar is one hash-identified layer: {:?}",
+        avatar_rosters(&events)
+    );
+
+    // Clearing returns to a classic prop avatar and tells the server with a
+    // USERPROP, the classic path.
+    handle.clear_type1_avatar();
+    assert!(
+        wait_for(
+            || server
+                .received_frames(order)
+                .iter()
+                .any(|frame| frame.opcode == opcode::USERPROP),
+            Duration::from_secs(5)
+        ),
+        "clearing sends a classic USERPROP"
+    );
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            avatar_rosters(collected).iter().any(|roster| {
+                roster
+                    .avatars
+                    .iter()
+                    .any(|avatar| avatar.is_self && avatar.avatar_type == AT_PROP)
+            })
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        avatar_rosters(&events).iter().any(|roster| {
+            roster.avatars.iter().any(|avatar| {
+                avatar.is_self
+                    && avatar.avatar_type == AT_PROP
+                    && avatar
+                        .parts
+                        .iter()
+                        .all(|part| !matches!(&part.art, AvatarArt::Type1 { .. }))
+            })
+        }),
+        "after clearing, the self avatar is classic again"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn the_classic_prop_avatar_path_is_unaffected_by_type1() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let (server, handle, mut rx, _screen, cache, seed) =
+        start_room_with_limits(&fixture, "type1-classic");
+
+    handle.set_props(vec![10, 20]);
+    assert!(
+        wait_for(
+            || !sent_user_props(&server, order).is_empty(),
+            Duration::from_secs(5)
+        ),
+        "the classic worn list still reaches the server"
+    );
+    let sent = sent_user_props(&server, order);
+    assert_eq!(ids_of(&sent[0]), vec![10, 20]);
+    assert!(
+        !server
+            .received_frames(order)
+            .iter()
+            .any(|frame| frame.opcode == opcode::AVATARSEND),
+        "a prop avatar never uploads an sAva"
+    );
+
+    let events = collect_events(
+        &mut rx,
+        |collected| !avatar_rosters(collected).is_empty(),
+        Duration::from_secs(5),
+    );
+    assert!(
+        avatar_rosters(&events)
+            .iter()
+            .all(|roster| roster
+                .avatars
+                .iter()
+                .all(|avatar| avatar.avatar_type == AT_PROP
+                    && avatar
+                        .parts
+                        .iter()
+                        .all(|part| !matches!(&part.art, AvatarArt::Type1 { .. })))),
+        "no user is a Type 1 avatar after a classic prop change"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+#[test]
+fn a_type1_avatar_is_refused_until_the_server_advertises_its_limits() {
+    let fixture = logon_fixture();
+    let (server, handle, mut rx, _screen, cache, seed) =
+        start_room_with_self(&fixture, "type1-no-limits");
+
+    handle.set_type1_avatar(tiny_png());
+    let events = collect_events(
+        &mut rx,
+        |collected| !error_chats(collected).is_empty(),
+        Duration::from_secs(5),
+    );
+    assert!(
+        error_chats(&events)
+            .iter()
+            .any(|text| text.contains("has not advertised")),
+        "without an 'AVAT' reply the client refuses rather than guessing: {:?}",
+        error_chats(&events)
+    );
+    assert!(
+        !server
+            .received_frames(fixture.byte_order)
+            .iter()
+            .any(|frame| frame.opcode == opcode::AVATARSEND),
+        "nothing is uploaded while the limits are unknown"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+/// A `USERNEW` carrying a `UserRecAvatar`: a Type 1 user's record.
+fn type1_user_new_frame(order: ByteOrder, id: i32, name: &str, hash: [u8; 20]) -> Vec<u8> {
+    let mut w = Writer::new(order);
+    w.write_i32(id);
+    Point::new(100, 100).encode(&mut w);
+    w.write_bytes(&[0u8; 52]);
+    w.write_bytes(&hash);
+    w.write_i16(901);
+    w.write_i16(0);
+    w.write_i16(0);
+    w.write_i16(AT_AVATAR);
+    w.write_u16(0);
+    w.write_i16(0);
+    w.write_str31(name);
+    Frame::new(opcode::USERNEW, id, w.into_vec())
+        .encode(order)
+        .expect("usernw encodes")
+}
+
+/// An `sAva` reply carrying an avatar's image bytes.
+fn avatar_send_frame(order: ByteOrder, hash: palace_client::AvatarHash, bytes: &[u8]) -> Vec<u8> {
+    AvatarSend {
+        hash,
+        flags: AVATAR_SEND_DATA,
+        data: bytes.to_vec(),
+    }
+    .frame(order)
+    .expect("sAva encodes")
+    .encode(order)
+    .expect("sAva frame encodes")
+}
+
+#[test]
+fn a_remote_type1_user_is_queried_and_its_image_is_cached() {
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let bytes = png_sized(16, 16);
+    let hash = content_hash(&bytes);
+
+    let mut frames = room_only_frames(&fixture);
+    frames.push(self_user_frame(order));
+    frames.push(type1_user_new_frame(order, 99, "Bo", *hash.bytes()));
+    frames.push(avatar_send_frame(order, hash, &bytes));
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("type1-fetch-cache");
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    let events = collect_events(
+        &mut rx,
+        |collected| {
+            avatar_rosters(collected).iter().any(|roster| {
+                roster.avatars.iter().any(|avatar| {
+                    avatar.id == 99
+                        && avatar.avatar_type == AT_AVATAR
+                        && avatar
+                            .parts
+                            .iter()
+                            .any(|part| matches!(&part.art, AvatarArt::Type1 { .. }))
+                })
+            })
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        avatar_rosters(&events).iter().any(|roster| roster
+            .avatars
+            .iter()
+            .any(|avatar| avatar.id == 99 && avatar.avatar_type == AT_AVATAR)),
+        "the Type 1 user is on the roster: {:?}",
+        avatar_rosters(&events)
+    );
+
+    assert!(
+        wait_for(
+            || {
+                server
+                    .received_frames(order)
+                    .iter()
+                    .any(|frame| frame.opcode == opcode::AVATARQUERY)
+            },
+            Duration::from_secs(5)
+        ),
+        "the client asked the server for the remote avatar with qAva"
+    );
+    let query = sent_message(&server, order, opcode::AVATARQUERY);
+    match query {
+        Message::AvatarQuery(query) => assert_eq!(query.hash, hash, "the qAva names the hash"),
+        other => panic!("expected AvatarQuery, got {other:?}"),
+    }
+
+    assert!(
+        wait_for(
+            || handle.avatar_images().has_type1(&hash),
+            Duration::from_secs(5)
+        ),
+        "the sAva reply's bytes are cached for the type1-avatar route"
+    );
+    let (cached, mime) = handle
+        .avatar_images()
+        .type1(&hash)
+        .expect("the avatar is served from cache");
+    assert_eq!(cached, bytes);
+    assert_eq!(mime, "image/png");
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
 }

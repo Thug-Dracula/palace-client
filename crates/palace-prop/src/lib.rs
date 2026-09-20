@@ -58,13 +58,21 @@
 //! prefix stripped. The module documents the identity pair and states plainly
 //! which parts are certain and which are undetermined.
 //!
+//! ## The `.prp` roster
+//!
+//! [`prp`] is the typed model of the server's `.prp` asset file: a flat container
+//! of prop blobs plus a map of 32-byte records and a names blob. It reuses this
+//! crate's prop header, format selector and asset CRC rather than re-deriving
+//! them, and preserves each record's raw blob so a roster can be rewritten byte
+//! for byte. The reader and writer themselves are later tasks.
+//!
 //! ## What this crate is not
 //!
-//! It knows nothing about the `.prp` roster container, the wire protocol or the
-//! network. Props are a self-contained binary format, so this crate has no
-//! dependency on `palace-wire` — only on `flate2` for the zlib step and `png` for
-//! debug output. The bag reader lives here because the bag is a prop container,
-//! not because it is part of the codec.
+//! It knows nothing about the wire protocol or the network. Props are a
+//! self-contained binary format, so this crate has no dependency on
+//! `palace-wire` — only on `flate2` for the zlib step and `png` for debug output.
+//! The bag reader lives here because the bag is a prop container, not because it
+//! is part of the codec.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -72,16 +80,33 @@
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
 
+pub mod animated;
 pub mod bag;
+pub mod bag_catalog;
+pub mod bag_folder;
+pub mod bag_store;
 pub mod catalog;
+pub mod catalog_paging;
 pub mod codec;
 pub mod crc;
+pub mod crc_repair;
+pub mod editor;
 pub mod encode;
+pub mod encoding;
 pub mod error;
+pub mod favorites_trash;
+pub mod gather;
 pub mod header;
 pub mod image;
+pub mod outfit_ops;
+pub mod outfits;
 pub mod palette;
+pub mod prop_animated_recon;
+pub mod provenance;
+pub mod prp;
+pub mod shelves;
 
+pub use animated::{AnimatedError, AnimatedProp, FrameInfo};
 pub use bag::{BagEntry, PropBag, BAG_INDEX_RECORD_LEN, BAG_PREFIX_LEN};
 pub use catalog::{CatalogEntry, PropCatalog};
 pub use crc::{asset_crc, payload_crc, ASSET_CRC_MAGIC};
@@ -128,6 +153,15 @@ impl Prop {
 /// bytes contain: a malformed prop produces an [`PropError`], not a crash.
 pub fn decode(data: &[u8]) -> Result<Prop> {
     let header = PropHeader::parse(data)?;
+    // A big-prop container's payload is an embedded image plus a raw 44x44
+    // still, not one of the five pixel formats, so the decoders below would
+    // reject it. Render the 44x44 still instead; `animated` exposes the
+    // embedded full-size image and the frame table.
+    if header.flags & animated::BIG_FLAG_MASK != 0 {
+        if let Some(image) = animated::legacy_image(data) {
+            return Ok(Prop { header, image });
+        }
+    }
     let payload = data.get(HEADER_LEN..).unwrap_or(&[]);
     let image = codec::decode_payload(&header, payload)?;
     Ok(Prop { header, image })

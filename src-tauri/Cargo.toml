@@ -26,7 +26,26 @@ palace-client = { workspace = true }
 palace-render = { workspace = true }
 palace-prop = { workspace = true }
 palace-audio = { workspace = true }
+# The editor decodes imported raster images (PNG/JPG/BMP/GIF/WebP) at the app
+# layer. `palace-prop::editor` is deliberately format-free — it takes RGBA in
+# and gives RGBA out — so format decoding must live here rather than in that
+# dependency-light crate. The workspace pins `image` with default features off
+# (png/jpeg/gif enabled); `bmp` and `webp` are added here so the import path
+# accepts every format the editor promises. The already-built sibling
+# `palace-render` uses the same crate for its loose-asset decoding.
+image = { workspace = true, features = ["bmp", "webp"] }
+# The text tool rasterizes glyphs into a layer at the app layer. `fontdue` is a
+# small, pure-Rust glyph rasterizer (no system font/freetype dependency) and is
+# already in the workspace graph via `palace-render`, which uses it for name
+# tags; adding it here pulls in no new transitive crate. The face is the same
+# embedded Liberation Sans Bold (SIL OFL 1.1) `palace-render` already bundles.
+fontdue = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# The animation-export test decodes the WebP this crate muxes to prove the
+# container is well formed. `image` decodes WebP but does not expose its
+# animation frame API, and `image-webp` is already in the dependency graph
+# (pulled in by `image`), so this adds no new transitive crate.
+image-webp = "0.2"

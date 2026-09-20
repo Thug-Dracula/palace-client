@@ -45,6 +45,31 @@ pub const USEREXIT: Opcode = Opcode(0x6570_7273);
 pub const USERLOG: Opcode = Opcode(0x6c6f_6720);
 /// `0x73696e66` — server info.
 pub const SERVERINFO: Opcode = Opcode(0x7369_6e66);
+/// `0x73496e66` — `sInf` — `EXTENDEDINFO`, the server's extended-info reply.
+///
+/// Capital-`I` `sInf` is the extended-info message (`m-events.h:57`); lowercase
+/// `sinf` ([`SERVERINFO`]) is the older permissions-and-name message. They are
+/// distinct opcodes.
+pub const EXTENDEDINFO: Opcode = Opcode(0x7349_6e66);
+/// `0x66417661` — `fAva` — a user's Type 1 avatar flags.
+///
+/// Spec note `TYPE1-AVATARS.md` §5: `MSG_AVATARFLAGS 'fAva'` carries a user's
+/// avatar flags. `ClientMsg_avatarFlags { uint16 avatarFlags }` (m-protocol.h:90-92,
+/// confirmed by the compiled server's debug struct `t155`).
+pub const AVATARFLAGS: Opcode = Opcode(0x6641_7661);
+/// `0x71417661` — `qAva` — "do you have this 20-byte avatar hash?".
+///
+/// Spec note §5: `MSG_AVATARQUERY 'qAva'` carries a 20-byte hash.
+/// `ClientMsg_avatarQuery { uint8 hash[AVATAR_HASH_LEN] }` (m-protocol.h:94-96,
+/// confirmed by debug struct `t156`).
+pub const AVATARQUERY: Opcode = Opcode(0x7141_7661);
+/// `0x73417661` — `sAva` — the avatar itself: raw image bytes or a URL.
+///
+/// Spec note §5: `MSG_AVATARSEND 'sAva'`. `ClientMsg_avatarSend { hash[20];
+/// uint32 flags; uint32 dataSize; uint8 data[dataSize] }` (m-protocol.h:98-105,
+/// confirmed by debug struct `t157`). `flags` is `AVATAR_SEND_DATA` (0) or
+/// `AVATAR_SEND_URL` (1).
+pub const AVATARSEND: Opcode = Opcode(0x7341_7661);
 /// `0x76657273` — server version.
 pub const VERSION: Opcode = Opcode(0x7665_7273);
 /// `0x48545450` — media/HTTP server URL.
@@ -130,6 +155,9 @@ pub const TABLE: &[(u32, &str, &str)] = &[
     (0x7341_7374, "sAst", "ASSETSEND"),
     (0x6175_7468, "auth", "AUTHENTICATE"),
     (0x6175_7472, "autr", "AUTHRESPONSE"),
+    (0x6641_7661, "fAva", "AVATARFLAGS"),
+    (0x7141_7661, "qAva", "AVATARQUERY"),
+    (0x7341_7661, "sAva", "AVATARSEND"),
     (0x626c_6f77, "blow", "BLOWTHRU"),
     (0x6475_726c, "durl", "DISPLAYURL"),
     (0x7279_6974, "ryit", "DIYIT"),
