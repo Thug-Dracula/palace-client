@@ -1,11 +1,15 @@
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
+import { svelteTesting } from "@testing-library/svelte/vite";
 
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
-  plugins: [sveltekit()],
+  // `svelteTesting()` is inert outside Vitest (it keys off process.env.VITEST).
+  // Under Vitest it resolves Svelte's browser build so components can be mounted
+  // in jsdom, and adds the DOM auto-cleanup setup file.
+  plugins: [sveltekit(), svelteTesting()],
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

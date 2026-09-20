@@ -35,7 +35,7 @@ use palace_prop::editor::tools::transform::{self, CropShape, ShapeCropOptions};
 use palace_prop::editor::tools::{
     adjust,
     guides::{
-        self, CentreCross, GuideGeometry, GuideLine, GuideToggles, GridLines, Point, Rect,
+        self, CentreCross, GridLines, GuideGeometry, GuideLine, GuideToggles, Point, Rect,
         ThirdsLines, DEFAULT_GRID_SPACING, DEFAULT_ONION_RADIUS, DEFAULT_SAFE_AREA_INSET,
     },
     paint,
@@ -4290,9 +4290,18 @@ mod tests {
 
         assert_eq!((geometry.width, geometry.height), (44, 44));
 
-        let xs: Vec<i32> = geometry.grid.vertical.iter().map(|line| line.from.x).collect();
+        let xs: Vec<i32> = geometry
+            .grid
+            .vertical
+            .iter()
+            .map(|line| line.from.x)
+            .collect();
         assert_eq!(xs, vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40]);
-        assert_eq!(geometry.grid.vertical.len(), 11, "eleven cells across 44 px");
+        assert_eq!(
+            geometry.grid.vertical.len(),
+            11,
+            "eleven cells across 44 px"
+        );
         assert!(geometry
             .grid
             .vertical

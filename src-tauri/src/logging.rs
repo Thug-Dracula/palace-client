@@ -26,6 +26,14 @@
 //! `PALACE_LOG` selects the level: `error`, `warn`, `info` (the default),
 //! `debug` or `trace`. Unknown values fall back to `info`.
 //!
+//! # Window labels
+//!
+//! A window reports its lifecycle through [`WindowLog`], which prefixes every
+//! line with the window's label (`[main]`, `[panel-users]`) so one greppable
+//! file answers "which window did what". Creation, destruction, detach,
+//! re-attach and layout restore are `info`; move and resize are `debug`, so
+//! dragging a window does not flood the default output.
+//!
 //! # Guarantees
 //!
 //! * **Every line is flushed before the call returns.** A log that only reaches
@@ -69,6 +77,12 @@ pub const MAX_ARCHIVES: u32 = 2;
 
 /// Longest single line the logger will write before truncating.
 const MAX_LINE: usize = 8192;
+
+/// Longest window label kept in a prefix.
+const MAX_LABEL: usize = 64;
+
+/// The prefix used when a window has no usable label.
+const UNKNOWN_LABEL: &str = "unknown-window";
 
 /// The process-wide logger, or empty until [`init`] runs.
 static LOGGER: OnceLock<Logger> = OnceLock::new();
@@ -132,7 +146,124 @@ impl Level {
     }
 }
 
-/// One open log target with its rotation policy.
+/// A window lifecycle milestone worth a line in the log.
+///
+/// The shell and each panel report these through [`WindowLog`]; the token
+/// written for each is stable so `grep` and tooling can rely on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WindowMilestone {
+    /// A window was created.
+    Created,
+    /// A window was destroyed.
+    Destroyed,
+    /// A window moved without being resized.
+    Moved,
+    /// A window was resized.
+    Resized,
+    /// A panel left the main window and became its own OS window.
+    Detached,
+    /// A panel was folded back into the main window.
+    Reattached,
+    /// A saved geometry was applied to a window at startup.
+    RestoredFromLayout,
+}
+
+impl WindowMilestone {
+    /// Every milestone, in the order they are documented.
+    pub const ALL: [WindowMilestone; 7] = [
+        WindowMilestone::Created,
+        WindowMilestone::Destroyed,
+        WindowMilestone::Moved,
+        WindowMilestone::Resized,
+        WindowMilestone::Detached,
+        WindowMilestone::Reattached,
+        WindowMilestone::RestoredFromLayout,
+    ];
+
+    /// The token written to the log for this milestone.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowMilestone::Created => "created",
+            WindowMilestone::Destroyed => "destroyed",
+            WindowMilestone::Moved => "moved",
+            WindowMilestone::Resized => "resized",
+            WindowMilestone::Detached => "detached",
+            WindowMilestone::Reattached => "reattached",
+            WindowMilestone::RestoredFromLayout => "restored-from-layout",
+        }
+    }
+
+    /// The level this milestone writes at unless the caller overrides it.
+    ///
+    /// Move and resize fire continuously while a window is dragged, so they
+    /// stay at `debug`; the rest happen once per session and stay visible at
+    /// the default level.
+    #[must_use]
+    pub fn level(self) -> Level {
+        match self {
+            WindowMilestone::Moved | WindowMilestone::Resized => Level::Debug,
+            _ => Level::Info,
+        }
+    }
+}
+
+/// A window-scoped view of the log: every line it writes carries `[label]`.
+///
+/// Keep one per window for the window's lifetime, or call [`log_window`] for a
+/// single event.
+#[derive(Debug, Clone)]
+pub struct WindowLog {
+    label: String,
+}
+
+impl WindowLog {
+    /// A logger for the window named `label`.
+    ///
+    /// The label is cleaned to ASCII identifier characters; an unusable label
+    /// becomes `unknown-window`.
+    #[must_use]
+    pub fn new(label: &str) -> WindowLog {
+        WindowLog {
+            label: clean_label(label),
+        }
+    }
+
+    /// The window's cleaned label, without the brackets.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Record a milestone at the level [`WindowMilestone::level`] picks.
+    pub fn record(&self, milestone: WindowMilestone, detail: impl fmt::Display) {
+        self.record_at(milestone.level(), milestone, detail);
+    }
+
+    /// Record a milestone at an explicit level.
+    pub fn record_at(&self, level: Level, milestone: WindowMilestone, detail: impl fmt::Display) {
+        log(
+            level,
+            format_window_message(&self.label, milestone, &detail.to_string()),
+        );
+    }
+}
+
+/// Record one window milestone through the process logger.
+///
+/// Shorthand for a single event; a window that logs repeatedly should keep a
+/// [`WindowLog`] instead. The level is [`WindowMilestone::level`].
+pub fn log_window(label: &str, milestone: WindowMilestone, detail: impl fmt::Display) {
+    WindowLog::new(label).record(milestone, detail);
+}
+
+/// The `[label]` prefix for a window line.
+#[must_use]
+pub fn window_prefix(label: &str) -> String {
+    format!("[{}]", clean_label(label))
+}
+
+/// One log target with its rotation policy.
 struct Logger {
     level: Level,
     path: PathBuf,
@@ -382,6 +513,34 @@ fn install_panic_hook() {
     });
 }
 
+/// Reduce a window label to ASCII identifier characters.
+///
+/// A label carrying a space, a `]` or a newline could otherwise split a line
+/// or fake another window's prefix. An empty result becomes [`UNKNOWN_LABEL`]
+/// so every line still names a window.
+fn clean_label(label: &str) -> String {
+    let cleaned: String = label
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        .take(MAX_LABEL)
+        .collect();
+    if cleaned.is_empty() {
+        UNKNOWN_LABEL.to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// The message body of a window line, without the timestamp and level the
+/// logger adds.
+fn format_window_message(label: &str, milestone: WindowMilestone, detail: &str) -> String {
+    if detail.is_empty() {
+        format!("{} {}", window_prefix(label), milestone.as_str())
+    } else {
+        format!("{} {} {}", window_prefix(label), milestone.as_str(), detail)
+    }
+}
+
 /// Collapse a message to one line and cap its length.
 fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_LINE));
@@ -598,5 +757,115 @@ mod tests {
             "the formatter agrees with a known instant"
         );
         assert_eq!(civil_from_secs(0), (1970, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn window_prefixes_name_the_window() {
+        assert_eq!(window_prefix("main"), "[main]");
+        assert_eq!(window_prefix("panel-users"), "[panel-users]");
+        assert_eq!(
+            window_prefix("panel users ] [main"),
+            "[panelusersmain]",
+            "a label cannot forge a second prefix or split the line"
+        );
+        assert_eq!(window_prefix(""), "[unknown-window]");
+        assert_eq!(window_prefix("   "), "[unknown-window]");
+        assert_eq!(WindowLog::new("main").label(), "main");
+        assert_eq!(WindowLog::new("").label(), UNKNOWN_LABEL);
+    }
+
+    #[test]
+    fn milestones_have_stable_tokens() {
+        let tokens: Vec<&str> = WindowMilestone::ALL.iter().map(|m| m.as_str()).collect();
+        assert_eq!(
+            tokens,
+            vec![
+                "created",
+                "destroyed",
+                "moved",
+                "resized",
+                "detached",
+                "reattached",
+                "restored-from-layout",
+            ]
+        );
+        assert_eq!(
+            format_window_message("main", WindowMilestone::Destroyed, ""),
+            "[main] destroyed",
+            "a milestone without detail still names the window"
+        );
+    }
+
+    #[test]
+    fn move_and_resize_stay_quiet_at_the_default_level() {
+        assert_eq!(WindowMilestone::Moved.level(), Level::Debug);
+        assert_eq!(WindowMilestone::Resized.level(), Level::Debug);
+        for milestone in [
+            WindowMilestone::Created,
+            WindowMilestone::Destroyed,
+            WindowMilestone::Detached,
+            WindowMilestone::Reattached,
+            WindowMilestone::RestoredFromLayout,
+        ] {
+            assert_eq!(
+                milestone.level(),
+                Level::Info,
+                "{milestone:?} is a lifecycle event"
+            );
+        }
+
+        let dir = temp_dir("window-levels");
+        let logger = Logger::open(&dir, Level::Info, MAX_BYTES, MAX_ARCHIVES).expect("opens");
+        logger.write(
+            WindowMilestone::Moved.level(),
+            &format_window_message("main", WindowMilestone::Moved, "x=1 y=2"),
+        );
+        logger.write(
+            WindowMilestone::Created.level(),
+            &format_window_message("main", WindowMilestone::Created, "label=main"),
+        );
+        let text = read(logger.path());
+        assert!(
+            !text.contains("moved"),
+            "a drag stays below the default level: {text}"
+        );
+        assert!(text.contains("INFO  [main] created label=main"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_window_line_carries_its_label_and_milestone() {
+        let dir = temp_dir("window-line");
+        let logger = Logger::open(&dir, Level::Debug, MAX_BYTES, MAX_ARCHIVES).expect("opens");
+        logger.write(
+            WindowMilestone::Detached.level(),
+            &format_window_message(
+                "panel-users",
+                WindowMilestone::Detached,
+                "label=panel-users",
+            ),
+        );
+        logger.write(
+            WindowMilestone::RestoredFromLayout.level(),
+            &format_window_message("main", WindowMilestone::RestoredFromLayout, "x=0 y=0"),
+        );
+        let text = read(logger.path());
+        assert!(
+            text.contains("INFO  [panel-users] detached label=panel-users"),
+            "{text}"
+        );
+        assert!(
+            text.contains("INFO  [main] restored-from-layout x=0 y=0"),
+            "{text}"
+        );
+
+        let prefix = window_prefix("panel-users");
+        assert!(prefix.starts_with('[') && prefix.ends_with(']'));
+        assert_eq!(
+            prefix.matches(']').count(),
+            1,
+            "the prefix cannot nest brackets"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
