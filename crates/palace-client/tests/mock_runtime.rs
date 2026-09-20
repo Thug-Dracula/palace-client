@@ -23,7 +23,7 @@ use palace_client::runtime::ClientRuntime;
 use palace_client::trace::{self, Tracer};
 use palace_client::{
     content_hash, AvatarArt, ChatKind, ClientConfig, ClientEvent, ClientHandle, ConnectionStatus,
-    RoomInfo, ScreenState, ServerBanner, UserInfo,
+    RoomInfo, ScreenState, ServerBanner, UserInfo, CHAT_REPLAY_LIMIT,
 };
 use palace_wire::byteorder::{ByteOrder, Reader, Writer};
 use palace_wire::fixture::{default_fixture_dir, Fixture};
@@ -7525,6 +7525,156 @@ fn a_remote_type1_user_is_queried_and_its_image_is_cached() {
         .expect("the avatar is served from cache");
     assert_eq!(cached, bytes);
     assert_eq!(mime, "image/png");
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+// ---------------------------------------------------------------------------
+// Task 10: backend-owned scrollback and the `refresh` replay
+// ---------------------------------------------------------------------------
+
+/// A late-opening Chat or log window must receive the whole retained
+/// transcript, not a truncated tail: `Refresh` replays the backend's bounded
+/// scrollback in full.
+#[test]
+fn refresh_replays_the_full_retained_scrollback_for_a_late_subscriber() {
+    const LINES: usize = 1000;
+
+    let fixture = logon_fixture();
+    let order = fixture.byte_order;
+    let room = room_desc(&fixture);
+    let mut frames = server_bytes(&fixture);
+    frames.push(self_user_frame(order));
+    for index in 0..LINES {
+        frames.push(talk_from_frame(
+            order,
+            SELF_ID,
+            &format!("scroll line {index}"),
+        ));
+    }
+    let server = MockServer::start(frames);
+    let cache = unique_temp_dir("scrollback-cache");
+    let seed = seed_media_dir(&room);
+    let (handle, stream) =
+        ClientRuntime::spawn(config_for(server.port, cache.clone(), seed.clone()));
+    let mut rx = stream.into_receiver();
+
+    // Wait until the newest fed line arrived, so the transcript is full.
+    let newest = format!("scroll line {}", LINES - 1);
+    let events = collect_events(
+        &mut rx,
+        |collected| chats(collected).contains(&newest.as_str()),
+        Duration::from_secs(60),
+    );
+    assert!(
+        chats(&events).contains(&newest.as_str()),
+        "every fed chat line arrived"
+    );
+
+    // Drain whatever is still queued, so the replay below stands alone.
+    let _ = collect_events(&mut rx, |_| false, Duration::from_millis(300));
+
+    // A brand-new subscriber's seed call.
+    handle.refresh();
+    let replayed_events = collect_events(
+        &mut rx,
+        |collected| !screens(collected).is_empty(),
+        Duration::from_secs(10),
+    );
+    let replayed: Vec<&str> = chats(&replayed_events);
+
+    assert_eq!(
+        replayed.len(),
+        CHAT_REPLAY_LIMIT,
+        "refresh replayed exactly the retained scrollback: {replayed:?}"
+    );
+    let oldest_retained = format!("scroll line {}", LINES - CHAT_REPLAY_LIMIT);
+    assert_eq!(
+        replayed.first().copied(),
+        Some(oldest_retained.as_str()),
+        "the oldest replayed line is the oldest the cap kept"
+    );
+    assert_eq!(
+        replayed.last().copied(),
+        Some(newest.as_str()),
+        "the newest replayed line is the newest in the transcript"
+    );
+    assert!(
+        !replayed.contains(&"scroll line 0"),
+        "lines the bounded transcript dropped are not replayed"
+    );
+
+    handle.disconnect();
+    drop(server);
+    cleanup(&cache);
+    cleanup(&seed);
+}
+
+/// A late-opening Room panel must get the sprite roster and the recent notices
+/// on `Refresh`, or it opens with an empty sprite layer and an empty notice list.
+#[test]
+fn refresh_replays_the_avatar_roster_and_recent_notices() {
+    let fixture = logon_fixture();
+    let (server, handle, mut rx, screen, cache, seed) =
+        start_room_with_self(&fixture, "resync-seed");
+
+    // Move the avatar: this produces "walk:" notices only a click can make, so
+    // seeing one after the refresh proves the replay, not fresh activity.
+    let floor = screen
+        .geometry
+        .transform()
+        .room_to_viewport(palace_render::PointF::new(30_000.0, 30_000.0));
+    handle.click(floor.x, floor.y);
+    let walked = collect_events(
+        &mut rx,
+        |collected| {
+            notes(collected)
+                .iter()
+                .any(|text| text.starts_with("walk: sent"))
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        notes(&walked)
+            .iter()
+            .any(|text| text.starts_with("walk: local apply")),
+        "the click produced its own notices: {:?}",
+        notes(&walked)
+    );
+
+    // Drain so only the refresh's replay is judged.
+    let _ = collect_events(&mut rx, |_| false, Duration::from_millis(200));
+
+    handle.refresh();
+    let events = collect_events(
+        &mut rx,
+        |collected| !screens(collected).is_empty(),
+        Duration::from_secs(10),
+    );
+
+    assert!(
+        !avatar_rosters(&events).is_empty(),
+        "refresh re-emitted the avatar roster for the room panel"
+    );
+    assert_eq!(
+        avatar_rosters(&events).last().map(|roster| roster.room_id),
+        Some(901),
+        "the replayed roster names the entered room"
+    );
+    let replayed_notes: Vec<&str> = notes(&events);
+    assert!(
+        replayed_notes
+            .iter()
+            .any(|text| text.starts_with("walk: local apply")),
+        "refresh re-emitted a notice from before the refresh: {replayed_notes:?}"
+    );
+    assert!(
+        replayed_notes.len() <= 6,
+        "the notice replay is bounded to the frontend's cap: {replayed_notes:?}"
+    );
 
     handle.disconnect();
     drop(server);

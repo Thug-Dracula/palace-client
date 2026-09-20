@@ -7,6 +7,7 @@
 pub mod bag;
 pub mod commands;
 pub mod editor;
+pub mod geometry;
 pub mod logging;
 pub mod protocol;
 pub mod settings;
@@ -210,24 +211,35 @@ pub fn handle_window_event<R: tauri::Runtime>(
 ) {
     let label = window.label();
     match event {
-        tauri::WindowEvent::CloseRequested { .. } => match windows::close_action(label) {
-            windows::CloseAction::ReattachPanel => {
-                logging::log(Level::Info, format!("panel close requested label={label}"));
-                windows::panel_close_requested(window.app_handle(), label);
-            }
-            windows::CloseAction::DisconnectMain => {
-                logging::log(Level::Info, "window close requested; disconnecting");
-                if let Some(state) = window.try_state::<AppState>() {
-                    if let Ok(guard) = state.client.lock() {
-                        if let Some(client) = guard.as_ref() {
-                            client.disconnect();
-                            std::thread::sleep(Duration::from_millis(150));
+        tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
+            // Drags and resizes fire continuously; the store only marks itself
+            // dirty here and the autosave thread writes at its own pace.
+            geometry::note_geometry_changed(window);
+        }
+        tauri::WindowEvent::CloseRequested { .. } => {
+            // Capture before the window goes away. This saves geometry but
+            // never changes the detached flag: a panel closing because the app
+            // is quitting must stay marked detached for the next launch.
+            geometry::note_window_closing(window);
+            match windows::close_action(label) {
+                windows::CloseAction::ReattachPanel => {
+                    logging::log(Level::Info, format!("panel close requested label={label}"));
+                    windows::panel_close_requested(window.app_handle(), label);
+                }
+                windows::CloseAction::DisconnectMain => {
+                    logging::log(Level::Info, "window close requested; disconnecting");
+                    if let Some(state) = window.try_state::<AppState>() {
+                        if let Ok(guard) = state.client.lock() {
+                            if let Some(client) = guard.as_ref() {
+                                client.disconnect();
+                                std::thread::sleep(Duration::from_millis(150));
+                            }
                         }
                     }
                 }
+                windows::CloseAction::Ignore => {}
             }
-            windows::CloseAction::Ignore => {}
-        },
+        }
         tauri::WindowEvent::Destroyed => {
             logging::log_window(
                 label,
@@ -429,6 +441,19 @@ pub fn run() {
                 bundled_soundfont: bundled,
                 bag: bag_service.clone(),
             });
+            // Layout memory loads before any window moves and is restored on
+            // the main thread once `setup` returns; until the restore has run
+            // the store ignores move events, so a platform-placed window can
+            // never overwrite the saved rectangle on disk.
+            let layout = geometry::LayoutStore::discover(&handle);
+            let _ = app.manage(layout.clone());
+            if let Err(error) = geometry::spawn_autosave(&layout) {
+                logging::log(
+                    Level::Warn,
+                    format!("could not start the window-layout autosave thread: {error}"),
+                );
+            }
+            geometry::schedule_restore(&handle);
             match start_client(&handle, &settings, audio_handle) {
                 Ok(client) => {
                     if let Some(state) = handle.try_state::<AppState>() {

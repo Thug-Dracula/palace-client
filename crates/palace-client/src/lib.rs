@@ -44,9 +44,12 @@ pub use palace_wire::messages::{AvatarHash, ClientIdentity, ExtendedInfoAvatar, 
 pub use palace_wire::registration::RegistrationCode;
 pub use runtime::{
     ClientCommand, ClientConfig, ClientEvent, ClientEventStream, ClientHandle, ClientRuntime,
+    CHAT_REPLAY_LIMIT,
 };
 pub use secret::Secret;
-pub use state::{ChatKind, ChatLine, ConnectionStatus, RoomInfo, ServerBanner, UserInfo};
+pub use state::{
+    ChatKind, ChatLine, ConnectionStatus, RoomInfo, ServerBanner, UserInfo, CHAT_SCROLLBACK_CAP,
+};
 pub use trace::Tracer;
 pub use type1::{
     content_hash, export_prop_as_type1, image_dimensions, validate_type1, Type1AvatarError,

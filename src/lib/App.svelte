@@ -1,16 +1,20 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import * as api from "./api";
-  import { store } from "./store.svelte";
-  import TopBar from "./components/TopBar.svelte";
-  import RoomList from "./components/RoomList.svelte";
-  import Viewport from "./components/Viewport.svelte";
-  import UserList from "./components/UserList.svelte";
-  import ChatPanel from "./components/ChatPanel.svelte";
+
+  import PanelHost from "./PanelHost.svelte";
+  import PanelWindow from "./PanelWindow.svelte";
   import StatusBar from "./components/StatusBar.svelte";
+  import TopBar from "./components/TopBar.svelte";
+  import { viewForHash } from "./panels";
+  import { startSession } from "./session";
+  import { store } from "./store.svelte";
   import "./styles/app.css";
 
   const SCALE_STEP = 0.05;
+
+  let { hash = typeof window === "undefined" ? "" : window.location.hash }: { hash?: string } =
+    $props();
+  const view = $derived(viewForHash(hash));
 
   function onWheel(event: WheelEvent) {
     if (!event.ctrlKey) {
@@ -58,39 +62,36 @@
   }
 
   onMount(() => {
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-    void (async () => {
-      const stop = await api.onEvent((event) => store.apply(event));
-      if (disposed) {
-        stop();
-        return;
-      }
-      unlisten = stop;
-      // The backend auto-connects before this listener exists; ask it to replay
-      // the current status, banner, lists and frame so the UI starts in sync.
-      await api.refresh().catch(() => {});
-    })();
-    window.addEventListener("wheel", onWheel, { passive: false });
+    // The main shell seeds itself; a detached panel is seeded by PanelWindow.
+    // Both call the same startSession helper — only `main` also owns the
+    // global zoom keys, which resize the main window through `set_ui_scale`.
+    const isMain = view.kind === "main";
+    const session = isMain ? startSession() : undefined;
+    if (isMain) {
+      window.addEventListener("wheel", onWheel, { passive: false });
+    }
     return () => {
-      disposed = true;
-      unlisten?.();
+      session?.stop();
       window.removeEventListener("wheel", onWheel);
     };
   });
 </script>
 
-<svelte:window onkeydown={onKeydown} />
+<svelte:window onkeydown={view.kind === "main" ? onKeydown : undefined} />
 
-<div class="app">
-  <TopBar />
-  <div class="workspace">
-    <RoomList />
-    <div class="center">
-      <Viewport />
-      <ChatPanel />
+{#if view.kind === "panel"}
+  <PanelWindow panel={view.panel} />
+{:else}
+  <div class="app">
+    <TopBar />
+    <div class="workspace">
+      <PanelHost panel="rooms" />
+      <div class="center">
+        <PanelHost panel="room" />
+        <PanelHost panel="chat" />
+      </div>
+      <PanelHost panel="users" />
     </div>
-    <UserList />
+    <StatusBar />
   </div>
-  <StatusBar />
-</div>
+{/if}

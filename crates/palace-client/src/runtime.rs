@@ -6,7 +6,7 @@
 //! frame lands in a shared [`FrameStore`] that the presentation layer reads.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,12 +53,24 @@ use crate::secret::Secret;
 use crate::session::{Connection, POLL_SLICE};
 use crate::state::{
     ChatKind, ChatLine, ConnectionStatus, RoomInfo, ScriptStimulus, ServerBanner, SessionState,
-    UserInfo, HS_LOCK, HS_UNLOCK,
+    UserInfo, CHAT_SCROLLBACK_CAP, HS_LOCK, HS_UNLOCK,
 };
 use crate::type1::{content_hash, validate_type1, Type1AvatarLimits};
 
 const MEDIA_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const PROP_REQUEST_BUDGET: usize = 80;
+
+/// How many retained transcript lines a `Refresh` replays.
+///
+/// Equal to the transcript cap, so a late-opening Chat or log window receives
+/// the whole scrollback the backend still holds rather than a truncated tail.
+pub const CHAT_REPLAY_LIMIT: usize = CHAT_SCROLLBACK_CAP;
+
+/// How many recent notices a `Refresh` replays.
+///
+/// The frontend keeps at most six notices (`src/lib/store.svelte.ts`), so a
+/// longer replay would be discarded on arrival.
+const NOTICE_REPLAY_LIMIT: usize = 6;
 
 /// The fastest the animation redraw may run. Each redraw ships a full-frame PNG
 /// to the webview, which cannot consume them at loop rate.
@@ -389,6 +401,9 @@ struct Shared {
     /// The server's Type 1 avatar limits, once its `'AVAT'` reply arrives. Shared
     /// so a UI command can show a user what the server accepts.
     avatar_limits: Mutex<Option<Type1AvatarLimits>>,
+    /// The most recent notices, replayed on `Refresh` so a late window's notice
+    /// list is seeded. Bounded like the frontend's own notice cap.
+    notices: Mutex<VecDeque<String>>,
 }
 
 impl Shared {
@@ -398,7 +413,22 @@ impl Shared {
     }
 
     fn note(&self, text: impl Into<String>) {
-        self.emit(ClientEvent::Note { text: text.into() });
+        let text = text.into();
+        if let Ok(mut notices) = self.notices.lock() {
+            if notices.len() >= NOTICE_REPLAY_LIMIT {
+                notices.pop_front();
+            }
+            notices.push_back(text.clone());
+        }
+        self.emit(ClientEvent::Note { text });
+    }
+
+    /// The notices a `Refresh` replays, oldest first.
+    fn replayed_notices(&self) -> Vec<String> {
+        self.notices
+            .lock()
+            .map(|notices| notices.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn chat(&self, kind: ChatKind, text: impl Into<String>) {
@@ -745,6 +775,7 @@ impl ClientRuntime {
             bake_avatars: bake_avatars_from_env(),
             props_dir: Mutex::new(None),
             avatar_limits: Mutex::new(None),
+            notices: Mutex::new(VecDeque::new()),
         });
 
         let handle = ClientHandle {
@@ -1131,10 +1162,13 @@ fn run_session(
             if let Some(room) = state.current_room.clone() {
                 shared.emit(ClientEvent::RoomEntered { room });
             }
-            let replay_from = state.chat.len().saturating_sub(120);
-            for line in state.chat[replay_from..].iter().cloned() {
+            for line in state.recent_chat(CHAT_REPLAY_LIMIT).iter().cloned() {
                 shared.emit(ClientEvent::Chat { line });
             }
+            for text in shared.replayed_notices() {
+                shared.emit(ClientEvent::Note { text });
+            }
+            emit_avatar_roster(&state, &mut builder, shared);
             if let Some(screen) = &last_screen {
                 shared.emit(ClientEvent::Screen {
                     screen: screen.clone(),
@@ -6171,6 +6205,7 @@ mod tests {
             bake_avatars,
             props_dir: Mutex::new(None),
             avatar_limits: Mutex::new(None),
+            notices: Mutex::new(VecDeque::new()),
         })
     }
 

@@ -33,6 +33,14 @@ use crate::xtlk;
 pub(crate) const HS_UNLOCK: i16 = 0;
 pub(crate) const HS_LOCK: i16 = 1;
 
+/// The transcript cap: how many of the most recent chat lines the backend keeps.
+///
+/// This mirrors the frontend's own `CHAT_LIMIT` (`src/lib/store.svelte.ts`), so
+/// a window that opens late and replays the retained transcript can receive at
+/// least as much history as a window that was open the whole time can display.
+/// It is the one number that bounds both the stored transcript and its replay.
+pub const CHAT_SCROLLBACK_CAP: usize = 500;
+
 /// Where the connection stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -299,10 +307,21 @@ impl SessionState {
             kind,
         };
         self.chat.push(line.clone());
-        if self.chat.len() > 500 {
+        if self.chat.len() > CHAT_SCROLLBACK_CAP {
             self.chat.remove(0);
         }
         line
+    }
+
+    /// The most recent `limit` transcript lines, oldest first.
+    ///
+    /// This is the window a `Refresh` replays to a late-opening window. It is
+    /// bounded by the transcript cap, so a `limit` above
+    /// [`CHAT_SCROLLBACK_CAP`] returns the whole retained transcript.
+    #[must_use]
+    pub fn recent_chat(&self, limit: usize) -> &[ChatLine] {
+        let from = self.chat.len().saturating_sub(limit);
+        &self.chat[from..]
     }
 
     /// Replace one transcript line's text, returning the updated line.
@@ -2676,5 +2695,64 @@ mod tests {
             1,
             "and its front command the front list"
         );
+    }
+
+    #[test]
+    fn appending_past_the_cap_drops_the_oldest_and_keeps_the_newest() {
+        let mut state = SessionState::new("test", 1);
+        let total = CHAT_SCROLLBACK_CAP + 500;
+        for index in 0..total {
+            state.system_line(ChatKind::System, format!("line {index}"));
+        }
+
+        assert_eq!(
+            state.chat.len(),
+            CHAT_SCROLLBACK_CAP,
+            "the transcript never grows past its cap"
+        );
+        let oldest = format!("line {}", total - CHAT_SCROLLBACK_CAP);
+        assert_eq!(
+            state.chat.first().map(|line| line.text.as_str()),
+            Some(oldest.as_str()),
+            "every line older than the cap is gone"
+        );
+        let newest = format!("line {}", total - 1);
+        assert_eq!(
+            state.chat.last().map(|line| line.text.as_str()),
+            Some(newest.as_str()),
+            "the most recent line is retained"
+        );
+    }
+
+    #[test]
+    fn recent_chat_returns_the_most_recent_tail_within_the_cap() {
+        let mut state = SessionState::new("test", 1);
+        assert!(
+            state.recent_chat(10).is_empty(),
+            "an empty transcript replays nothing"
+        );
+
+        for index in 0..1000 {
+            state.system_line(ChatKind::System, format!("line {index}"));
+        }
+
+        assert!(state.recent_chat(0).is_empty());
+
+        let tail = state.recent_chat(10);
+        assert_eq!(tail.len(), 10);
+        assert_eq!(
+            tail.first().map(|line| line.text.as_str()),
+            Some("line 990")
+        );
+        assert_eq!(tail.last().map(|line| line.text.as_str()), Some("line 999"));
+
+        let all = state.recent_chat(usize::MAX);
+        assert_eq!(all.len(), CHAT_SCROLLBACK_CAP);
+        assert_eq!(
+            all.first().map(|line| line.text.as_str()),
+            Some("line 500"),
+            "the retained transcript starts at the first line the cap kept"
+        );
+        assert_eq!(all.last().map(|line| line.text.as_str()), Some("line 999"));
     }
 }

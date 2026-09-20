@@ -474,6 +474,20 @@ export const setUiScale = (scale: number): Promise<number> => invoke("set_ui_sca
 
 export const refresh = (): Promise<void> => invoke("refresh");
 
+/** The result of asking Rust to detach a panel into its own OS window. */
+export type PanelOpenOutcome = "created" | "already_open";
+
+/** The result of asking a detached panel's window to close (re-attach). */
+export type PanelCloseOutcome = "closed" | "not_open";
+
+/** Detach a panel; the id is validated against the Rust registry's enum. */
+export const openPanel = (panelId: string): Promise<PanelOpenOutcome> =>
+  invoke("open_panel", { panelId });
+
+/** Close a detached panel's window, which re-attaches it to the main window. */
+export const closePanel = (panelId: string): Promise<PanelCloseOutcome> =>
+  invoke("close_panel", { panelId });
+
 export const click = (x: number, y: number): Promise<void> => invoke("click", { x, y });
 
 export const mousemove = (x: number, y: number): Promise<void> => invoke("mousemove", { x, y });

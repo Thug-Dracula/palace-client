@@ -268,7 +268,7 @@ edge-case test.
 **App quit.** All windows close. Geometry and detach state are saved on
 move, resize and close (debounced), then restored on next launch with off-screen
 clamping. Geometry lives in its own file, never in the shared `settings.json`;
-Task 7 fixes the exact path and format and documents it here when implemented.
+the path and format are fixed in section 6.1.
 
 **Apply semantics for options.** This document does not enumerate preference
 keys; `PREFERENCES.md` (Task 5) owns the per-key live-versus-reconnect column.
@@ -277,6 +277,64 @@ or the live session cannot apply without a reconnect; everything else (appearanc
 sound, logging, layout, notifications) applies live. No window may reconnect
 independently; a reconnect is a single backend action that every window sees
 through the event channel.
+
+### 6.1 Window layout memory (Task 7, implemented in `src-tauri/src/geometry.rs`)
+
+**Where.** `<app-config-dir>/window-layout.json` — on Linux
+`~/.config/org.palace.client/window-layout.json`. The `PALACE_LAYOUT_FILE`
+environment variable overrides the whole path, which is how the test harnesses
+point a run at a scratch file. The resolved path is announced in the diagnostic
+log at startup. `settings.json` is never touched by this feature.
+
+**Format.** Schema version 1, keyed by the same window labels the registry uses
+(`main`, `panel-users`, …):
+
+```json
+{
+  "version": 1,
+  "order": ["users", "chat"],
+  "windows": {
+    "main":        { "x": 40, "y": 30, "w": 1200, "h": 820, "monitor": "DP-1", "detached": false },
+    "panel-users": { "x": 140, "y": 110, "w": 520, "h": 430, "monitor": "DP-1", "detached": true }
+  }
+}
+```
+
+`x`/`y` are the window's physical screen position (the outer origin where the
+platform reports one, otherwise the client origin); `w`/`h` are the physical
+**client** size. The client size is deliberate: `set_size` restores that, and
+storing the outer size would add the decorations back on every restart. The
+`order` array is the detach order Task 18 restores panels in. A file written by
+a newer schema is left byte-identical, never overwritten; a malformed file is
+replaced on the next write with a warning in the log.
+
+**When.** Move and resize events only mark the in-memory snapshot dirty; a
+background thread flushes at most every 600 ms. A window close is a synchronous
+capture-and-flush, so the last known rectangle is on disk before the window is
+destroyed. Writes are atomic (temp file, then rename) and a write that changes
+nothing is a no-op.
+
+**Clamp on restore.** The pure function `geometry::clamp_placement` decides,
+before any platform call: a saved rectangle whose monitor still exists is pulled
+fully on-screen; one whose monitor is gone is centred on the primary; one with
+no recorded monitor goes to the screen that contains it, else the primary; a
+rectangle larger than its monitor is shrunk to fit. The placement is applied
+immediately and, if the platform has not mapped the window yet, once more from
+a short-lived background thread (a platform may drop geometry requests made
+before a window is mapped).
+
+**`main` and `set_ui_scale`.** `set_ui_scale` owns `main`'s size
+(`BASE_WINDOW × scale`) and its title. The chosen scale is not persisted, so
+restoring a remembered size for `main` would produce a window sized for a scale
+that no longer applies, with the page at 100% zoom. Layout memory therefore
+restores `main`'s **position only**; its size is recorded for diagnostics and
+never applied. Panels have no size authority but the user, so their full
+rectangle is restored.
+
+**Who sets `detached`.** Only `LayoutStore::set_detached(panel, bool)`, called by
+the detach/re-attach actions (Task 18). The window-event path saves geometry but
+never changes the flag: a panel closing because the app is quitting must stay
+marked detached, or the next launch would not reopen it.
 
 ---
 
