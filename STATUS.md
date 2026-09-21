@@ -598,11 +598,13 @@ document now states what a launch log shows.
    `harness_isolation gdk_backend=x11 wayland=removed`. Regression test:
    `the_harness_isolation_pins_x11_and_a_scratch_config_directory`.
 
-### Final review wave (F1–F4) — all four APPROVE, awaiting the user's okay
+### Final review wave (F1–F4) — all four APPROVE; user-approved
 
-Run 2026-09-21 at `9fba954`. The plan requires the user's **explicit approval**
-before the wave is marked complete; this records the outcome, not a completion
-claim.
+Run 2026-09-21 at `9fba954`. The user gave **explicit approval the same day**, so
+the modularity plan is complete: the plan file's 29 task boxes, the F1–F4 boxes
+and the final checklist are all ticked. The settings restore it flagged was
+performed by the user's instruction (`settings.json` copied back from
+`settings.json.bak`, verified byte-identical).
 
 | Review | Verdict |
 |---|---|
