@@ -609,13 +609,15 @@ performed by the user's instruction (`settings.json` copied back from
 | Review | Verdict |
 |---|---|
 | F1 plan compliance | APPROVE — Must Have 8/8, Must NOT Have 10/10, Tasks 29/29 |
-| F2 code quality | APPROVE — fmt/clippy clean, 287 + 271 + 491 tests, no slop found |
+| F2 code quality | APPROVE — fmt/clippy clean, 287 + 271 + 491 tests, no blocking slop; one silent-failure defect (cleanup item 1) |
 | F3 real QA | APPROVE — scenarios 58/58, integration 4/4, edge cases 4 |
 | F4 scope fidelity | APPROVE — tasks 29/29, contamination clean, 3 harmless unaccounted files |
 
 Evidence: `.omo/evidence/final-qa/` (F3 — `00-SUMMARY.txt` plus the raw logs),
 `.omo/evidence/task-29-*.txt`. F2 was run by the orchestrator after the
-delegated reviewer timed out and was then cancelled.
+delegated reviewer timed out and was cancelled; a later retry's TypeScript/Svelte
+sub-reviewer produced the cleanup findings below (the retry's own verdict never
+completed, so the approval is the orchestrator's).
 
 The wave surfaced and closed three defects: the panel/prefs 404 in real windows
 (`0267a1d`), the harness desktop-safety hole and the test-side `settings.json`
@@ -624,6 +626,28 @@ overwrite (`8f60327`), and the stale STATUS claims (`9fba954`).
 **Still needs a human:** the plan's one visual check — detach a panel in a real
 window, move it, close it to re-attach, restart and confirm the layout returns.
 Exact steps are under "Needs a human" above.
+
+### Known cleanup items (found by the F2 review — none block approval)
+
+1. **`DetachButton.svelte:17` swallows a deliberately re-thrown failure.**
+   `panelLayout.detach()` re-throws when the panel window cannot be created
+   ("the error re-thrown so the caller can report it"), but the button discards
+   it with `.catch(() => {})`. So a failed detach does nothing and says nothing.
+   The grid slot is restored correctly; the failure is only invisible. Fixing it
+   needs a small UI choice about where to show the message.
+2. **Duplicated preference plumbing.** `booleanOr` is defined identically in
+   `chatLogPrefs.ts`, `graphicsPrefs.ts` and `notificationsPrefs.ts`; the
+   option-table + unsupported-keys + lookup trio is repeated five times; and five
+   preference groups repeat the same save wrapper. One `definePrefsModule` plus a
+   shared save helper would collapse roughly 1,200 lines. The risk is future
+   divergence (coercion rules and range bounds drifting apart).
+3. **Test-only exports.** `UNSUPPORTED_*_KEYS`, `is*OptionSupported`,
+   `muteCapability`, `detachedNames`, `workspaceTracks` are referenced only by
+   tests — either wire them into the UI or drop them from the public surface.
+4. **Silent `.catch(() => {})` debt** in `session.ts:38`, `store.svelte.ts`
+   (183/198/280/444), `TopBar.svelte:17`, `ChatPanel.svelte:45/54/67`,
+   `RoomList.svelte:15`, `Viewport.svelte` (several) and `PanelHost.svelte:15`:
+   a failed background call is invisible. Cosmetic, not behavioural.
 
 
 
