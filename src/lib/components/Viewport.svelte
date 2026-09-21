@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import * as api from "../api";
-  import { store } from "../store.svelte";
+  import { acceptsGeometry, store } from "../store.svelte";
   import RoomMenu from "./RoomMenu.svelte";
   import AvatarDialog from "./AvatarDialog.svelte";
   import PropBagDialog from "./PropBagDialog.svelte";
@@ -19,6 +19,21 @@
 
   let element: HTMLDivElement | undefined = $state();
   const last = { width: 0, height: 0, dpr: 0, native: false };
+
+  // This window's own label. The viewport report is authoritative for the one
+  // window that shows the room, so the geometry reply it gets back is tagged
+  // with this label and a monotonic epoch and must match both to be applied.
+  const ownerLabel = api.currentWindowLabel();
+  let geometryEpoch = 0;
+  let stopGeometry: (() => void) | undefined;
+  let disposed = false;
+
+  // Resize storms are coalesced: dragging a window edge fires far faster than
+  // the compositor needs to rebuild for. The first report is sent immediately;
+  // only resize-driven follow-ups wait for the burst to settle.
+  const RESIZE_DEBOUNCE_MS = 120;
+  let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+  let dprQuery: MediaQueryList | null = null;
 
   let menu = $state<{ x: number; y: number; prop: PickedProp | null } | null>(null);
   let avatarOpen = $state(false);
@@ -109,21 +124,103 @@
       last.dpr === dpr &&
       last.native === store.native
     ) {
+      watchDpr();
       return;
     }
     Object.assign(last, { width, height, dpr, native: store.native });
     store.viewport = { width, height, dpr };
     void api.setViewport(width, height, dpr, 1, store.native).catch(() => {});
+    watchDpr();
+  }
+
+  // A burst of resize callbacks re-reports once, after the drag settles.
+  function schedulePush() {
+    if (resizeTimer !== null) {
+      clearTimeout(resizeTimer);
+    }
+    resizeTimer = setTimeout(() => {
+      resizeTimer = null;
+      push();
+    }, RESIZE_DEBOUNCE_MS);
+  }
+
+  function onDprChange() {
+    push();
+  }
+
+  function addDprListener(query: MediaQueryList) {
+    if (typeof query.addEventListener === "function") {
+      query.addEventListener("change", onDprChange);
+    } else {
+      query.addListener(onDprChange);
+    }
+  }
+
+  function removeDprListener(query: MediaQueryList) {
+    if (typeof query.removeEventListener === "function") {
+      query.removeEventListener("change", onDprChange);
+    } else {
+      query.removeListener(onDprChange);
+    }
+  }
+
+  // Moving the window to a monitor with a different scale changes
+  // `devicePixelRatio` with no resize. Re-report when the ratio changes so the
+  // compositor rebuilds for the new physical pixel size.
+  function watchDpr() {
+    try {
+      if (typeof window.matchMedia !== "function") {
+        return;
+      }
+      const query = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      if (dprQuery && dprQuery.media === query.media) {
+        return;
+      }
+      if (dprQuery) {
+        removeDprListener(dprQuery);
+      }
+      dprQuery = query;
+      addDprListener(query);
+    } catch {
+      // A host without matchMedia support simply never re-reports on scale change.
+    }
   }
 
   onMount(() => {
-    const observer = new ResizeObserver(() => push());
+    void api
+      .onGeometry(ownerLabel, (reply) => {
+        if (!acceptsGeometry(ownerLabel, geometryEpoch, reply)) {
+          return;
+        }
+        geometryEpoch = reply.epoch;
+        store.applyScreen(reply.screen);
+      })
+      .then((stop) => {
+        if (disposed) {
+          stop();
+        } else {
+          stopGeometry = stop;
+        }
+      });
+
+    const observer = new ResizeObserver(() => schedulePush());
     if (element) {
       observer.observe(element);
     }
     push();
     return () => {
+      disposed = true;
+      stopGeometry?.();
+      stopGeometry = undefined;
       observer.disconnect();
+      if (resizeTimer !== null) {
+        clearTimeout(resizeTimer);
+        resizeTimer = null;
+      }
+      if (dprQuery) {
+        removeDprListener(dprQuery);
+        dprQuery = null;
+      }
       if (moveFrame) {
         cancelAnimationFrame(moveFrame);
         moveFrame = 0;

@@ -46,6 +46,13 @@ serde = { workspace = true }
 # survive with their names, values and position intact (see `src/settings.rs`
 # and `PREFERENCES.md`).
 serde_json = { workspace = true, features = ["preserve_order"] }
+# The opt-in desktop-notification subsystem (`src/notify.rs`). The plugin is
+# the platform integration itself: it maps to the freedesktop notification
+# service on Linux, the Windows toast API and macOS `UNUserNotificationCenter`,
+# so the client never talks to D-Bus or a WinRT API directly. It is only ever
+# reached from Rust (the event pump), never from a webview: firing in the pump
+# means one notification per message, not one per open window.
+tauri-plugin-notification = "2.4.0"
 
 [dev-dependencies]
 # The animation-export test decodes the WebP this crate muxes to prove the

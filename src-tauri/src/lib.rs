@@ -5,10 +5,13 @@
 //! asset and compositing work lives in `palace-client` on worker threads.
 
 pub mod bag;
+pub mod chat_log;
 pub mod commands;
 pub mod editor;
 pub mod geometry;
 pub mod logging;
+pub mod notify;
+pub mod prefs;
 pub mod protocol;
 pub mod settings;
 pub mod windows;
@@ -17,6 +20,7 @@ pub use settings::Settings;
 
 use logging::Level;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,6 +40,12 @@ pub struct AppState {
     pub bundled_soundfont: Option<PathBuf>,
     /// The prop bag folder and the operations the shell exposes over it.
     pub bag: bag::BagService,
+    /// The epoch of the most recent `refresh` request.
+    ///
+    /// Bumped once per request and stamped on every replayed event, so the log
+    /// can tell N windows seeding once each (N epochs) from one window
+    /// re-seeding in a loop (many events under one epoch).
+    pub refresh_epoch: AtomicU64,
 }
 
 /// Split a search path using the platform's own separator.
@@ -139,6 +149,30 @@ pub fn audio_config_for(settings: &Settings, default_soundfont: Option<&Path>) -
     }
 }
 
+/// The audio config the desktop shell actually spawns.
+///
+/// Like [`audio_config_for`], except that a saved SoundFont which is no longer
+/// on disk is replaced by the bundled bank at this point, with a warning, so
+/// the engine never receives a dead path. Without this the engine would fail
+/// to load the font and drop to its fallback tone, silently ignoring a bundled
+/// bank that is sitting right there.
+#[must_use]
+pub fn shell_audio_config(settings: &Settings, bundled: Option<&Path>) -> AudioConfig {
+    let (soundfont, substituted) =
+        settings::resolve_soundfont(settings.soundfont.as_deref(), bundled);
+    if substituted {
+        if let Some(chosen) = settings.soundfont.as_deref() {
+            settings::warn_missing_soundfont(chosen, soundfont.as_deref());
+        }
+    }
+    AudioConfig {
+        soundfont,
+        enabled: settings.audio_enabled,
+        volume: settings.audio_volume,
+        ..AudioConfig::desktop()
+    }
+}
+
 /// Mirror one runtime event into the diagnostic log.
 ///
 /// Every diagnostic the log panel shows is a [`ClientEvent`], so logging at the
@@ -153,33 +187,181 @@ fn log_event(event: &ClientEvent) {
     logging::log(level, palace_client::trace::describe_client_event(event));
 }
 
+/// Mirror one event into the chat transcript, when it is a chat line and file
+/// logging is on.
+///
+/// Separate from the pump so the wiring can be tested without a live runtime:
+/// the pump calls this for every event, and the service decides whether the
+/// line is written. With file logging off this is a no-op, so the in-memory
+/// transcript is unaffected.
+pub fn record_chat_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &ClientEvent) {
+    if let ClientEvent::Chat { line } = event {
+        if let Some(transcript) = app.try_state::<chat_log::ChatLogService>() {
+            transcript.record(line);
+        }
+    }
+}
+
+/// Offer one chat line to the opt-in notification subsystem.
+///
+/// Like [`record_chat_event`], this runs in the pump rather than in a webview,
+/// so one message produces at most one notification no matter how many windows
+/// are open. The decision (opt-in, scope, ignore list) and the delivery both
+/// live in [`notify`], which logs a failed platform call and never panics, so
+/// a desktop with no notification service changes nothing for the app.
+pub fn notify_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &ClientEvent) {
+    if let ClientEvent::Chat { line } = event {
+        if let Some(service) = app.try_state::<notify::NotificationService>() {
+            let notifier = notify::TauriNotifier::new(app.clone());
+            let _ = service.deliver(&notifier, line);
+        }
+    }
+}
+
+/// The audio side effect one session event asks for, if any.
+///
+/// The sound engine is a single process-global owner (`AppState.audio`), and
+/// this is the only mapping from a session event to a command on it. Because
+/// the mapping runs once per event in the pump — never once per window — a
+/// detached panel cannot double-fire audio no matter how many windows are open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SoundEffect {
+    Sound(String),
+    MidiPlay(String),
+    MidiLoop(String, i32),
+    MidiStop,
+    Beep,
+}
+
+impl SoundEffect {
+    /// Play this effect on the one engine.
+    pub fn play(&self, audio: &AudioHandle) {
+        match self {
+            SoundEffect::Sound(name) => audio.play_sound(name.clone()),
+            SoundEffect::MidiPlay(name) => audio.midi_play(name.clone()),
+            SoundEffect::MidiLoop(name, loops) => audio.midi_loop(name.clone(), *loops),
+            SoundEffect::MidiStop => audio.midi_stop(),
+            SoundEffect::Beep => audio.beep(),
+        }
+    }
+}
+
+/// Map one session event to the audio effect it asks for, if it asks for one.
+#[must_use]
+pub fn sound_effect(event: &ClientEvent) -> Option<SoundEffect> {
+    match event {
+        ClientEvent::Sound { name } => Some(SoundEffect::Sound(name.clone())),
+        ClientEvent::MidiPlay { name } => Some(SoundEffect::MidiPlay(name.clone())),
+        ClientEvent::MidiLoop { name, loops } => Some(SoundEffect::MidiLoop(name.clone(), *loops)),
+        ClientEvent::MidiStop => Some(SoundEffect::MidiStop),
+        ClientEvent::Beep => Some(SoundEffect::Beep),
+        _ => None,
+    }
+}
+
+/// Handle exactly one session event: log it, mirror it, route its audio, then
+/// broadcast it — except a screen, which is sent only to the window that owns
+/// the room view.
+///
+/// Extracted from [`spawn_pump`] so the per-event behaviour can be tested
+/// without a live runtime: in particular, that one sound event issues exactly
+/// one audio command and a non-audio event issues none. `media_base` is the
+/// pump's remembered base URL; the banner branch only forwards a change.
+pub fn handle_pump_event<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    audio: &AudioHandle,
+    media_base: &mut Option<String>,
+    event: &ClientEvent,
+) -> Result<(), tauri::Error> {
+    log_event(event);
+    record_chat_event(app, event);
+    notify_event(app, event);
+    logging::log(
+        Level::Debug,
+        format!("event_epoch epoch={}", refresh_epoch(app)),
+    );
+    if let ClientEvent::Banner { banner } = event {
+        if let Some(base) = &banner.media_base {
+            if media_base.as_deref() != Some(base.as_str()) {
+                *media_base = Some(base.clone());
+                audio.set_media_base(base.clone());
+            }
+        }
+    } else if let Some(effect) = sound_effect(event) {
+        effect.play(audio);
+    }
+    match event {
+        ClientEvent::Screen { screen } => {
+            forward_screen(app, screen);
+            Ok(())
+        }
+        _ => app.emit(commands::EVENT_NAME, event),
+    }
+}
+
+/// The epoch of the most recent `refresh` request, or 0 before any window seeds.
+///
+/// Read by the pump so a replayed event can be tagged with the request that
+/// produced it. A missing `AppState` (a bare mock app in a unit test) reads as
+/// 0, which is the same value a pre-seed event carries.
+#[must_use]
+pub fn refresh_epoch<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> u64 {
+    app.try_state::<AppState>()
+        .map_or(0, |state| state.refresh_epoch.load(Ordering::Relaxed))
+}
+
 /// Forward runtime events to the webview, routing sound effects to the engine.
 pub fn spawn_pump(app: tauri::AppHandle, mut stream: ClientEventStream, audio: AudioHandle) {
     tauri::async_runtime::spawn(async move {
         let mut media_base: Option<String> = None;
         while let Some(event) = stream.recv().await {
-            log_event(&event);
-            match &event {
-                ClientEvent::Banner { banner } => {
-                    if let Some(base) = &banner.media_base {
-                        if media_base.as_deref() != Some(base.as_str()) {
-                            media_base = Some(base.clone());
-                            audio.set_media_base(base.clone());
-                        }
-                    }
-                }
-                ClientEvent::Sound { name } => audio.play_sound(name.clone()),
-                ClientEvent::MidiPlay { name } => audio.midi_play(name.clone()),
-                ClientEvent::MidiLoop { name, loops } => audio.midi_loop(name.clone(), *loops),
-                ClientEvent::MidiStop => audio.midi_stop(),
-                ClientEvent::Beep => audio.beep(),
-                _ => {}
-            }
-            if app.emit(commands::EVENT_NAME, &event).is_err() {
+            if handle_pump_event(&app, &audio, &mut media_base, &event).is_err() {
                 break;
             }
         }
     });
+}
+
+/// Deliver a composed room screen to the one window that owns the room view.
+///
+/// The geometry in `screen` is computed for whichever viewport was reported
+/// last, so broadcasting it would let a second window treat another window's
+/// geometry as its own, re-report its own size, and fight over the one shared
+/// frame. The reply is tagged with the owner label and the report epoch and is
+/// sent with `emit_to`, so only that window receives it and a superseded epoch
+/// can be dropped by the frontend.
+///
+/// Until a window has claimed the viewport there is no window the geometry
+/// could belong to, so the event is dropped rather than broadcast: the owner's
+/// first report makes the compositor emit a fresh screen for it.
+pub fn forward_screen<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    screen: &palace_client::ScreenState,
+) {
+    let Some(claim) = app
+        .try_state::<protocol::ViewportOwnerSlot>()
+        .and_then(|slot| slot.current())
+    else {
+        return;
+    };
+    logging::log(
+        Level::Debug,
+        format!("geometry_emit owner={} epoch={}", claim.owner, claim.epoch),
+    );
+    let reply = protocol::GeometryReply {
+        owner: claim.owner.clone(),
+        epoch: claim.epoch,
+        screen: screen.clone(),
+    };
+    if let Err(error) = app.emit_to(claim.owner.as_str(), commands::GEOMETRY_EVENT, reply) {
+        logging::log(
+            Level::Warn,
+            format!(
+                "geometry_emit_failed owner={} epoch={} {error}",
+                claim.owner, claim.epoch
+            ),
+        );
+    }
 }
 
 /// Start a runtime and wire it to the frame protocol and the event pump.
@@ -223,8 +405,18 @@ pub fn handle_window_event<R: tauri::Runtime>(
             geometry::note_window_closing(window);
             match windows::close_action(label) {
                 windows::CloseAction::ReattachPanel => {
-                    logging::log(Level::Info, format!("panel close requested label={label}"));
-                    windows::panel_close_requested(window.app_handle(), label);
+                    if windows::is_quitting() {
+                        // The app is on its way out, so this close is part of
+                        // the quit rather than a re-attach: signal nothing and
+                        // leave the detached flag alone.
+                        logging::log(
+                            Level::Info,
+                            format!("panel closing during quit label={label}"),
+                        );
+                    } else {
+                        logging::log(Level::Info, format!("panel close requested label={label}"));
+                        windows::panel_close_requested(window.app_handle(), label);
+                    }
                 }
                 windows::CloseAction::DisconnectMain => {
                     logging::log(Level::Info, "window close requested; disconnecting");
@@ -236,6 +428,9 @@ pub fn handle_window_event<R: tauri::Runtime>(
                             }
                         }
                     }
+                    // Closing `main` quits: it takes the open panels with it
+                    // rather than leaving them over a dead session.
+                    windows::begin_quit(window.app_handle());
                 }
                 windows::CloseAction::Ignore => {}
             }
@@ -246,6 +441,27 @@ pub fn handle_window_event<R: tauri::Runtime>(
                 logging::WindowMilestone::Destroyed,
                 "os window destroyed",
             );
+            let action = windows::destroyed_action(
+                label,
+                windows::is_quitting(),
+                windows::take_close_requested(label),
+            );
+            if action == windows::DestroyAction::ReattachPanel {
+                // A panel whose webview died on its own: re-dock it so `main`
+                // never keeps a ghost placeholder. Reuses PANEL_CLOSED_EVENT and
+                // the `reattached` milestone; `via=destroyed` distinguishes it.
+                windows::panel_destroyed(window.app_handle(), label);
+            }
+            // A `main` that dies without a close request (a crashed webview, a
+            // window-manager kill) would otherwise orphan open panels over a
+            // dead session.
+            if label == windows::MAIN_LABEL
+                && !windows::is_quitting()
+                && (windows::any_panel_open(window.app_handle())
+                    || windows::any_tool_window_open(window.app_handle()))
+            {
+                windows::begin_quit(window.app_handle());
+            }
         }
         _ => {}
     }
@@ -261,6 +477,7 @@ pub fn run() {
     let catalog_slot = protocol::CatalogSlot::default();
     let image_slot = protocol::AvatarImageSlot::default();
     let handler_images = image_slot.clone();
+    let viewport_owner = protocol::ViewportOwnerSlot::default();
     match palace_prop::PropCatalog::open_default() {
         Some(catalog) => {
             logging::log(
@@ -294,11 +511,15 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(slot)
         .manage(catalog_slot)
         .manage(image_slot)
         .manage(bag_slot)
         .manage(editor_slot)
+        .manage(viewport_owner)
+        .manage(chat_log::ChatLogService::new())
+        .manage(notify::NotificationService::new())
         .register_asynchronous_uri_scheme_protocol("palace", move |_ctx, request, responder| {
             protocol::handle(
                 &handler_slot,
@@ -326,6 +547,7 @@ pub fn run() {
             commands::type1_avatar_limits,
             commands::set_viewport,
             commands::set_ui_scale,
+            commands::set_fullscreen,
             commands::refresh,
             commands::get_audio_state,
             commands::set_soundfont,
@@ -402,6 +624,16 @@ pub fn run() {
             editor::editor_snap_point,
             windows::open_panel,
             windows::close_panel,
+            windows::open_preferences,
+            windows::close_preferences,
+            geometry::get_layout_memory,
+            geometry::set_layout_remember,
+            geometry::reset_layout,
+            prefs::get_prefs,
+            prefs::set_prefs,
+            prefs::reset_prefs,
+            prefs::set_connection_settings,
+            chat_log::chat_log_status,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -432,7 +664,7 @@ pub fn run() {
                 ),
             );
             let bundled = bundled_soundfont(&handle);
-            let audio = AudioEngine::spawn(audio_config_for(&settings, bundled.as_deref()));
+            let audio = AudioEngine::spawn(shell_audio_config(&settings, bundled.as_deref()));
             let audio_handle = audio.handle();
             app.manage(AppState {
                 client: Mutex::new(None),
@@ -440,7 +672,18 @@ pub fn run() {
                 audio: Mutex::new(audio),
                 bundled_soundfont: bundled,
                 bag: bag_service.clone(),
+                refresh_epoch: AtomicU64::new(0),
             });
+            // Applied before the pump starts, so the session's first line is written.
+            if let Some(path) = settings::config_path(&handle) {
+                let prefs = settings::read_prefs(&path);
+                if let Some(transcript) = handle.try_state::<chat_log::ChatLogService>() {
+                    transcript.configure_from_prefs(&prefs);
+                }
+                if let Some(notifications) = handle.try_state::<notify::NotificationService>() {
+                    notifications.configure_from_prefs(&prefs, &settings.username);
+                }
+            }
             // Layout memory loads before any window moves and is restored on
             // the main thread once `setup` returns; until the restore has run
             // the store ignores move events, so a platform-placed window can
@@ -533,6 +776,47 @@ mod tests {
             Some(PathBuf::from("/tmp/mine.sf2")),
             "a saved soundfont beats the vendored fallback"
         );
+    }
+
+    #[test]
+    fn the_shell_uses_the_bundled_bank_when_a_saved_soundfont_is_gone() {
+        let directory =
+            std::env::temp_dir().join(format!("palace-app-soundfont-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a scratch directory is creatable");
+        let bundled = directory.join("GeneralUser-GS.sf2");
+        std::fs::write(&bundled, b"bundled").expect("the bundled font is writable");
+        let gone = directory.join("deleted.sf2");
+
+        let settings = Settings {
+            soundfont: Some(gone.clone()),
+            ..sample()
+        };
+        assert_eq!(
+            shell_audio_config(&settings, Some(&bundled)).soundfont,
+            Some(bundled.clone()),
+            "a dead path is replaced by the bundled bank, not handed to the engine"
+        );
+        assert_eq!(
+            shell_audio_config(&settings, None).soundfont,
+            None,
+            "without a bundle the engine starts on its fallback tone"
+        );
+        assert_eq!(
+            shell_audio_config(&settings, Some(&bundled)).volume,
+            1.0,
+            "the rest of the audio preferences are carried through"
+        );
+
+        let live = Settings {
+            soundfont: Some(bundled.clone()),
+            ..sample()
+        };
+        assert_eq!(
+            shell_audio_config(&live, Some(&bundled)).soundfont,
+            Some(bundled.clone()),
+            "an on-disk choice is used as chosen"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

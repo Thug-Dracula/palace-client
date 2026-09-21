@@ -14,6 +14,18 @@
 /** The five panels that can live in their own OS window, in plan order. */
 export const PANEL_IDS = ["room", "users", "rooms", "chat", "props"] as const;
 
+/**
+ * The hash of the singleton Preferences window.
+ *
+ * `src-tauri/src/windows.rs` builds this exact route for the `prefs` label.
+ * Preferences is deliberately not a panel id: it is one window that is never
+ * docked, so it lives outside {@link PANEL_IDS}.
+ */
+export const PREFS_HASH = "#/prefs";
+
+/** The window label of the Preferences window, mirroring `windows::PREFS_LABEL`. */
+export const PREFS_LABEL = "prefs";
+
 /** A detachable panel's stable id, as passed to `open_panel`/`close_panel`. */
 export type PanelId = (typeof PANEL_IDS)[number];
 
@@ -34,19 +46,22 @@ export function panelFromId(id: string): PanelId | null {
   return PANEL_ALIASES[name] ?? null;
 }
 
-/** Which view a window should mount: the full shell, or one detached panel. */
-export type AppView = { kind: "main" } | { kind: "panel"; panel: PanelId };
+/** Which view a window should mount: the full shell, one detached panel, or Preferences. */
+export type AppView = { kind: "main" } | { kind: "panel"; panel: PanelId } | { kind: "prefs" };
 
 /**
  * Resolve `window.location.hash` into the view for this window.
  *
- * The only panel routes are the ones the Rust registry builds
- * (`#/panel/<id>`). An unknown or malformed hash falls back to the full
- * layout: that is also what the SPA asset fallback serves, so a stray URL can
- * never leave a window blank.
+ * The only routes are the ones the Rust registry builds: `#/panel/<id>` for a
+ * detached panel and `#/prefs` for the Preferences window. An unknown or
+ * malformed hash falls back to the full layout: that is also what the SPA asset
+ * fallback serves, so a stray URL can never leave a window blank.
  */
 export function viewForHash(hash: string): AppView {
   const path = hash.replace(/^#/, "").replace(/^\//, "");
+  if (path === "prefs") {
+    return { kind: "prefs" };
+  }
   if (!path.startsWith("panel/")) {
     return { kind: "main" };
   }

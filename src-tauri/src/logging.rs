@@ -437,9 +437,14 @@ pub fn init() -> io::Result<PathBuf> {
     init_at(&default_log_dir(), Level::from_env())
 }
 
-/// The directory the log lives in: `PALACE_LOG_DIR`, else the platform data
+/// The directory the logs live in: `PALACE_LOG_DIR`, else the platform data
 /// directory under [`APP_ID`].
-fn default_log_dir() -> PathBuf {
+///
+/// Shared with the chat transcript (`crate::chat_log::default_path`), which
+/// lives in the same directory in its own file: one place to look for this
+/// install's logs, two files that cannot push each other out of rotation.
+#[must_use]
+pub fn default_log_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(ENV_LOG_DIR).filter(|value| !value.is_empty()) {
         return PathBuf::from(dir);
     }
@@ -542,7 +547,7 @@ fn format_window_message(label: &str, milestone: WindowMilestone, detail: &str) 
 }
 
 /// Collapse a message to one line and cap its length.
-fn sanitize(text: &str) -> String {
+pub(crate) fn sanitize(text: &str) -> String {
     let mut out = String::with_capacity(text.len().min(MAX_LINE));
     for ch in text.chars() {
         match ch {
@@ -560,7 +565,7 @@ fn sanitize(text: &str) -> String {
 }
 
 /// `2026-09-18T12:34:56.789Z` from the wall clock.
-fn timestamp() -> String {
+pub(crate) fn timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

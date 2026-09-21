@@ -16,11 +16,20 @@
 //! ```text
 //! xvfb-run -a cargo test -p palace-app --test panel_registry -- --nocapture --test-threads=1
 //! ```
+//!
+//! The real-runtime case runs on the shared [`multiwindow_harness`], which
+//! refuses any display it cannot *prove* is virtual (an `Xvfb` serving the
+//! exact `DISPLAY`, or a running `gamescope`). On the developer's real desktop
+//! session the launch returns `Err` and this test prints `SKIP …` and passes,
+//! so `cargo test` can never open a window on the user's screen.
 
 #![cfg(any(target_os = "linux", target_os = "windows"))]
 
+#[cfg(target_os = "linux")]
+#[path = "multiwindow_harness.rs"]
+mod multiwindow_harness;
+
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -31,8 +40,6 @@ use tauri::{Emitter, Manager};
 
 /// Reports sent back from the JS injected into the windows.
 static REPORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// Set once the orchestration thread has finished, to disarm the watchdog.
-static FINISHED: AtomicBool = AtomicBool::new(false);
 
 fn record_report(kind: &str) {
     REPORTS.lock().unwrap().push(kind.to_string());
@@ -152,7 +159,6 @@ fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) -> bool {
 fn orchestrate(handle: tauri::AppHandle) {
     let Some(main) = handle.get_webview_window("main") else {
         eprintln!("panel_registry: no main window; aborting");
-        FINISHED.store(true, Ordering::SeqCst);
         handle.exit(4);
         return;
     };
@@ -256,7 +262,6 @@ fn orchestrate(handle: tauri::AppHandle) {
         record_report("rust_close_missing_noop");
     }
 
-    FINISHED.store(true, Ordering::SeqCst);
     handle.exit(0);
 }
 
@@ -352,58 +357,86 @@ fn the_panel_capability_matches_panel_windows_only() {
     assert!(!panel_permissions.contains(&"core:default".to_string()));
 }
 
+#[test]
+fn the_prefs_capability_matches_the_prefs_window_only() {
+    let prefs_path = manifest_dir().join("capabilities/prefs.json");
+    let prefs = read_json(&prefs_path);
+
+    let windows: Vec<&str> = prefs
+        .get("windows")
+        .and_then(Value::as_array)
+        .expect("windows is an array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        windows,
+        vec!["prefs"],
+        "the capability must target the Preferences label only, never the panel namespace"
+    );
+
+    let prefs_permissions = permissions(&prefs_path);
+    assert_eq!(
+        prefs_permissions,
+        vec!["core:event:default"],
+        "the Preferences window is a receiving view: event listen, nothing more"
+    );
+    for forbidden in FORBIDDEN {
+        assert!(
+            !prefs_permissions.contains(&forbidden.to_string()),
+            "Preferences must not be able to create or close windows, found {forbidden}"
+        );
+    }
+    assert!(!prefs_permissions.contains(&"core:default".to_string()));
+    assert!(
+        !prefs_permissions.contains(&"dialog:allow-open".to_string()),
+        "the window itself is opened by the Rust command, not by the frontend"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Real runtime (needs a display)
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 #[test]
 fn registry_lifecycle_on_the_real_runtime() {
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        eprintln!(
-            "SKIP registry_lifecycle_on_the_real_runtime: no DISPLAY/WAYLAND_DISPLAY; \
-             run under `xvfb-run -a …`"
-        );
-        return;
-    }
+    use multiwindow_harness::Harness;
 
-    let log_dir = std::env::var_os("PANEL_REGISTRY_LOG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("palace-panel-registry"));
-    let log_path = logging::init_at(&log_dir, Level::Debug).expect("logger installs");
+    let harness = match Harness::launch_with(|builder| {
+        builder
+            .invoke_handler(tauri::generate_handler![
+                multiwindow_harness::command::harness_report,
+                panel_probe,
+                windows::open_panel,
+                windows::close_panel
+            ])
+            .on_window_event(palace_app_lib::handle_window_event)
+    }) {
+        Ok(harness) => harness,
+        Err(reason) => {
+            eprintln!("SKIP registry_lifecycle_on_the_real_runtime: {reason}");
+            return;
+        }
+    };
+    println!("display_provenance={}", harness.display_provenance());
+
+    let log_path = harness.log_path().to_path_buf();
     println!("panel-registry log: {}", log_path.display());
 
-    let app = tauri::Builder::default()
-        .any_thread()
-        .invoke_handler(tauri::generate_handler![
-            panel_probe,
-            windows::open_panel,
-            windows::close_panel
-        ])
-        .on_window_event(palace_app_lib::handle_window_event)
-        .setup(move |app| {
-            let handle = app.handle().clone();
-            let watchdog = handle.clone();
-            std::thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(150);
-                while Instant::now() < deadline {
-                    if FINISHED.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-                if !FINISHED.load(Ordering::SeqCst) {
-                    eprintln!("panel_registry: watchdog timeout; forcing exit 3");
-                    watchdog.exit(3);
-                }
-            });
-            std::thread::spawn(move || orchestrate(handle));
-            Ok(())
-        })
-        .build(tauri::generate_context!())
-        .expect("the panel-registry app builds");
+    // Config windows are created when the event loop starts, and the harness
+    // hands back the handle as soon as the app is built, so `main` may not be
+    // in the registry yet.
+    harness
+        .wait_for_window("main", multiwindow_harness::DEFAULT_TIMEOUT)
+        .expect("the configured main window appears");
 
-    let exit_code = app.run_return(|_app, _event| {});
-    FINISHED.store(true, Ordering::SeqCst);
+    // The harness runs the event loop on its own background thread, so the test
+    // thread is free to drive the registry: `orchestrate` runs here, not in a
+    // spawned thread as the hand-rolled builder needed.
+    orchestrate(harness.handle().clone());
+
+    let exit_code = harness.quit().expect("the harness app stops");
 
     let reports = REPORTS.lock().unwrap().clone();
     let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -449,4 +482,13 @@ fn registry_lifecycle_on_the_real_runtime() {
             "the log must record {expected}:\n{log_text}"
         );
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn registry_lifecycle_on_the_real_runtime() {
+    eprintln!(
+        "SKIP registry_lifecycle_on_the_real_runtime: the multiwindow harness is Linux-only; \
+         refusing to open real windows on this platform"
+    );
 }

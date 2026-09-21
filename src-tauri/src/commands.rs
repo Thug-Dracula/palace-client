@@ -3,6 +3,7 @@
 //! or compositing work.
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use palace_client::ClientHandle;
@@ -20,6 +21,13 @@ use crate::{start_client, AppState, Settings};
 
 /// The event name runtime events are emitted under.
 pub const EVENT_NAME: &str = "palace://event";
+
+/// The event a room-viewport geometry reply is delivered under.
+///
+/// It is a distinct channel from [`EVENT_NAME`] and is always sent with
+/// `emit_to` to the window that owns the room view, so a reply can never be
+/// mistaken for the broadcast session feed.
+pub const GEOMETRY_EVENT: &str = "palace://geometry";
 
 /// The logical window size the interface is laid out at 100% scale.
 pub const BASE_WINDOW: (f64, f64) = (1200.0, 820.0);
@@ -543,23 +551,84 @@ pub async fn outfits_duplicate(
 }
 
 /// Report the viewport size, device pixel ratio, zoom and scale mode.
+///
+/// Only the window that owns the room view may report a viewport (see
+/// [`crate::windows::owns_room_view`]): the report changes the process-global
+/// viewport the compositor builds geometry for, so a report from any other
+/// window would silently re-composite the frame behind the room's back. A
+/// usable report claims ownership with a fresh epoch; the pump then tags the
+/// geometry reply with that owner and epoch and targets it at this window only.
 #[tauri::command]
-pub fn set_viewport(
+pub fn set_viewport<R: tauri::Runtime>(
     state: State<'_, AppState>,
+    window: tauri::Window<R>,
     width: f64,
     height: f64,
     dpr: f64,
     zoom: f64,
     native: bool,
 ) -> Result<(), String> {
-    with_client(&state, |client| {
-        client.set_viewport(width, height, dpr, zoom, native);
-    })
+    let label = window.label().to_string();
+    if !crate::windows::owns_room_view(&label) {
+        return Err(format!(
+            "window {label:?} does not own the room view and may not report a viewport"
+        ));
+    }
+    if !viewport_report_is_usable(width, height, dpr, zoom) {
+        logging::log(
+            Level::Debug,
+            format!(
+                "viewport_report_ignored label={label} width={width} height={height} dpr={dpr} zoom={zoom}"
+            ),
+        );
+        return Ok(());
+    }
+
+    let guard = state.client.lock().map_err(|error| error.to_string())?;
+    let client = guard
+        .as_ref()
+        .ok_or_else(|| "no client is running".to_string())?;
+    let epoch = window
+        .try_state::<crate::protocol::ViewportOwnerSlot>()
+        .map(|slot| slot.claim(&label));
+    logging::log(
+        Level::Debug,
+        format!(
+            "viewport_claim label={label} epoch={epoch:?} width={width} height={height} dpr={dpr}"
+        ),
+    );
+    client.set_viewport(width, height, dpr, zoom, native);
+    Ok(())
+}
+
+/// Whether a reported viewport is worth compositing for.
+///
+/// A window that has not been laid out yet measures zero; that is a transient
+/// state, not an error, and it must never become a compose request — a
+/// zero-sized frame is meaningless and the allocation would be wasted. A
+/// non-finite value or a non-positive ratio/zoom is refused the same way.
+#[must_use]
+pub fn viewport_report_is_usable(width: f64, height: f64, dpr: f64, zoom: f64) -> bool {
+    width.is_finite()
+        && height.is_finite()
+        && dpr.is_finite()
+        && zoom.is_finite()
+        && width >= 1.0
+        && height >= 1.0
+        && dpr > 0.0
+        && zoom > 0.0
 }
 
 /// Ask the runtime to recompose the current room.
+///
+/// Every window calls this once on mount to seed itself. The request bumps the
+/// process-global refresh epoch and logs it, so the diagnostic log shows one
+/// `refresh_requested` line per window seed: a window that re-seeds in a loop
+/// is visible as a burst of them, which is the refresh-storm signal.
 #[tauri::command]
 pub fn refresh(state: State<'_, AppState>) -> Result<(), String> {
+    let epoch = state.refresh_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+    logging::log(Level::Info, format!("refresh_requested epoch={epoch}"));
     with_client(&state, |client| client.refresh())
 }
 
@@ -581,21 +650,31 @@ pub struct AudioState {
     pub volume: f32,
     pub soundfont: Option<std::path::PathBuf>,
     pub soundfont_exists: bool,
+    /// True when the chosen SoundFont is gone and the bundled bank took over.
+    pub soundfont_fallback: bool,
+    /// True when the font in effect is the bundled bank, not a chosen file.
+    pub soundfont_bundled: bool,
 }
 
 /// The audio engine's state, as the stored settings record it.
+///
+/// The SoundFont is reported as the engine actually resolves it (chosen file
+/// while it is on disk, otherwise the bundled bank), so the panel can never
+/// claim a dead path is loaded, and the two flags say which of the three
+/// cases produced the font that is named.
 #[tauri::command]
 pub fn get_audio_state(state: State<'_, AppState>) -> Result<AudioState, String> {
     let settings = state.settings.lock().map_err(|error| error.to_string())?;
-    let soundfont = settings
-        .soundfont
-        .clone()
-        .or_else(|| state.bundled_soundfont.clone());
+    let chosen = settings.soundfont.clone();
+    let (soundfont, soundfont_fallback) =
+        crate::settings::resolve_soundfont(chosen.as_deref(), state.bundled_soundfont.as_deref());
     Ok(AudioState {
         enabled: settings.audio_enabled,
         volume: settings.audio_volume,
         soundfont_exists: soundfont.as_deref().is_some_and(std::path::Path::is_file),
+        soundfont_bundled: chosen.is_none() && soundfont.is_some(),
         soundfont,
+        soundfont_fallback,
     })
 }
 
@@ -701,6 +780,23 @@ pub fn set_ui_scale(app: AppHandle, scale: f64) -> Result<f64, String> {
     Ok(scale)
 }
 
+/// Enter or leave full screen on the primary window.
+///
+/// The preference is application-wide, so it is applied to `main` the same way
+/// [`set_ui_scale`] is, rather than to whichever window raised it. Returns the
+/// state that was applied, so the caller can reconcile a switch when the change
+/// did not take.
+#[tauri::command]
+pub fn set_fullscreen(app: AppHandle, fullscreen: bool) -> Result<bool, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "no main window".to_string())?;
+    window
+        .set_fullscreen(fullscreen)
+        .map_err(|error| error.to_string())?;
+    Ok(fullscreen)
+}
+
 /// Apply a settings change, persisting it before the caller touches the engine.
 fn update_settings(
     app: &AppHandle,
@@ -748,5 +844,45 @@ mod tests {
         assert_eq!(clamp_ui_scale(9.0), MAX_UI_SCALE);
         assert_eq!(clamp_ui_scale(f64::NAN), 1.0);
         assert_eq!(clamp_ui_scale(f64::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn a_zero_or_nonsense_viewport_is_not_usable() {
+        assert!(
+            !viewport_report_is_usable(0.0, 480.0, 1.0, 1.0),
+            "an unlaid-out window measures zero width"
+        );
+        assert!(
+            !viewport_report_is_usable(640.0, 0.0, 1.0, 1.0),
+            "an unlaid-out window measures zero height"
+        );
+        assert!(!viewport_report_is_usable(f64::NAN, 480.0, 1.0, 1.0));
+        assert!(!viewport_report_is_usable(640.0, f64::INFINITY, 1.0, 1.0));
+        assert!(
+            !viewport_report_is_usable(640.0, 480.0, 0.0, 1.0),
+            "a zero device pixel ratio cannot scale a frame"
+        );
+        assert!(
+            !viewport_report_is_usable(640.0, 480.0, -1.0, 1.0),
+            "a negative device pixel ratio cannot scale a frame"
+        );
+        assert!(!viewport_report_is_usable(640.0, 480.0, 1.0, 0.0));
+        assert!(!viewport_report_is_usable(-640.0, 480.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn a_real_viewport_is_usable() {
+        assert!(viewport_report_is_usable(1.0, 1.0, 1.0, 1.0));
+        assert!(viewport_report_is_usable(640.0, 480.0, 2.0, 1.0));
+        assert!(viewport_report_is_usable(1920.0, 1080.0, 1.5, 1.5));
+    }
+
+    #[test]
+    fn geometry_replies_use_their_own_targeted_channel() {
+        assert_eq!(GEOMETRY_EVENT, "palace://geometry");
+        assert_ne!(
+            GEOMETRY_EVENT, EVENT_NAME,
+            "a geometry reply must not share the broadcast session channel"
+        );
     }
 }

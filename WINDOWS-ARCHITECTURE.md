@@ -69,6 +69,22 @@ There is exactly one `palace://event` channel (`src/lib/api.ts:6`,
 channel. A detached window must never call `connect`, must never own a socket,
 and must never publish its own event channel.
 
+**Backend change-notifications.** Alongside the session channel there are three
+backend-emitted notifications. Each carries one subsystem's state to every open
+window, so a change made in one window is visible in the others without a reload:
+
+| Event | Emitted from | Carries |
+|---|---|---|
+| `palace://geometry` | Rust, when the room view is measured | the viewport's pixel size |
+| `palace://prefs` | `prefs.rs`, on every settings write | the merged `prefs` block |
+| `palace://layout` | `geometry.rs`, on a layout change | `{remember, detached[], path}` |
+
+They are **not** session events and they are **not** window-created: the backend
+emits them, any window may listen, and no window may emit one. `palace://event`
+remains the only channel carrying session state, and the only one a window
+subscribes to for the session. A window that needs state it does not receive should
+re-read the authoritative source on focus rather than invent another channel.
+
 ---
 
 ## 3. The event channel and what each event carries
@@ -343,7 +359,8 @@ marked detached, or the next launch would not reopen it.
 - No second connection. There is one `AppState.client` and one socket.
 - No per-window authoritative state. A window is a view; the backend is the
   source of truth.
-- No window-created event channel. There is one `palace://event`.
+- No window-created event channel. There is one `palace://event`; the backend's
+  change-notifications (§2.3) are emitted by Rust, never by a window.
 - No detached panel that renders the full layout, and no full `main` layout
   inside a panel window.
 - No sharing of UI-only state (scroll offset, input draft, selected tab, room

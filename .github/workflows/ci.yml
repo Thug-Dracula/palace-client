@@ -43,15 +43,17 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
-      # The coverage gate below excludes palace-app, so its real-window
-      # behaviour is proven here instead: the harness launches the production
-      # Tauri context on the real runtime under Xvfb and asserts that a second
-      # OS window appears, boots its webview and closes. The WEBKIT_* variables
-      # are the standard workaround for WebKitGTK on a GPU-less runner; they
-      # change rendering, not behaviour. The Tests step above already ran the
-      # same binary without a display and exercised the skip path.
-      - name: Multi-window harness (real webviews on a virtual display)
-        run: xvfb-run -a cargo test -p palace-app --test multiwindow_harness --locked -- --nocapture --test-threads=1
+      # palace-app is excluded from the coverage gate below, so its real-window
+      # behaviour is proven here instead: every display-gated test runs on the
+      # real Tauri runtime under Xvfb. The display is given a real size because
+      # `xvfb-run`'s 640x480 default is smaller than geometry_persistence's
+      # fixtures, which would make that test skip instead of run. The WEBKIT_*
+      # variables are the standard workaround for WebKitGTK on a GPU-less
+      # runner; they change rendering, not behaviour. The Tests step above
+      # already ran these binaries without a display, exercising their skip
+      # paths.
+      - name: Real-window tests (real webviews on a virtual display)
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" cargo test -p palace-app --locked --no-fail-fast -- --nocapture --test-threads=1
         env:
           WEBKIT_DISABLE_DMABUF_RENDERER: "1"
           WEBKIT_DISABLE_COMPOSITING_MODE: "1"

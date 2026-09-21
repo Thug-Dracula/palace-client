@@ -157,9 +157,20 @@
 
       <div class="block-label">Current SoundFont</div>
       <div class="soundfont">
-        {#if store.audio.soundfont}
+        {#if store.audio.soundfont_fallback}
+          {#if store.audio.soundfont}
+            <span class="soundfont-path" title={store.audio.soundfont}>{store.audio.soundfont}</span>
+          {/if}
+          <span class="audio-note warn">
+            The chosen file is missing from disk — MIDI uses the bundled bank{store.audio.soundfont
+              ? ""
+              : " or the fallback tone"} instead.
+          </span>
+        {:else if store.audio.soundfont}
           <span class="soundfont-path" title={store.audio.soundfont}>{store.audio.soundfont}</span>
-          {#if store.audio.soundfont_exists}
+          {#if store.audio.soundfont_bundled}
+            <span class="audio-note">No file chosen — the bundled bank is in use.</span>
+          {:else if store.audio.soundfont_exists}
             <span class="audio-note ok">Selected.</span>
           {:else}
             <span class="audio-note warn">This file is missing on disk — MIDI plays the fallback tone.</span>

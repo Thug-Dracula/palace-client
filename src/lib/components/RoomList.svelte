@@ -3,6 +3,11 @@
   import { store } from "../store.svelte";
   import DetachButton from "./DetachButton.svelte";
 
+  // The filter is per-window view state, not session state: each webview runs
+  // its own store instance, so a detached list and the docked one never share
+  // a filter (WINDOWS-ARCHITECTURE.md §2.2).
+  const query = $derived(store.roomFilter.trim());
+
   async function enter(roomId: number) {
     if (!store.connected) {
       return;
@@ -38,6 +43,8 @@
     {/each}
     {#if !store.rooms.length}
       <div class="empty-note">{store.connected ? "No room list yet." : "Not connected."}</div>
+    {:else if !store.filteredRooms.length}
+      <div class="empty-note">No rooms match “{query}”.</div>
     {/if}
   </div>
 </div>

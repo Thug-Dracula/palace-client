@@ -9,7 +9,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { PANEL_IDS, panelFromId, viewForHash } from "./panels";
+import { PANEL_IDS, PREFS_HASH, panelFromId, viewForHash } from "./panels";
 
 describe("panel ids", () => {
   it("are exactly the five panels the Rust registry exposes", () => {
@@ -55,5 +55,13 @@ describe("viewForHash", () => {
     expect(viewForHash("#/panel/")).toEqual({ kind: "main" });
     expect(viewForHash("#/panel")).toEqual({ kind: "main" });
     expect(viewForHash("#/something-else")).toEqual({ kind: "main" });
+  });
+
+  it("mounts the Preferences window for the prefs hash the Rust registry builds", () => {
+    expect(PREFS_HASH).toBe("#/prefs");
+    expect(viewForHash(PREFS_HASH)).toEqual({ kind: "prefs" });
+    expect(viewForHash("/prefs")).toEqual({ kind: "prefs" });
+    expect(viewForHash("#/pref")).toEqual({ kind: "main" });
+    expect(viewForHash("#/panel/prefs")).toEqual({ kind: "main" });
   });
 });

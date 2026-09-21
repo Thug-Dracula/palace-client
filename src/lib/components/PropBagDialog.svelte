@@ -2,7 +2,9 @@
   import { onMount, tick } from "svelte";
   import * as api from "../api";
   import type { BagPropEntry } from "../api";
+  import { panelLayout } from "../panelLayout.svelte";
   import { MAX_PROPS, store } from "../store.svelte";
+  import { isPanelWindow } from "../windowRole";
   import {
     BAG_PAGE_SIZE,
     allWorn,
@@ -19,11 +21,49 @@
   import BagSidebar from "./bag/BagSidebar.svelte";
   import BagTile from "./bag/BagTile.svelte";
   import PropActionBar from "./bag/PropActionBar.svelte";
+  import DetachButton from "./DetachButton.svelte";
   import { focusFirst, trapTabKey } from "./editor/a11y";
   import { BAG, MESSAGES } from "./editor/strings";
   import "./editor/ui.css";
 
-  let { onclose }: { onclose: () => void } = $props();
+  /** How this copy of the bag is presented. */
+  type BagMode = "modal" | "panel";
+
+  /**
+   * - `modal` — the main shell's modal, opened from the room menu.
+   * - `panel` — the `panel-props` OS window, rendered by `PanelHost`.
+   *
+   * `PanelHost` renders the same component in both places, so the mode defaults
+   * from the SPA hash: a panel window routes itself to `#/panel/props`
+   * (`windowRole.ts`), `main` loads the bare page.
+   */
+  let {
+    onclose,
+    mode = isPanelWindow() ? "panel" : "modal",
+  }: { onclose: () => void; mode?: BagMode } = $props();
+
+  const modal = $derived(mode === "modal");
+
+  /**
+   * The panel-only words. The shared table lives in the editor's `strings.ts`,
+   * which the prop-editor task owns; these are bag-panel concepts only.
+   */
+  const PANEL_LABELS = {
+    detached: "The prop bag is in its own window.",
+    reattach: "Reattach",
+    closeWindow: "Close this window and dock the bag again",
+  };
+
+  /**
+   * While the bag lives in its own OS window, the main window must not render a
+   * second, conflicting copy. The modal becomes a placeholder that offers the
+   * way back instead (the plan's "placeholder in main").
+   */
+  const detached = $derived(modal && panelLayout.isDetached("props"));
+
+  function reattachBag(): void {
+    void panelLayout.reattach("props");
+  }
 
   let loading = $state(!store.bagLoaded);
   let busy = $state(false);
@@ -36,7 +76,7 @@
   let thumbVersion = $state(0);
   let sidebarTab = $state<"collections" | "outfits">("collections");
   let confirmPurge = $state(false);
-  let dialog: HTMLDivElement | undefined = $state();
+  let dialog: HTMLElement | undefined = $state();
 
   const wornIds = $derived(store.self?.props ?? []);
   const catalog = $derived(store.bagCatalog);
@@ -307,7 +347,16 @@
 
   onMount(() => {
     void (async () => {
-      await load();
+      // Every copy seeds itself: bag state arrives only through the `bag_*`
+      // commands (`loadBag()`), never through the `palace://event` replay, so
+      // a detached panel that skipped this would open empty. While this window
+      // is only the placeholder there is nothing to load.
+      if (!detached) {
+        await load();
+      }
+      if (!modal) {
+        return;
+      }
       await tick();
       const target =
         dialog?.querySelector<HTMLButtonElement>(".bag-tile-wear") ??
@@ -321,23 +370,25 @@
   });
 </script>
 
-<div class="dialog-backdrop">
-  <div
-    class="dialog prop-dialog bag-dialog"
-    role="dialog"
-    aria-modal="true"
-    aria-label={BAG.dialogLabel}
-    tabindex="-1"
-    bind:this={dialog}
-    onkeydown={onKeydown}
-    oncontextmenu={(event) => event.preventDefault()}
-  >
-    <div class="dialog-head">
-      <span>{BAG.title}</span>
-      <button class="dialog-x" type="button" aria-label={BAG.closeLabel} onclick={onclose}>×</button>
+{#snippet bagContent()}
+  <div class="dialog-head">
+    <span>{BAG.title}</span>
+    <div class="bag-head-actions">
+      {#if modal}
+        <DetachButton panel="props" />
+      {/if}
+      <button
+        class="dialog-x"
+        type="button"
+        aria-label={modal ? BAG.closeLabel : PANEL_LABELS.closeWindow}
+        onclick={onclose}
+      >
+        ×
+      </button>
     </div>
+  </div>
 
-    <div class="dialog-body bag-body">
+  <div class="dialog-body bag-body">
       {#if loading}
         <p class="dialog-hint ui-loading" role="status" aria-live="polite">{BAG.loading}</p>
       {:else if error && catalog.length === 0}
@@ -533,11 +584,61 @@
         >
           {BAG.actions.takeAllOff}
         </button>
-        <button class="btn primary" type="button" onclick={onclose} disabled={busy}>{BAG.actions.close}</button>
+        <button class="btn primary" type="button" onclick={onclose} disabled={busy}>
+          {modal ? BAG.actions.close : PANEL_LABELS.reattach}
+        </button>
+      </div>
+    </div>
+{/snippet}
+
+{#if detached}
+  <div class="dialog-backdrop">
+    <div
+      class="dialog prop-dialog bag-dialog bag-detached"
+      role="dialog"
+      aria-modal="true"
+      aria-label={BAG.dialogLabel}
+    >
+      <div class="dialog-head">
+        <span>{BAG.title}</span>
+        <button class="dialog-x" type="button" aria-label={BAG.closeLabel} onclick={onclose}>×</button>
+      </div>
+      <div class="dialog-body">
+        <p class="dialog-hint">{PANEL_LABELS.detached}</p>
+        <div class="dialog-actions">
+          <button class="btn primary" type="button" onclick={reattachBag}>
+            {PANEL_LABELS.reattach}
+          </button>
+        </div>
       </div>
     </div>
   </div>
-</div>
+{:else if modal}
+  <div class="dialog-backdrop">
+    <div
+      class="dialog prop-dialog bag-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label={BAG.dialogLabel}
+      tabindex="-1"
+      bind:this={dialog}
+      onkeydown={onKeydown}
+      oncontextmenu={(event) => event.preventDefault()}
+    >
+      {@render bagContent()}
+    </div>
+  </div>
+{:else}
+  <section
+    class="bag-dialog bag-panel"
+    aria-label={BAG.dialogLabel}
+    tabindex="-1"
+    bind:this={dialog}
+    oncontextmenu={(event) => event.preventDefault()}
+  >
+    {@render bagContent()}
+  </section>
+{/if}
 
 <style>
   .bag-dialog {
@@ -671,6 +772,56 @@
 
   .bag-dialog .dialog-error {
     max-width: none;
+  }
+
+  /* The dialog head carries the modal's detach control next to its close. */
+  .bag-head-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-1);
+    flex: none;
+  }
+
+  /* The placeholder the main-window modal becomes while the bag is detached. */
+  .bag-detached {
+    width: min(420px, calc(100vw - 32px));
+  }
+
+  /* ---------- Panel window form ----------
+     In its own OS window the bag is the whole page: no backdrop, no fixed
+     modal geometry, and the browser grid takes every pixel the window has. */
+  .bag-panel {
+    width: 100%;
+    max-width: none;
+    max-height: none;
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface-2);
+    color: var(--text-0);
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    animation: none;
+  }
+
+  .bag-panel .dialog-head {
+    border-radius: 0;
+  }
+
+  .bag-panel .bag-body {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .bag-panel .bag-layout {
+    height: auto;
+    flex: 1;
+  }
+
+  .bag-panel .dialog-actions {
+    margin-top: var(--sp-2);
   }
 
   .btn.danger:hover {

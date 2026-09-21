@@ -16,6 +16,7 @@
 import { listen } from "@tauri-apps/api/event";
 
 import * as api from "./api";
+import { LAYOUT_CHANGED_EVENT, layoutMemoryFrom } from "./layoutPrefs";
 import { PANEL_IDS, panelFromId, type PanelId } from "./panels";
 
 /** The targeted event Rust emits to `main` when a panel window is closing. */
@@ -54,6 +55,67 @@ class PanelLayout {
   /** Dock every panel again. */
   reset(): void {
     this.state = allDocked();
+  }
+
+  /**
+   * Replace the whole detached set from an authoritative list.
+   *
+   * The list is filtered through the registry order and unknown ids are
+   * dropped, so a malformed broadcast can never invent a panel. This is the
+   * one place a seed and a live broadcast both land.
+   */
+  applyDetached(detached: readonly string[]): void {
+    const known = layoutMemoryFrom({ detached }).detached;
+    for (const panel of PANEL_IDS) {
+      this.state[panel] = known.includes(panel);
+    }
+  }
+
+  /**
+   * Seed the detached set from the live window registry, once, on mount.
+   *
+   * Startup restore reopens detached panels on the Rust side, and it can do
+   * that before this webview has subscribed to `palace://layout`. Without this
+   * seed the main grid would render a *docked* copy of a panel that is already
+   * in its own window. Reading the authoritative registry closes that gap; a
+   * window that subscribes in time is also kept in step by
+   * {@link startLayoutListener}.
+   */
+  async seedFromBackend(): Promise<void> {
+    try {
+      this.applyDetached((await api.getLayoutMemory()).detached);
+    } catch {
+      // No bridge (a test, a plain browser): every panel stays docked.
+    }
+  }
+
+  /**
+   * Follow layout changes Rust made, or another window asked for. `main` only.
+   *
+   * A detach in this window is already optimistic, so the echo is a no-op; the
+   * event is what makes a reset from Preferences, or a change made in another
+   * window, reflow this grid without a reload.
+   */
+  startLayoutListener(): () => void {
+    let unlisten: (() => void) | undefined;
+    let stopped = false;
+    void listen<api.LayoutMemory>(LAYOUT_CHANGED_EVENT, (event) =>
+      this.applyDetached(layoutMemoryFrom(event.payload).detached),
+    )
+      .then((stop) => {
+        if (stopped) {
+          stop();
+        } else {
+          unlisten = stop;
+        }
+      })
+      .catch(() => {
+        // No Tauri event bridge in this host; the one-shot seed still ran.
+      });
+    return () => {
+      stopped = true;
+      unlisten?.();
+    };
   }
 
   /**

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "prefs",
+  "description": "The Preferences window (label `prefs`). Like a panel it is a peer view, so it gets the event permission only. It deliberately gets no window/webview create, close or destroy permission and no dialog permission: it opens through the Rust `open_preferences` command, which takes no label from the caller, and its file pickers, if any arrive with later group tasks, must be granted explicitly.",
+  "windows": ["prefs"],
+  "permissions": ["core:event:default"]
+}

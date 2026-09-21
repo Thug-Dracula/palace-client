@@ -66,6 +66,38 @@
 //! the implicit close when the app quits — saves geometry but must not clear
 //! the flag, otherwise detach state would not survive a restart. That is why
 //! the window-event path never touches it.
+//!
+//! # Remembering can be turned off
+//!
+//! The layout file carries its own `remember` flag (default `true`, so an
+//! existing file keeps behaving exactly as before). Task 27's Layout memory
+//! group is the UI over it:
+//!
+//! * with `remember` **off** the store refuses to write at all — [`flush`]
+//!   becomes a no-op, so move, resize, detach and close events cannot touch the
+//!   file. The one exception is the write that records the flag itself when the
+//!   user turns memory off, which happens *as part of* the toggle;
+//! * a store that reads a file with `remember: false` does not load the saved
+//!   geometry, does not restore it, and therefore starts the session on the
+//!   default single-window layout. The file is left exactly as it was;
+//! * turning memory back on starts remembering from the current session; the
+//!   previous geometry is not resurrected, so a stale detach flag can never
+//!   reopen a panel the user has since docked.
+//!
+//! [`LayoutStore::reset_layout`] is the explicit "reset layout to default"
+//! action: it forgets every remembered window, so the next launch is the
+//! default single-window layout. The window destruction that re-docks the
+//! panels *now* lives in [`reset_layout`], which the Preferences window calls.
+//!
+//! # The Preferences window is tracked too
+//!
+//! `prefs` is not a panel — it is a singleton tool window that is never docked
+//! and never reopened at startup — but its position and size are remembered
+//! like any other window's (Task 19 deferred this to Task 27). [`apply`] and
+//! the two event helpers therefore accept a tool-window label, and
+//! `windows::open_tool_window` applies the saved rectangle when the window is
+//! opened. The restore loop deliberately only reopens [`Panel`]s, so a `prefs`
+//! entry can never make the Preferences window appear on launch.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -74,7 +106,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, Runtime, WebviewWindow, Window};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Runtime, WebviewWindow, Window,
+};
 
 use crate::logging::{self, Level, WindowLog, WindowMilestone};
 use crate::windows::{self, Panel, MAIN_LABEL, PANEL_SIZE};
@@ -90,6 +124,15 @@ pub const LAYOUT_ENV: &str = "PALACE_LAYOUT_FILE";
 
 /// The schema version this build writes and the newest it reads.
 pub const LAYOUT_SCHEMA_VERSION: u64 = 1;
+
+/// The event every webview may listen to for a change in layout memory.
+///
+/// The Preferences window shows which panels are detached and whether memory is
+/// on; the main shell already learns about re-attaches through
+/// `palace://panel-closed`. This event carries the same facts as
+/// [`LayoutMemory`] so the Preferences window follows a detach that happened in
+/// another window without polling.
+pub const LAYOUT_CHANGED_EVENT: &str = "palace://layout";
 
 /// How often the background thread flushes a dirty snapshot.
 const AUTOSAVE_INTERVAL: Duration = Duration::from_millis(600);
@@ -300,13 +343,20 @@ impl WindowGeometry {
     }
 }
 
-/// The whole layout file: the schema version, the detach order and every
-/// remembered window.
+/// The whole layout file: the schema version, whether memory is on, the detach
+/// order and every remembered window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Layout {
     /// The schema version the file was written with.
     #[serde(default = "schema_version")]
     pub version: u64,
+    /// Whether window positions are remembered at all.
+    ///
+    /// Defaults to `true`, so a file written before this flag existed keeps
+    /// its behaviour. `false` freezes the file: nothing is recorded or
+    /// restored until the user turns memory back on.
+    #[serde(default = "remember_default")]
+    pub remember: bool,
     /// Panel ids in the order they were detached, oldest first.
     #[serde(default)]
     pub order: Vec<String>,
@@ -320,14 +370,64 @@ fn schema_version() -> u64 {
     LAYOUT_SCHEMA_VERSION
 }
 
+/// The default value for a missing `remember` field: memory on.
+fn remember_default() -> bool {
+    true
+}
+
 impl Default for Layout {
     fn default() -> Self {
         Layout {
             version: LAYOUT_SCHEMA_VERSION,
+            remember: true,
             order: Vec::new(),
             windows: BTreeMap::new(),
         }
     }
+}
+
+/// The layout-memory state the Preferences window shows.
+///
+/// `detached` is read from the live window registry, not from the saved flags:
+/// it says which panels are in their own window *right now*, which is the
+/// question the group answers. The order is [`Panel::ALL`]'s, so the list is
+/// stable no matter when a panel was detached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LayoutMemory {
+    /// Whether positions and sizes are being remembered.
+    pub remember: bool,
+    /// The ids of the panels currently in their own window.
+    pub detached: Vec<String>,
+    /// The file the layout is written to, when the platform names one.
+    pub path: Option<String>,
+}
+
+/// The panels a saved layout asks to reopen, in the saved detach order.
+///
+/// Only [`Panel`] labels can appear: a tool window such as `prefs` is tracked
+/// for geometry but is never reopened at startup, and an entry with a
+/// `detached` flag of `false` is skipped.
+#[must_use]
+pub fn panels_to_reopen(layout: &Layout) -> Vec<Panel> {
+    let mut order = layout.order.clone();
+    for label in layout.windows.keys() {
+        if let Some(panel) = Panel::from_label(label) {
+            let id = panel.id().to_string();
+            if !order.contains(&id) {
+                order.push(id);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|id| Panel::from_id(&id).ok())
+        .filter(|panel| {
+            layout
+                .windows
+                .get(panel.label())
+                .is_some_and(|geometry| geometry.detached)
+        })
+        .collect()
 }
 
 /// The layout file's path: the [`LAYOUT_ENV`] override, else the app-config
@@ -525,7 +625,7 @@ fn screens_of<R: Runtime>(window: &WebviewWindow<R>) -> (Vec<Screen>, usize) {
 /// background retry applies the same placement again once it has mapped.
 pub fn apply<R: Runtime>(store: &LayoutStore, window: &WebviewWindow<R>) -> bool {
     let label = window.label().to_string();
-    if label != MAIN_LABEL && !windows::is_panel_label(&label) {
+    if !windows::tracks_geometry(&label) {
         return false;
     }
     let Some(saved) = store.snapshot().windows.get(&label).cloned() else {
@@ -639,32 +739,23 @@ pub fn restore_saved_layout<R: Runtime>(app: &AppHandle<R>) {
     };
     let layout = store.startup_snapshot();
 
+    if !layout.remember {
+        store.arm();
+        logging::log(
+            Level::Info,
+            "layout memory is off; starting from the default single-window layout",
+        );
+        return;
+    }
+
     if layout.windows.contains_key(MAIN_LABEL) {
         if let Some(main) = app.get_webview_window(MAIN_LABEL) {
             apply(&store, &main);
         }
     }
 
-    let mut order = layout.order.clone();
-    for label in layout.windows.keys() {
-        if let Some(panel) = Panel::from_label(label) {
-            let id = panel.id().to_string();
-            if !order.contains(&id) {
-                order.push(id);
-            }
-        }
-    }
     let mut reopened = 0usize;
-    for id in order {
-        let Ok(panel) = Panel::from_id(&id) else {
-            continue;
-        };
-        let Some(geometry) = layout.windows.get(panel.label()) else {
-            continue;
-        };
-        if !geometry.detached {
-            continue;
-        }
+    for panel in panels_to_reopen(&layout) {
         match windows::open(app, panel) {
             Ok(_) => {
                 if let Some(window) = app.get_webview_window(panel.label()) {
@@ -709,7 +800,7 @@ pub fn schedule_restore<R: Runtime>(app: &AppHandle<R>) {
 /// Record a window that moved or resized, when layout memory is armed.
 pub fn note_geometry_changed<R: Runtime>(window: &Window<R>) {
     let label = window.label();
-    if label != MAIN_LABEL && !windows::is_panel_label(label) {
+    if !windows::tracks_geometry(label) {
         return;
     }
     let Some(store) = window.try_state::<LayoutStore>() else {
@@ -726,14 +817,22 @@ pub fn note_geometry_changed<R: Runtime>(window: &Window<R>) {
 /// This never changes the `detached` flag: closing a panel on app quit must
 /// leave the panel marked detached so the next launch reopens it.
 pub fn note_window_closing<R: Runtime>(window: &Window<R>) {
-    let label = window.label();
-    if label != MAIN_LABEL && !windows::is_panel_label(label) {
+    note_closing(window.app_handle(), window.label());
+}
+
+/// [`note_window_closing`], addressed by the app handle and a window label.
+///
+/// The quit path closes panels from an [`AppHandle`] rather than a `Window`, so
+/// it needs the same capture-and-flush without a window reference. The
+/// `detached` flag is left untouched, exactly as [`note_window_closing`] does.
+pub fn note_closing<R: Runtime>(app: &AppHandle<R>, label: &str) {
+    if !windows::tracks_geometry(label) {
         return;
     }
-    let Some(store) = window.try_state::<LayoutStore>() else {
+    let Some(store) = app.try_state::<LayoutStore>() else {
         return;
     };
-    let Some(webview) = window.app_handle().get_webview_window(label) else {
+    let Some(webview) = app.get_webview_window(label) else {
         return;
     };
     store.note_window(&webview);
@@ -742,6 +841,123 @@ pub fn note_window_closing<R: Runtime>(window: &Window<R>) {
             "could not save the window layout on {label}'s close: {error}"
         ));
     }
+}
+
+/// The layout-memory state the Preferences window shows.
+///
+/// The detached list comes from the live window registry: it answers "which
+/// panels are in their own window right now", which is what the group displays.
+#[must_use]
+pub fn layout_memory_state<R: Runtime>(app: &AppHandle<R>) -> LayoutMemory {
+    let store = app.try_state::<LayoutStore>();
+    let remember = store.as_ref().is_none_or(|store| store.remember());
+    let path = store
+        .as_ref()
+        .and_then(|store| store.path())
+        .map(|path| path.display().to_string());
+    let detached = Panel::ALL
+        .iter()
+        .filter(|panel| app.get_webview_window(panel.label()).is_some())
+        .map(|panel| panel.id().to_string())
+        .collect();
+    LayoutMemory {
+        remember,
+        detached,
+        path,
+    }
+}
+
+/// Tell every window that layout memory changed.
+///
+/// The Preferences window follows detaches that happen in another window
+/// through this event instead of polling; the payload is a [`LayoutMemory`].
+pub fn notify_layout_changed<R: Runtime>(app: &AppHandle<R>) {
+    let state = layout_memory_state(app);
+    if let Err(error) = app.emit(LAYOUT_CHANGED_EVENT, &state) {
+        logging::log(
+            Level::Debug,
+            format!("layout event was not delivered: {error}"),
+        );
+    }
+}
+
+/// Read the layout-memory state. Backs the Layout memory preference group.
+#[tauri::command]
+pub fn get_layout_memory<R: Runtime>(app: AppHandle<R>) -> Result<LayoutMemory, String> {
+    Ok(layout_memory_state(&app))
+}
+
+/// Turn layout memory on or off and report the new state.
+///
+/// Turning it off is a real stop, not a hidden control: the store refuses to
+/// write anything after this returns, so the next launch starts from the
+/// default single-window layout.
+#[tauri::command]
+pub fn set_layout_remember<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<LayoutMemory, String> {
+    if let Some(store) = app.try_state::<LayoutStore>() {
+        store.set_remember(enabled)?;
+    }
+    logging::log(
+        Level::Info,
+        format!(
+            "layout memory turned {}",
+            if enabled { "on" } else { "off" }
+        ),
+    );
+    let state = layout_memory_state(&app);
+    let _ = app.emit(LAYOUT_CHANGED_EVENT, &state);
+    Ok(state)
+}
+
+/// Reset the layout to default: re-dock every panel now and forget every
+/// remembered window.
+///
+/// The panel windows are destroyed rather than asked to close, so nothing
+/// captures geometry on the way out; the resulting `Destroyed` events re-dock
+/// each panel through the one existing re-dock channel. The store is cleared
+/// afterwards, so the next launch is the default single-window layout. With
+/// memory off nothing is written, because memory off means nothing is written.
+#[tauri::command]
+pub fn reset_layout<R: Runtime>(app: AppHandle<R>) -> Result<LayoutMemory, String> {
+    let mut closed = 0usize;
+    let mut failed = Vec::new();
+    for panel in Panel::ALL {
+        if let Some(window) = app.get_webview_window(panel.label()) {
+            match window.destroy() {
+                Ok(()) => closed += 1,
+                Err(error) => {
+                    failed.push(panel.id().to_string());
+                    warn(&format!(
+                        "could not close {} while resetting the layout: {error}",
+                        panel.label()
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(store) = app.try_state::<LayoutStore>() {
+        store.reset_layout();
+        if let Err(error) = store.flush() {
+            warn(&format!("could not write the reset window layout: {error}"));
+        }
+    }
+    logging::log(
+        Level::Info,
+        format!(
+            "layout reset to default: {closed} panel window(s) closed, {} still open",
+            failed.len()
+        ),
+    );
+    // The destroys are asynchronous, so the live registry can still list the
+    // windows at this point. The answer is the set the reset guarantees: only a
+    // panel whose window refused to close stays detached.
+    let mut state = layout_memory_state(&app);
+    state.detached = failed;
+    let _ = app.emit(LAYOUT_CHANGED_EVENT, &state);
+    Ok(state)
 }
 
 /// The in-memory layout and its file, shared by every window.
@@ -787,14 +1003,28 @@ impl LayoutStore {
     /// Load the store from an explicit path (`None` disables persistence).
     #[must_use]
     pub fn open(path: Option<PathBuf>) -> LayoutStore {
-        let (layout, file_state) = match path.as_deref() {
+        let (mut layout, file_state) = match path.as_deref() {
             Some(path) => read_file(path),
             None => (Layout::default(), FileState::Missing),
         };
+        if !layout.remember {
+            // Memory is off: the saved geometry is deliberately not loaded, so
+            // this session starts from the default single-window layout and
+            // turning memory back on cannot resurrect a stale detach flag. The
+            // file itself is left exactly as it was.
+            layout = Layout {
+                remember: false,
+                ..Layout::default()
+            };
+        }
         match path.as_deref() {
             Some(path) => logging::log(
                 Level::Info,
-                format!("window layout file: {}", path.display()),
+                format!(
+                    "window layout file: {} (remember={})",
+                    path.display(),
+                    layout.remember
+                ),
             ),
             None => logging::log(
                 Level::Info,
@@ -851,6 +1081,47 @@ impl LayoutStore {
     #[must_use]
     pub fn dirty(&self) -> bool {
         self.state().dirty
+    }
+
+    /// Whether positions and sizes are being remembered.
+    #[must_use]
+    pub fn remember(&self) -> bool {
+        self.state().layout.remember
+    }
+
+    /// Turn layout memory on or off, persisting the flag itself.
+    ///
+    /// Turning it off writes the current snapshot one last time — the flag has
+    /// to reach the disk for the next launch to see it — and every later
+    /// [`flush`](Self::flush) becomes a no-op. Turning it back on resumes
+    /// recording; the snapshot it starts from is whatever the session has now,
+    /// because a store that was opened with memory off never loaded the file's
+    /// geometry.
+    pub fn set_remember(&self, enabled: bool) -> Result<(), String> {
+        {
+            let mut state = self.state();
+            if state.layout.remember == enabled {
+                return Ok(());
+            }
+            state.layout.remember = enabled;
+            state.revision = state.revision.wrapping_add(1);
+            state.dirty = true;
+        }
+        self.flush_inner(true)
+    }
+
+    /// Forget every remembered window and the detach order.
+    ///
+    /// This is the store half of "reset layout to default": the next launch
+    /// starts from the default single-window layout. The window destruction
+    /// that re-docks panels *now* is [`reset_layout`]'s job. When memory is
+    /// off the store is still cleared in memory but nothing is written.
+    pub fn reset_layout(&self) {
+        let mut state = self.state();
+        state.layout.windows.clear();
+        state.layout.order.clear();
+        state.revision = state.revision.wrapping_add(1);
+        state.dirty = true;
     }
 
     /// Store one window's rectangle, keeping its `detached` flag.
@@ -939,15 +1210,24 @@ impl LayoutStore {
             .collect()
     }
 
-    /// Write the snapshot if it changed. A no-op when clean or when no path is
-    /// configured.
+    /// Write the snapshot if it changed. A no-op when clean, when no path is
+    /// configured, or when layout memory is off.
     pub fn flush(&self) -> Result<(), String> {
+        self.flush_inner(false)
+    }
+
+    /// Write the snapshot; `force` bypasses the memory-off gate so the flag
+    /// that turns memory off can itself reach the disk.
+    fn flush_inner(&self, force: bool) -> Result<(), String> {
         if self.inner.write_blocked {
             return Ok(());
         }
         let (path, layout, revision) = {
             let state = self.state();
             if !state.dirty {
+                return Ok(());
+            }
+            if !force && !state.layout.remember {
                 return Ok(());
             }
             (
@@ -1238,5 +1518,222 @@ mod tests {
         assert!(!store.armed(), "a fresh store must not record yet");
         store.arm();
         assert!(store.armed());
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("palace-geometry-{tag}-{unique}"));
+        std::fs::create_dir_all(&directory).expect("a scratch directory is creatable");
+        directory
+    }
+
+    fn seeded_layout() -> Layout {
+        let mut layout = Layout::default();
+        layout.windows.insert(
+            MAIN_LABEL.to_string(),
+            WindowGeometry::from_rect(
+                Rect {
+                    x: 40,
+                    y: 60,
+                    w: 900,
+                    h: 700,
+                },
+                Some("primary".to_string()),
+                false,
+            ),
+        );
+        layout.windows.insert(
+            Panel::Users.label().to_string(),
+            WindowGeometry::from_rect(
+                Rect {
+                    x: 120,
+                    y: 90,
+                    w: 520,
+                    h: 430,
+                },
+                Some("primary".to_string()),
+                true,
+            ),
+        );
+        layout.order.push("users".to_string());
+        layout
+    }
+
+    #[test]
+    fn a_file_without_the_remember_flag_keeps_remembering() {
+        let layout: Layout = serde_json::from_str(r#"{"version":1,"windows":{}}"#)
+            .expect("an older file still parses");
+        assert!(layout.remember, "memory defaults to on");
+        assert!(Layout::default().remember);
+        assert!(serde_json::to_string(&Layout::default())
+            .expect("serializes")
+            .contains("\"remember\":true"));
+    }
+
+    #[test]
+    fn remember_off_freezes_the_file_and_the_next_launch_is_the_default_layout() {
+        let directory = scratch("remember-off");
+        let path = directory.join(LAYOUT_FILE);
+        save(&path, &seeded_layout()).expect("the seed layout is written");
+
+        let store = LayoutStore::open(Some(path.clone()));
+        assert!(store.remember());
+        assert_eq!(
+            panels_to_reopen(&store.startup_snapshot()),
+            vec![Panel::Users],
+            "with memory on the detached panel is part of the next launch"
+        );
+
+        store
+            .set_remember(false)
+            .expect("turning memory off persists the flag");
+        let frozen = std::fs::read_to_string(&path).expect("the layout file is readable");
+        assert!(frozen.contains("\"remember\": false"), "{frozen}");
+
+        // Everything a live session does after the toggle must not reach disk.
+        store.arm();
+        store.set_detached(Panel::Chat, true);
+        store.record_geometry(
+            Panel::Chat.label(),
+            WindowGeometry::from_rect(
+                Rect {
+                    x: 1,
+                    y: 2,
+                    w: 3,
+                    h: 4,
+                },
+                None,
+                true,
+            ),
+        );
+        store
+            .flush()
+            .expect("a flush while memory is off is a no-op, not an error");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the layout file is readable"),
+            frozen,
+            "no layout state may be written while memory is off"
+        );
+
+        // The next launch reads the same file: default single-window layout.
+        let relaunched = LayoutStore::open(Some(path.clone()));
+        assert!(!relaunched.remember());
+        assert!(
+            relaunched.startup_snapshot().windows.is_empty(),
+            "the saved geometry is not loaded while memory is off"
+        );
+        assert!(
+            panels_to_reopen(&relaunched.startup_snapshot()).is_empty(),
+            "the next launch must be the default single-window layout"
+        );
+        relaunched.arm();
+        relaunched.flush().expect("the relaunch writes nothing");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the layout file is readable"),
+            frozen,
+            "the relaunch must leave the frozen file exactly as it was"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn turning_remember_back_on_starts_from_the_current_session() {
+        let directory = scratch("remember-on");
+        let path = directory.join(LAYOUT_FILE);
+        save(&path, &seeded_layout()).expect("the seed layout is written");
+
+        // The user turns memory off in one session …
+        let first = LayoutStore::open(Some(path.clone()));
+        first
+            .set_remember(false)
+            .expect("turning memory off persists the flag");
+
+        // … and launches again: the saved geometry is not loaded.
+        let store = LayoutStore::open(Some(path.clone()));
+        assert!(!store.remember());
+        assert!(store.startup_snapshot().windows.is_empty());
+
+        // Turning it back on now remembers this session, not the old file.
+        store
+            .set_remember(true)
+            .expect("turning memory on persists again");
+        store.set_detached(Panel::Chat, true);
+        store
+            .flush()
+            .expect("what the session does after memory is on is written");
+
+        let reloaded = LayoutStore::open(Some(path.clone()));
+        assert!(reloaded.remember());
+        assert!(
+            reloaded
+                .startup_snapshot()
+                .windows
+                .contains_key(Panel::Chat.label()),
+            "what the session detaches after memory is on is remembered"
+        );
+        assert!(
+            !reloaded
+                .startup_snapshot()
+                .windows
+                .contains_key(Panel::Users.label()),
+            "the stale detach flag from before the toggle must not come back"
+        );
+        assert_eq!(
+            panels_to_reopen(&reloaded.startup_snapshot()),
+            vec![Panel::Chat]
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn reset_layout_forgets_every_window_and_the_detach_order() {
+        let store = LayoutStore::open(None);
+        store.set_detached(Panel::Users, true);
+        store.record_geometry(MAIN_LABEL, seeded_layout().windows[MAIN_LABEL].clone());
+        assert!(store.dirty());
+        assert_eq!(store.detached_panels(), vec![Panel::Users]);
+
+        store.reset_layout();
+
+        assert!(store.snapshot().windows.is_empty());
+        assert!(store.snapshot().order.is_empty());
+        assert!(store.detached_panels().is_empty());
+        assert!(store.dirty(), "the reset must reach the file");
+    }
+
+    #[test]
+    fn the_preferences_window_is_tracked_for_geometry_but_never_reopened() {
+        let mut layout = seeded_layout();
+        layout.windows.insert(
+            crate::windows::ToolWindow::Preferences.label().to_string(),
+            WindowGeometry::from_rect(
+                Rect {
+                    x: 700,
+                    y: 500,
+                    w: 780,
+                    h: 620,
+                },
+                None,
+                false,
+            ),
+        );
+
+        assert_eq!(
+            panels_to_reopen(&layout),
+            vec![Panel::Users],
+            "a prefs entry must never make the Preferences window appear at startup"
+        );
+        assert!(
+            windows::tracks_geometry(crate::windows::ToolWindow::Preferences.label()),
+            "the prefs window's own geometry is remembered"
+        );
+        assert!(!windows::is_panel_label(
+            crate::windows::ToolWindow::Preferences.label()
+        ));
     }
 }

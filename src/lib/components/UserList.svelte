@@ -7,12 +7,12 @@
   <div class="panel-head">
     <span>In room</span>
     <div class="panel-head-tools">
-      <span class="count">{store.users.length}</span>
+      <span class="count">{store.visibleUsers.length}</span>
       <DetachButton panel="users" />
     </div>
   </div>
   <div class="scroll">
-    {#each store.users as user (user.id)}
+    {#each store.visibleUsers as user (user.id)}
       <div class="row" class:self={user.is_self} class:away={user.away}>
         <span class="face" style="color:{faceColor(user.color)}"></span>
         <span class="name">{user.name}</span>
@@ -20,7 +20,7 @@
         <span class="meta">{user.away ? "away" : ""}</span>
       </div>
     {/each}
-    {#if !store.users.length}
+    {#if !store.visibleUsers.length}
       <div class="empty-note">{store.connected ? "Nobody here." : "Not connected."}</div>
     {/if}
   </div>

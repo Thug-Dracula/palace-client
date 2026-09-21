@@ -2,8 +2,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { internalBaseUrl } from "./internalUrl";
+import { PREFS_LABEL, viewForHash } from "./panels";
+import type { PrefsDocument } from "./prefs";
 
 export const EVENT_NAME = "palace://event";
+
+/**
+ * The targeted event a room-viewport geometry reply arrives on.
+ *
+ * Distinct from {@link EVENT_NAME}: a geometry reply is sent with `emit_to` to
+ * the one window that owns the room view, never broadcast, and the listener is
+ * label-scoped (see {@link onGeometry}).
+ */
+export const GEOMETRY_EVENT = "palace://geometry";
 
 export type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error";
 
@@ -19,6 +30,10 @@ export interface AudioState {
   volume: number;
   soundfont: string | null;
   soundfont_exists: boolean;
+  /** True when the chosen SoundFont is gone and the bundled bank took over. */
+  soundfont_fallback?: boolean;
+  /** True when the font in effect is the bundled bank, not a chosen file. */
+  soundfont_bundled?: boolean;
 }
 
 export interface ServerBanner {
@@ -98,6 +113,16 @@ export interface ScreenState {
   mid_version?: number | null;
   /** Board top layer version; null/absent when that layer is empty. */
   top_version?: number | null;
+}
+
+/** A targeted room-viewport geometry reply (Rust `protocol::GeometryReply`). */
+export interface GeometryReply {
+  /** The window this reply is for, e.g. `panel-room`. */
+  owner: string;
+  /** The monotonic epoch of the viewport report that produced it. */
+  epoch: number;
+  /** The composited room screen, including geometry for the owner's viewport. */
+  screen: ScreenState;
 }
 
 /** A tagged reference to one piece of avatar artwork: a face, a prop, or a Type 1 image. */
@@ -449,6 +474,50 @@ export const outfitsDuplicate = (source: string, target: string): Promise<BagOut
 
 export const getSettings = (): Promise<Settings> => invoke("get_settings");
 
+/** Read the whole `prefs` block; an absent one reads as an empty object. */
+export const getPrefs = (): Promise<PrefsDocument> => invoke("get_prefs");
+
+/** Additively merge `patch` into the `prefs` block; returns the merged block. */
+export const setPrefs = (patch: PrefsDocument): Promise<PrefsDocument> =>
+  invoke("set_prefs", { patch });
+
+/** Restore this build's preference defaults; returns the resulting block. */
+export const resetPrefs = (): Promise<PrefsDocument> => invoke("reset_prefs");
+
+/** The chat transcript writer's current state. */
+export interface ChatLogStatus {
+  /** Whether new chat lines are being written to disk right now. */
+  enabled: boolean;
+  /** The resolved destination, whether or not logging is on. */
+  path: string;
+  /** The active file's size cap in bytes. */
+  max_bytes: number;
+  /** How many archives are kept. */
+  rotate_files: number;
+  /** How much the active file holds; `0` while logging is off. */
+  bytes_written: number;
+}
+
+/**
+ * Read the transcript writer's state.
+ *
+ * Read-only; the destination, cap and toggle are written through `setPrefs`,
+ * which reconfigures the writer as part of the same live-apply path.
+ */
+export const chatLogStatus = (): Promise<ChatLogStatus> => invoke("chat_log_status");
+
+/**
+ * Persist host, port and user name for the next connection.
+ *
+ * Deliberately does not touch the running client or start a connection: the
+ * caller shows a "reconnect required" affordance instead.
+ */
+export const setConnectionSettings = (
+  host: string,
+  port: number,
+  username: string,
+): Promise<Settings> => invoke("set_connection_settings", { host, port, username });
+
 export const connect = (settings: Settings): Promise<void> =>
   invoke("connect", {
     host: settings.host,
@@ -487,6 +556,46 @@ export const openPanel = (panelId: string): Promise<PanelOpenOutcome> =>
 /** Close a detached panel's window, which re-attaches it to the main window. */
 export const closePanel = (panelId: string): Promise<PanelCloseOutcome> =>
   invoke("close_panel", { panelId });
+
+/** Open the singleton Preferences window (the label is fixed in Rust). */
+export const openPreferences = (): Promise<PanelOpenOutcome> => invoke("open_preferences");
+
+/** Ask the Preferences window to close; its titlebar close does the same. */
+export const closePreferences = (): Promise<PanelCloseOutcome> => invoke("close_preferences");
+
+/** The layout-memory state the Layout memory preference group shows. */
+export interface LayoutMemory {
+  /** Whether window positions and sizes are being remembered at all. */
+  remember: boolean;
+  /** The ids of the panels that are in their own window right now. */
+  detached: string[];
+  /** The file the layout is written to, when the platform names one. */
+  path: string | null;
+}
+
+/**
+ * Read the layout-memory state.
+ *
+ * The detached list comes from the live window registry, not from the saved
+ * flags, so it says which panels are detached now.
+ */
+export const getLayoutMemory = (): Promise<LayoutMemory> => invoke("get_layout_memory");
+
+/**
+ * Turn layout memory on or off.
+ *
+ * Off is a real stop: the store refuses to write after this, so the next
+ * launch is the default single-window layout. The file the user already had is
+ * kept, not destroyed.
+ */
+export const setLayoutRemember = (enabled: boolean): Promise<LayoutMemory> =>
+  invoke("set_layout_remember", { enabled });
+
+/**
+ * Reset the layout to default: re-dock every panel now and forget every
+ * remembered window, so the next launch is the default single-window layout.
+ */
+export const resetLayout = (): Promise<LayoutMemory> => invoke("reset_layout");
 
 export const click = (x: number, y: number): Promise<void> => invoke("click", { x, y });
 
@@ -542,6 +651,60 @@ export const setVolume = (volume: number): Promise<number> => invoke("set_volume
 
 export const onEvent = (handler: (event: ClientEvent) => void): Promise<UnlistenFn> =>
   listen<ClientEvent>(EVENT_NAME, (message) => handler(message.payload));
+
+function tauriWindowLabel(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const label = (
+    window as unknown as {
+      __TAURI_INTERNALS__?: { metadata?: { currentWindow?: { label?: unknown } } };
+    }
+  ).__TAURI_INTERNALS__?.metadata?.currentWindow?.label;
+  return typeof label === "string" && label.length > 0 ? label : null;
+}
+
+/**
+ * The label of the window this webview is in: `main`, `panel-<id>` or `prefs`.
+ *
+ * Tauri's own label is preferred; the SPA hash is the fallback so a plain
+ * browser (unit tests) resolves deterministically. The Rust registry builds the
+ * hash from the label, so the two agree for every panel and for Preferences.
+ */
+export function currentWindowLabel(
+  hash: string = typeof window === "undefined" ? "" : window.location.hash,
+): string {
+  const label = tauriWindowLabel();
+  if (label) {
+    return label;
+  }
+  const view = viewForHash(hash);
+  if (view.kind === "panel") {
+    return `panel-${view.panel}`;
+  }
+  return view.kind === "prefs" ? PREFS_LABEL : "main";
+}
+
+/**
+ * Subscribe to this window's targeted room-viewport geometry replies.
+ *
+ * The listener is label-scoped on purpose: `emit_to` is not absolute, so a
+ * listener registered with the default `Any` target would also receive replies
+ * meant for another window (Task 1, Q3). Outside a Tauri host the subscribe
+ * fails and resolves to a no-op, so a plain browser still mounts.
+ */
+export const onGeometry = async (
+  label: string,
+  handler: (reply: GeometryReply) => void,
+): Promise<UnlistenFn> => {
+  try {
+    return await listen<GeometryReply>(GEOMETRY_EVENT, (message) => handler(message.payload), {
+      target: label,
+    });
+  } catch {
+    return () => {};
+  }
+};
 
 /** Where the open editor document came from: a blank canvas, a bag prop clone, or an imported image. */
 export type EditorOrigin =

@@ -19,8 +19,16 @@
 //! Run the real one headless:
 //!
 //! ```text
-//! GDK_BACKEND=x11 xvfb-run -a cargo test -p palace-app --test geometry_persistence -- --nocapture --test-threads=1
+//! GDK_BACKEND=x11 xvfb-run -a -s "-screen 0 1920x1080x24" \
+//!   cargo test -p palace-app --test geometry_persistence -- --nocapture --test-threads=1
 //! ```
+//!
+//! The screen size matters. `xvfb-run`'s default screen is only 640×480, and
+//! this test's fixture rectangles are bigger than that, so the off-screen clamp
+//! does its job and moves them — the assertions then fail while the app is
+//! behaving correctly. On a screen too small for the fixtures each phase prints
+//! `SKIP …` and exits with a distinct skip code, which the acceptance test
+//! reports as a skip rather than a failure.
 //!
 //! Each child process is given `GDK_BACKEND=x11` with `WAYLAND_DISPLAY`
 //! removed. GDK otherwise prefers the user's real Wayland session (reachable
@@ -317,6 +325,50 @@ mod real_runtime {
     /// How far the OS may be from the requested rectangle and still count.
     const TOLERANCE: i32 = 2;
 
+    /// The exit code a phase uses to report "this environment cannot run me".
+    ///
+    /// The acceptance test reads it as a skip, never as a failure: a screen too
+    /// small for the fixtures is a missing environment, not a broken app.
+    const SKIP_EXIT: i32 = 77;
+
+    /// The smallest screen that holds [`MOVED`] without the clamp moving it.
+    fn required_screen() -> (u32, u32) {
+        (
+            (MOVED.x + MOVED.w as i32) as u32,
+            (MOVED.y + MOVED.h as i32) as u32,
+        )
+    }
+
+    /// Stop the phase if the screen is smaller than the fixtures need.
+    ///
+    /// The off-screen clamp is production behaviour: on a screen too small for
+    /// the saved rectangle it moves the window back into view, so the phase
+    /// would fail while the app was behaving correctly. `xvfb-run`'s default
+    /// screen (640×480) is exactly that case.
+    fn skip_if_screen_too_small(window: &tauri::WebviewWindow) {
+        let monitor = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| window.primary_monitor().ok().flatten());
+        let Some(monitor) = monitor else {
+            return;
+        };
+        let size = *monitor.size();
+        let (need_w, need_h) = required_screen();
+        if size.width >= need_w && size.height >= need_h {
+            return;
+        }
+        eprintln!(
+            "SKIP geometry phase: the virtual screen is {}x{}, but this test needs at least \
+             {need_w}x{need_h} so the off-screen clamp does not (correctly) move the window. \
+             Run it as: xvfb-run -a -s \"-screen 0 1920x1080x24\" cargo test -p palace-app \
+             --test geometry_persistence",
+            size.width, size.height
+        );
+        std::process::exit(SKIP_EXIT);
+    }
+
     /// Launch the app with the same layout wiring production uses: the store
     /// is discovered from `PALACE_LAYOUT_FILE`, managed, autosaved, restored on
     /// the main thread, and the production window-event handler is attached.
@@ -405,6 +457,7 @@ mod real_runtime {
         let window = handle
             .get_webview_window(label)
             .expect("the panel window exists");
+        skip_if_screen_too_small(&window);
 
         window
             .set_position(PhysicalPosition::new(SAVED.x, SAVED.y))
@@ -470,6 +523,7 @@ mod real_runtime {
             .handle()
             .get_webview_window(Panel::Users.label())
             .expect("the restored window exists");
+        skip_if_screen_too_small(&window);
         let actual = wait_for_rect(
             &window,
             expected.rect(),
@@ -602,6 +656,13 @@ mod real_runtime {
 
         let write = run_child("write", &layout, &log_dir);
         print_child("write", &write);
+        if write.status.code() == Some(SKIP_EXIT) {
+            eprintln!(
+                "SKIP panel_geometry_is_restored_after_a_real_restart: the write phase reported \
+                 a screen too small for this test (see above)"
+            );
+            return;
+        }
         assert!(
             write.status.success(),
             "the write phase failed; see its output above"
@@ -618,6 +679,13 @@ mod real_runtime {
 
         let restore = run_child("restore", &layout, &log_dir);
         print_child("restore", &restore);
+        if restore.status.code() == Some(SKIP_EXIT) {
+            eprintln!(
+                "SKIP panel_geometry_is_restored_after_a_real_restart: the restore phase reported \
+                 a screen too small for this test (see above)"
+            );
+            return;
+        }
         assert!(
             restore.status.success(),
             "the restore phase failed; see its output above"

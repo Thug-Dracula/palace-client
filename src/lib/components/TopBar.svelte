@@ -41,6 +41,15 @@
       error = String(cause);
     }
   }
+
+  async function openPreferences() {
+    error = null;
+    try {
+      await api.openPreferences();
+    } catch (cause) {
+      error = String(cause);
+    }
+  }
 </script>
 
 <header class="topbar">
@@ -69,6 +78,7 @@
       Refresh
     </button>
     <button class="btn" type="button" onclick={() => (audioOpen = true)}>Audio…</button>
+    <button class="btn" type="button" onclick={openPreferences}>Preferences…</button>
     {#if error}<span class="topbar-error">{error}</span>{/if}
   </form>
 

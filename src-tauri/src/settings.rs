@@ -571,6 +571,39 @@ pub fn validate_soundfont(path: Option<&str>) -> Result<Option<PathBuf>, String>
     Ok(Some(candidate))
 }
 
+/// The SoundFont the engine should actually load, and whether a saved choice
+/// had to be dropped.
+///
+/// A chosen path wins while it is still a file on disk. When it has gone
+/// missing — a deleted file, an unmounted drive — the bundled bank is used
+/// instead, so a stale path in the shared settings file can never leave MIDI
+/// silent. The boolean is true only for that substitution, so the caller can
+/// warn once rather than on every read of the audio state.
+#[must_use]
+pub fn resolve_soundfont(chosen: Option<&Path>, bundled: Option<&Path>) -> (Option<PathBuf>, bool) {
+    match chosen {
+        Some(path) if path.is_file() => (Some(path.to_path_buf()), false),
+        Some(_) => (bundled.map(Path::to_path_buf), true),
+        None => (bundled.map(Path::to_path_buf), false),
+    }
+}
+
+/// Report a saved SoundFont that is gone, and what plays in its place.
+///
+/// This is the one warning the missing-font fallback emits; the log line names
+/// both the dead path and the bank that took over, so "why is the instrument
+/// different" is answerable from the diagnostic log alone.
+pub fn warn_missing_soundfont(chosen: &Path, fallback: Option<&Path>) {
+    let instead = match fallback {
+        Some(path) => format!("using the bundled bank at {}", path.display()),
+        None => "no bundled bank is available, so MIDI plays the fallback tone".to_string(),
+    };
+    warn(&format!(
+        "the chosen SoundFont {} is missing; {instead}",
+        chosen.display()
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,5 +1005,53 @@ mod tests {
         let error =
             validate_soundfont(Some(r"C:\some\dir\font.sf2")).expect_err("it is not on disk");
         assert!(error.contains(r"C:\some\dir\font.sf2"), "{error}");
+    }
+
+    #[test]
+    fn a_saved_soundfont_wins_while_it_is_still_on_disk() {
+        let directory = scratch("resolve-chosen");
+        let chosen = directory.join("mine.sf2");
+        let bundled = directory.join("bundled.sf2");
+        std::fs::write(&chosen, b"chosen").expect("the chosen font is writable");
+        std::fs::write(&bundled, b"bundled").expect("the bundled font is writable");
+
+        assert_eq!(
+            resolve_soundfont(Some(&chosen), Some(&bundled)),
+            (Some(chosen.clone()), false),
+            "the user's file is used and nothing is substituted"
+        );
+        assert_eq!(
+            resolve_soundfont(None, Some(&bundled)),
+            (Some(bundled.clone()), false),
+            "with no choice the bundled bank is used and no fallback is reported"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_missing_saved_soundfont_falls_back_to_the_bundled_bank() {
+        let directory = scratch("resolve-missing");
+        let bundled = directory.join("bundled.sf2");
+        std::fs::write(&bundled, b"bundled").expect("the bundled font is writable");
+        let gone = directory.join("deleted.sf2");
+
+        assert_eq!(
+            resolve_soundfont(Some(&gone), Some(&bundled)),
+            (Some(bundled.clone()), true),
+            "a stale path is replaced by the bundled bank and reported as substituted"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_missing_saved_soundfont_with_no_bundle_degrades_to_no_font() {
+        let directory = scratch("resolve-empty");
+        let gone = directory.join("deleted.sf2");
+        assert_eq!(
+            resolve_soundfont(Some(&gone), None),
+            (None, true),
+            "without a bundle the engine is left on its fallback tone, never a dead path"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

@@ -4,11 +4,13 @@
 //! into a JSON number array, which is orders of magnitude larger than the image
 //! itself. The webview fetches one already-encoded PNG per frame version.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::bag::BagSnapshot;
-use palace_client::{AvatarHash, AvatarImageStore, FrameStore};
+use palace_client::{AvatarHash, AvatarImageStore, FrameStore, ScreenState};
 use palace_prop::PropCatalog;
+use serde::Serialize;
 use tauri::http::{Request, Response, StatusCode};
 use tauri::UriSchemeResponder;
 
@@ -115,6 +117,75 @@ impl BagSlot {
             Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
+}
+
+/// The window that last reported a room-viewport size, and the epoch of that
+/// report.
+///
+/// A room-viewport report is not a passive observation: it changes the one
+/// process-global viewport the compositor builds geometry for, and the next
+/// `Screen` event carries geometry computed for *that* size. Exactly one room
+/// view is on screen at a time, so this slot names which window owns the frame
+/// and stamps every reply with a monotonically increasing epoch. The pump
+/// targets the reply at the owner (never broadcast) and the frontend drops a
+/// reply whose owner or epoch does not match what it last sent.
+#[derive(Clone, Default)]
+pub struct ViewportOwnerSlot {
+    inner: Arc<Mutex<Option<ViewportClaim>>>,
+    next_epoch: Arc<AtomicU64>,
+}
+
+impl ViewportOwnerSlot {
+    /// Record `owner` as the viewport owner and return the epoch of its claim.
+    ///
+    /// Epochs never repeat and never go backwards, so a reply carrying an older
+    /// epoch than the frontend has already accepted is provably stale.
+    pub fn claim(&self, owner: impl Into<String>) -> u64 {
+        let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let claim = ViewportClaim {
+            owner: owner.into(),
+            epoch,
+        };
+        match self.inner.lock() {
+            Ok(mut guard) => *guard = Some(claim),
+            Err(poisoned) => *poisoned.into_inner() = Some(claim),
+        }
+        epoch
+    }
+
+    /// The latest claim, if any window has reported a viewport.
+    #[must_use]
+    pub fn current(&self) -> Option<ViewportClaim> {
+        match self.inner.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+/// One window's viewport-owner claim: who reported, and at which epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewportClaim {
+    /// The window label that reported the viewport, e.g. `panel-room`.
+    pub owner: String,
+    /// The monotonic epoch assigned to that report.
+    pub epoch: u64,
+}
+
+/// The payload a room-viewport geometry reply travels under.
+///
+/// It is emitted with `emit_to` to `owner` only (see `lib::forward_screen`),
+/// not broadcast: a second window acting on geometry built for another
+/// viewport would re-report its own size and the two would fight over the one
+/// shared frame. `epoch` lets a late frontend drop a reply it has superseded.
+#[derive(Debug, Clone, Serialize)]
+pub struct GeometryReply {
+    /// The window the reply is for.
+    pub owner: String,
+    /// The epoch of the claim that produced this geometry.
+    pub epoch: u64,
+    /// The composited room screen, including geometry for the owner's viewport.
+    pub screen: ScreenState,
 }
 
 /// Route a `palace://localhost/<path>` request.
@@ -372,6 +443,7 @@ fn status(code: StatusCode) -> Response<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::bag::BagShelfInfo;
+    use palace_client::ViewGeometry;
     use palace_prop::bag_catalog::{BagCatalog, BagCollection};
     use palace_prop::prp::{AssetRec, PropHeader, PropRecord, Roster};
 
@@ -635,6 +707,75 @@ mod tests {
                 "{path} must not resolve"
             );
         }
+    }
+
+    #[test]
+    fn a_claim_names_the_owner_and_advances_the_epoch_monotonically() {
+        let slot = ViewportOwnerSlot::default();
+        assert_eq!(slot.current(), None, "nothing owns the viewport at startup");
+
+        let first = slot.claim("main");
+        assert_eq!(
+            slot.current(),
+            Some(ViewportClaim {
+                owner: "main".to_string(),
+                epoch: first
+            })
+        );
+
+        let second = slot.claim("panel-room");
+        assert!(second > first, "a later claim carries a higher epoch");
+        assert_eq!(
+            slot.current(),
+            Some(ViewportClaim {
+                owner: "panel-room".to_string(),
+                epoch: second
+            }),
+            "the latest claim wins"
+        );
+
+        let third = slot.claim("main");
+        assert!(third > second, "epochs never go backwards");
+        assert_eq!(slot.current().map(|claim| claim.owner), Some("main".into()));
+    }
+
+    #[test]
+    fn a_geometry_reply_serializes_its_owner_and_epoch() {
+        let reply = GeometryReply {
+            owner: "panel-room".to_string(),
+            epoch: 4,
+            screen: ScreenState {
+                version: 1,
+                mid_version: None,
+                top_version: None,
+                room_id: 1,
+                room_name: "Lobby".to_string(),
+                avatars: 0,
+                loose_props: 0,
+                props_pending: 0,
+                notes: Vec::new(),
+                geometry: ViewGeometry {
+                    room_w: 100.0,
+                    room_h: 80.0,
+                    viewport_w: 640.0,
+                    viewport_h: 480.0,
+                    dpr: 1.0,
+                    zoom: 1.0,
+                    native: false,
+                    scale: 1.0,
+                    content_x: 0.0,
+                    content_y: 0.0,
+                    content_w: 100.0,
+                    content_h: 80.0,
+                    bitmap_w: 100,
+                    bitmap_h: 80,
+                },
+            },
+        };
+        let json = serde_json::to_value(&reply).expect("a reply serializes");
+        assert_eq!(json["owner"], "panel-room");
+        assert_eq!(json["epoch"], 4);
+        assert_eq!(json["screen"]["room_name"], "Lobby");
     }
 
     #[test]

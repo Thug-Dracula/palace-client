@@ -3,8 +3,12 @@
 
   import PanelHost from "./PanelHost.svelte";
   import PanelWindow from "./PanelWindow.svelte";
+  import HomePalaceOffer from "./components/HomePalaceOffer.svelte";
   import StatusBar from "./components/StatusBar.svelte";
   import TopBar from "./components/TopBar.svelte";
+  import PreferencesWindow from "./components/prefs/PreferencesWindow.svelte";
+  import * as api from "./api";
+  import { applyAppearance, appearanceFrom } from "./appearance";
   import { detachedAttr, trackStyle } from "./layout";
   import { viewForHash } from "./panels";
   import { panelLayout } from "./panelLayout.svelte";
@@ -70,22 +74,45 @@
     event.preventDefault();
   }
 
+  async function syncAppearance() {
+    try {
+      applyAppearance(appearanceFrom(await api.getPrefs()));
+    } catch {
+      // Appearance is cosmetic; a failed read must not break the shell.
+    }
+  }
+
   onMount(() => {
     // The main shell seeds itself; a detached panel is seeded by PanelWindow.
-    // Both call the same startSession helper — only `main` also owns the
-    // global zoom keys, which resize the main window through `set_ui_scale`.
+    // Both call the same startSession helper. Keyboard shortcuts are bound per
+    // window (see the `svelte:window` tag below): a keypress reaches only the
+    // focused webview, so a detached panel can never drive the main window's
+    // zoom. There is deliberately no global input hook in Rust.
     const isMain = view.kind === "main";
     const session = isMain ? startSession() : undefined;
     // Rust tells `main` when a panel window closes; docking it again keeps the
     // re-attach path (button or titlebar) from ever losing the panel.
     const stopPanelClose = isMain ? panelLayout.startCloseListener() : undefined;
+    // The detach grid must reflect what Rust restored on this launch, and any
+    // later change made in another window (a Preferences layout reset, for
+    // example). Subscribe first, then seed, so an event that fires during the
+    // read is not lost.
+    const stopLayout = isMain ? panelLayout.startLayoutListener() : undefined;
     if (isMain) {
+      void panelLayout.seedFromBackend();
       window.addEventListener("wheel", onWheel, { passive: false });
+      // Appearance is edited in the Preferences window; re-reading it when this
+      // window regains focus is what makes such a change show up here without a
+      // relaunch.
+      void syncAppearance();
+      window.addEventListener("focus", syncAppearance);
     }
     return () => {
       session?.stop();
       stopPanelClose?.();
+      stopLayout?.();
       window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("focus", syncAppearance);
     };
   });
 </script>
@@ -94,9 +121,12 @@
 
 {#if view.kind === "panel"}
   <PanelWindow panel={view.panel} />
+{:else if view.kind === "prefs"}
+  <PreferencesWindow />
 {:else}
   <div class="app">
     <TopBar />
+    <HomePalaceOffer />
     <div class="workspace" data-detached={detachedList} style={workspaceStyle}>
       <PanelHost panel="rooms" detached={detachedIds.includes("rooms")} />
       <div class="center">

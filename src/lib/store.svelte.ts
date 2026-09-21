@@ -1,3 +1,14 @@
+import { listen } from "@tauri-apps/api/event";
+
+import { chatLineAlreadySeen } from "./chat";
+import { isGuestName, type GraphicsPrefs } from "./graphicsPrefs";
+import {
+  DEFAULT_IGNORE_ALL,
+  PREFS_CHANGED_EVENT,
+  mutePrefsFrom,
+  suppressesMessage,
+  type MutePrefs,
+} from "./mutePrefs";
 import type {
   AudioState,
   AvatarRoster,
@@ -11,6 +22,7 @@ import type {
   ClientEvent,
   ConnectionStatus,
   GatherResult,
+  GeometryReply,
   RoomInfo,
   ScreenState,
   ServerBanner,
@@ -34,6 +46,22 @@ export const faceColor = (index: number): string => {
   const n = FACE_COLORS.length;
   return FACE_COLORS[((index % n) + n) % n];
 };
+
+/**
+ * Whether a room-viewport geometry reply may be applied to this window.
+ *
+ * A reply is accepted only when it names this window AND is at least as new as
+ * the last one accepted. A foreign owner (a reply that leaked from another
+ * window) or a lower epoch (a reply the window has already superseded) is
+ * dropped, so stale or other-window geometry is never drawn or re-reported.
+ */
+export function acceptsGeometry(
+  myLabel: string,
+  lastEpoch: number,
+  reply: Pick<GeometryReply, "owner" | "epoch">,
+): boolean {
+  return reply.owner === myLabel && reply.epoch >= lastEpoch;
+}
 
 export interface LocalChatLine extends ChatLine {
   pending?: boolean;
@@ -84,6 +112,19 @@ class PalaceStore {
   native = $state(false);
   showNames = $state(true);
   showAvatars = $state(true);
+  showGuests = $state(true);
+
+  /**
+   * The live ignore rules.
+   *
+   * Seeded from the settings file and kept in step with the Preferences
+   * window through the `palace://prefs` broadcast, so a detached chat window
+   * applies a list that was edited in another window without a restart.
+   */
+  mute = $state<MutePrefs>({ ignoreAll: DEFAULT_IGNORE_ALL, identities: [] });
+
+  private muteStarted = false;
+  private muteStop: (() => void) | undefined;
 
   viewport = { width: 960, height: 540, dpr: 1 };
 
@@ -105,10 +146,134 @@ class PalaceStore {
     return this.users.find((user) => user.is_self) ?? null;
   }
 
+  /**
+   * The roster the In room list draws, with the guest filter applied.
+   *
+   * `showGuests` defaults to true, so an untouched install lists everybody,
+   * exactly as before. The signed-in user is always listed, even when their
+   * own name reads as a guest name, because hiding yourself from your own list
+   * is never what the option means. Guest names are display labels only; the
+   * full roster stays in {@link users} for everything else (room counts, self
+   * lookup, props).
+   */
+  get visibleUsers(): UserInfo[] {
+    if (this.showGuests) {
+      return this.users;
+    }
+    return this.users.filter((user) => user.is_self || !isGuestName(user.name));
+  }
+
+  /**
+   * Apply a stored graphics block to the live session.
+   *
+   * This is the live seam for the three supported options: storing a change
+   * (load, save echo, restore defaults) calls this, the name/avatar mirrors
+   * follow, and the backend re-composes the room frame through the existing
+   * `set_visibility` command. Only name/avatar changes reach the backend — the
+   * guest filter is client-side — and a change the store already holds is not
+   * re-sent.
+   */
+  applyGraphics(graphics: GraphicsPrefs): void {
+    const changed =
+      this.showNames !== graphics.showNames || this.showAvatars !== graphics.showAvatars;
+    this.showNames = graphics.showNames;
+    this.showAvatars = graphics.showAvatars;
+    this.showGuests = graphics.showGuests;
+    if (changed) {
+      void api.setVisibility(this.showNames, this.showAvatars).catch(() => {});
+    }
+  }
+
+  /**
+   * Show or hide names and avatars from the room menu: apply now, then persist.
+   *
+   * The server call is the live part (the frame re-composes); the write keeps
+   * the choice for the next launch. A failed write leaves the live change in
+   * place — the user asked for it and it is already on screen — it only means
+   * the choice is not remembered, and the Preferences group reports that.
+   */
   setVisibility(names: boolean, avatars: boolean): void {
     this.showNames = names;
     this.showAvatars = avatars;
     void api.setVisibility(names, avatars).catch(() => {});
+    void this.persistGraphics({ show_names: names, show_avatars: avatars });
+  }
+
+  /** Additively persist a `graphics.*` patch; returns whether the write landed. */
+  async persistGraphics(patch: Record<string, boolean>): Promise<boolean> {
+    try {
+      await api.setPrefs({ graphics: patch });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Apply the ignore rules the Preferences group resolved.
+   *
+   * Same live seam as {@link applyGraphics}: the group persists a change, the
+   * echo comes back, and this makes the running session follow.
+   */
+  applyMute(next: MutePrefs): void {
+    this.mute = next;
+  }
+
+  /**
+   * Load the persisted ignore list once, then follow later changes.
+   *
+   * Every webview is a peer view with its own mirror, so each window seeds
+   * itself before it can drop a message, and the broadcast keeps a window that
+   * never opened Preferences in step with one that did. Outside a Tauri host
+   * the subscribe fails and is ignored, so the store still works in tests.
+   */
+  startMuteRules(): void {
+    if (this.muteStarted) {
+      return;
+    }
+    this.muteStarted = true;
+    void this.seedMuteRules();
+    void this.watchMuteRules();
+  }
+
+  /** Forget the rules and allow seeding again (a restart, or a test). */
+  resetMuteRules(): void {
+    this.mute = { ignoreAll: DEFAULT_IGNORE_ALL, identities: [] };
+    this.muteStarted = false;
+    this.muteStop?.();
+    this.muteStop = undefined;
+  }
+
+  private async seedMuteRules(): Promise<void> {
+    try {
+      this.applyMute(mutePrefsFrom(await api.getPrefs()));
+    } catch {
+      // No bridge or no file yet: the shipped defaults stay in force.
+    }
+  }
+
+  private async watchMuteRules(): Promise<void> {
+    try {
+      const stop = await listen<Record<string, unknown>>(PREFS_CHANGED_EVENT, (event) => {
+        this.applyMute(mutePrefsFrom(event.payload));
+      });
+      if (this.muteStarted) {
+        this.muteStop = stop;
+      } else {
+        stop();
+      }
+    } catch {
+      // No Tauri event bridge in this host; there is nothing to listen to.
+    }
+  }
+
+  /** Whether this mirror must drop `line`: an ignored sender's message. */
+  suppresses(line: ChatLine): boolean {
+    const self = this.self;
+    return suppressesMessage(this.mute, line, {
+      name: self?.name ?? this.settings.username,
+      user_id: self?.id ?? this.banner?.user_id,
+    });
   }
 
   setProps(props: number[]): void {
@@ -299,7 +464,14 @@ class PalaceStore {
     return applied;
   }
 
+  /** Store a composed room screen and fold its notes into the store. */
+  applyScreen(screen: ScreenState): void {
+    this.screen = screen;
+    this.notes = screen.notes;
+  }
+
   apply(event: ClientEvent): void {
+    this.startMuteRules();
     switch (event.type) {
       case "status":
         this.status = event.status;
@@ -327,8 +499,7 @@ class PalaceStore {
         this.pushLine(event.line);
         break;
       case "screen":
-        this.screen = event.screen;
-        this.notes = event.screen.notes;
+        this.applyScreen(event.screen);
         break;
       case "avatars":
         this.avatars = event.roster;
@@ -353,6 +524,17 @@ class PalaceStore {
   }
 
   pushLine(line: ChatLine): void {
+    // The one suppression point: a dropped line never reaches any view, so the
+    // docked panel and every detached one agree by construction.
+    if (this.suppresses(line)) {
+      return;
+    }
+    // A window opened late is seeded by the backend replay, and that replay is
+    // broadcast to every window. Skip a line this mirror already holds so the
+    // late window's `refresh()` cannot duplicate history in its siblings.
+    if (chatLineAlreadySeen(this.chat, line)) {
+      return;
+    }
     if (line.kind === "talk" && line.user_id === this.banner?.user_id) {
       const index = this.chat.findIndex(
         (candidate) => candidate.pending && candidate.text === line.text,
