@@ -1,6 +1,6 @@
 # STATUS.md — where this project stands
 
-**Last updated:** 2026-09-20
+**Last updated:** 2026-09-21
 **Version:** 0.2.0 (declared). Next intended: **0.3.0 as a pre-release** — see "Version" below.
 
 This is the single place to look for the state of the project. If this file and
@@ -40,6 +40,12 @@ misleading once. The test is whether the user can click a button and have it wor
 | **Crash-safe logging** | `~/.local/share/org.palace.client/logs/palace-client.log` — written live, flushed per line, panic hook installed |
 | **Test suite** | ~500 tests green across the affected crates; wire byte-exact oracle tests intact |
 | **Avatars drawn as sprites, not baked** | Room split into base/mid/top layers plus a small avatar roster; the webview draws bodies, props, faces and name tags over the picture. A layer's version only changes when its content does — measured live: the base version held at `1` across repeated composes and ticked to `2` only on a real change |
+| **Detachable panels** — the room view, users, rooms, chat and prop bag can each open in its own OS window; closing one (its button or its titlebar) docks it back; a panel that dies on its own re-docks instead of leaving a gap | `.omo/evidence/task-18-close-semantics.txt`, `src-tauri/tests/layout_lifecycle.rs`, `src/lib/dockReflow.dom.test.ts` |
+| **One session across every window** — all windows share the one connection; a reconnect refreshes all of them; an incoming sound plays once, not once per window | `.omo/evidence/task-28-integration.txt`, `.omo/evidence/task-28-reconnect.txt`, `src-tauri/tests/cross_window_integration.rs` |
+| **Layout memory** — window positions and which panels were detached survive a restart (pulled back on-screen if a monitor is gone); "remember layout" off stops the writing; "reset layout" re-docks everything at once | `.omo/evidence/task-27-layout-reset.txt`, `.omo/evidence/task-27-layout-off.txt`, `src-tauri/tests/geometry_persistence.rs` |
+| **Preferences window, ten groups** — Connection & identity, Appearance, Room & graphics, Sound, Chat logging, Avatar & prop, Mute/ignore, Notifications, Layout memory, Preferences shell. Live groups apply at once; connection changes are saved for the next connect and raise "Reconnect required" | `.omo/evidence/task-19-prefs-shell.txt` … `task-27-*.txt`, `src/lib/prefsShell.dom.test.ts` |
+| **Every panel names its empty / disconnected state** — "Nobody here." / "Not connected.", "No room list yet.", "No rooms match …", "Chat appears here once connected.", "No props in your bag yet.", "Waiting for a room" / "Offline" — instead of a blank box | `src/lib/emptyStates.dom.test.ts` (8 tests), `src/lib/components/userList.dom.test.ts` |
+| **Detached panels and Preferences actually render** (fixed 2026-09-21) — before the fix they loaded the SPA at a path SvelteKit answered with its own 404 page | `windows.rs::tests::every_route_keeps_the_document_at_the_spa_root`, `.omo/evidence/task-29-boot.txt` |
 
 ## What is broken — open
 
@@ -57,15 +63,37 @@ misleading once. The test is whether the user can click a button and have it wor
 - Whether the new movement path *feels* right. The behaviour is pinned by tests and a live trace, but only the user can judge the feel — not yet reported.
 - Why the arena (`#31747`) produces a full-room, **opaque top layer** (3,146,804 bytes there, `0` everywhere else). Not diagnosed. Anything that changes in that band would re-send it. Prime suspect: the arena's fetched interface overlay.
 - Whether the rollback switch works. `PALACE_BAKE_AVATARS=1` restores baked avatars; untested end-to-end.
+- **No human has clicked through the modularity work.** Detached panels and the
+  Preferences window are verified by tests and headless runs (DOM tests, the
+  Rust window harness, and the log from a real launch on a virtual display), but
+  nobody has yet *seen* a real second window, moved it, or used a preference
+  group by hand. That is F3's step and it is asked of the user (see "Needs a
+  human").
+- **How the original PalaceChat treats the extra `prefs` block** in the shared
+  settings file is unproven: this client only adds keys and never edits
+  PalaceChat's own, but whether the closed-source sibling tolerates an unknown
+  block cannot be tested from here (see `PREFERENCES.md` → Risks 2).
+- **The multi-window test harness may not be display-isolated on a machine with
+  a live Wayland session.** `xvfb-run` sets `DISPLAY`, but GTK3 falls back to
+  the live `wayland-0` socket when `WAYLAND_DISPLAY` is unset, so a harness run
+  can land on the real desktop unless `GDK_BACKEND=x11` is forced. The
+  geometry tests already force it; the shared harness and CI do not. Found
+  during Task 29, not fixed here (out of scope) — evidence and reproduction in
+  `.omo/evidence/task-29-boot.txt`.
 
 ## Version
 
 Staying at **0.2.0** until the main flow works. The next release should be
 **0.3.0 as a pre-release**, because the client gained real capability (own
-identity, correct guest list, complete instruction coverage) but the headline
-flow — join a room and click — still fails. Do not call anything 1.0 while that
+identity, correct guest list, complete instruction coverage, and now a
+multi-window shell with a Preferences window) but the headline flow — join a
+room and click — still fails. Do not call anything 1.0 while that
 is true. A version number is a promise; only raise it for a measurable,
 user-visible leap, and say what the leap is.
+
+The modularity work (2026-09-20/21) is a shell-and-settings leap, not a fix for
+the headline flow, so it was deliberately **not** version-bumped by the docs
+task that recorded it. The 0.3.0 pre-release intent above is unchanged.
 
 ## The lesson this project taught
 
@@ -354,7 +382,7 @@ move we apply locally first and should beat PalaceChat — already proven on
 
 ### Prop bag & prop editor (2026-09-20)
 
-**Shipped and verified** (plan: `.omo/plans/prop-bag.md`; 39 tasks).
+**Shipped and verified** (plan: `.omo/plans/prop-bag.md`; 41 tasks).
 
 - **`.prp` read + write** — a no-op parse→write is **byte-identical over all 15 real
   collections** (including Palace.prp, 66,885 records / 74 MB). Record order is
@@ -416,10 +444,22 @@ never be driven by an agent):
    try favourite, trash and restore.
 4. **Decide on `ALLBLACK`** in `Palace - Hidden.PRP` — keep, delete, or restore from
    a backup. Do **not** CRC-repair it (see the CRC-repair entry above).
+5. **Detach a panel.** In a connected room, click the detach control in a panel
+   header (the ⧉ mark) for each of the five panels in turn. Check: each opens as
+   its own OS window showing that panel, both windows stay live, closing the
+   panel from its own titlebar puts it back in the dock, and nothing is left
+   duplicated. Then restart and check the layout comes back the way you left it.
+6. **Walk the Preferences window.** Click **Preferences…** in the top bar and
+   open all ten groups. Check: a change in Appearance (colour, text size) shows
+   in the main window at once; a Mute/ignore entry hides that person's messages;
+   changing the host says "Reconnect required" instead of reconnecting; the
+   controls marked **Not supported** are visibly disabled and say why.
+7. **Say whether the multi-window shell feels right.** This is the one thing no
+   test can judge (F3's step).
 
 For reference, `tools/ui-visual-check/capture.sh` writes screenshots of all four
-surfaces to `tools/ui-visual-check/out/` — that shows what they *render* like, but
-not what they *feel* like.
+prop-bag surfaces to `tools/ui-visual-check/out/` — that shows what they *render*
+like, but not what they *feel* like.
 
 ### Parked
 
@@ -429,5 +469,128 @@ not what they *feel* like.
 
 `5a75f64` — 21 files, the whole avatar change (3,474 insertions, 564 deletions).
 Previous save point: `8e494f2`. Not published; this repository does not auto-publish.
+
+---
+
+## Update — 2026-09-20/21 — detachable panels and the Preferences window
+
+Plan: `$HOME/.omo/plans/palace-client-modularity.md` (Tasks 13–28).
+Save point: **`44d76ac`** ("feat(windows): detachable panels, layout memory, and
+preferences"). Task 29 (docs, boot order, empty states) landed on top of it
+uncommitted; the orchestrator makes the save point.
+
+### What a user can now do
+
+- **Detach a panel.** The room view, the users list, the rooms list, the chat
+  log and the prop bag each open in their own OS window. They are peer views of
+  the one session, so they update together, a reconnect refreshes all of them,
+  and a sound plays once. Closing a panel — its button or its own titlebar —
+  docks it back into the main window. A panel whose window dies on its own is
+  re-docked automatically instead of leaving a dead placeholder.
+  Evidence: `.omo/evidence/task-28-integration.txt`,
+  `.omo/evidence/task-28-reconnect.txt`, `task-18-close-semantics.txt`;
+  locked by `src-tauri/tests/cross_window_integration.rs` and
+  `src-tauri/tests/layout_lifecycle.rs`.
+- **The layout is remembered.** Window positions, sizes and which panels were
+  detached come back on the next launch, pulled back on-screen if a monitor is
+  gone. "Remember layout" off genuinely stops the file being written; "reset
+  layout" re-docks everything immediately. Evidence:
+  `.omo/evidence/task-27-layout-reset.txt`, `task-27-layout-off.txt`,
+  `task-18-restore-layout.txt`; locked by
+  `src-tauri/tests/geometry_persistence.rs`.
+- **A Preferences window with ten groups.** Connection & identity, Appearance,
+  Room & graphics behaviour, Sound, Chat logging, Avatar & prop behaviour,
+  Mute/ignore, Notifications, Layout memory, Preferences shell. Live groups
+  apply as soon as they are changed; connection changes are saved for the next
+  connect and say "Reconnect required" instead of silently reconnecting.
+  Evidence: `.omo/evidence/task-19-prefs-shell.txt`,
+  `task-20-connection-identity.txt`, `task-21-appearance.txt`,
+  `task-22-graphics-toggles.txt`, `task-23-sound.txt`, `task-24-chat-log.txt`,
+  `task-25-ignore.txt`, `task-26-notifications.txt`,
+  `task-27-layout-reset.txt`; only the unsupported controls are disabled, and
+  each says why.
+- **Every panel has a clean empty / disconnected state.** "Nobody here." /
+  "Not connected.", "No room list yet.", "No rooms match …", "Chat appears here
+  once connected.", "No props in your bag yet.", "Waiting for a room" /
+  "Offline". Locked by `src/lib/emptyStates.dom.test.ts` (8 tests) plus the
+  per-panel DOM tests.
+
+### A real defect found and fixed while writing this section
+
+Detached panels and the Preferences window **rendered SvelteKit's own "404 Not
+Found" page**, not the panel. Their windows were opened at
+`index.html#/panel/…`; Tauri only treats the literal `index.html` as the root
+document, so the webview's document path became `/index.html` and the SPA's
+router answered it with a 404 before anything could mount. The route is now a
+bare fragment (`#/panel/…`, `#/prefs`), so the document stays at `/` and the
+route travels in the hash — which is what the frontend reads.
+
+Proof: headless Chromium against the built SPA rendered "404 / Not Found" for
+the old path and "IN ROOM 0 / Not connected." for the new one; a real launch
+after the fix seeds all three windows (`refresh_requested epoch=1, 2, 3`).
+Regression test `every_route_keeps_the_document_at_the_spa_root` fails if the
+old form returns. Full record: `.omo/evidence/task-29-boot.txt`.
+
+### Boot order, documented (measured, not assumed)
+
+`WINDOWS-ARCHITECTURE.md` §6.2 now records the real order: logging first;
+settings/identity; the main window already exists (Tauri creates it before
+`setup`); layout read and restored **inline** (Tauri runs a main-thread request
+immediately when the caller is already the main thread); the client starts;
+then the deferred after-map re-apply; then each window seeds once. The plan's
+prose "layout restore → window creation → connection" was an idealisation; the
+document now states what a launch log shows.
+
+### Verified for this section
+
+- `cargo fmt -p palace-app -- --check` — clean.
+- `cargo clippy -p palace-app --all-targets -- -D warnings` — clean.
+- `cargo test -p palace-client` — **271 passed, 0 failed**.
+- `env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1920x1080x24" cargo test -p palace-app`
+  — **281 passed, 0 failed** across 17 test binaries (one more than the 280
+  measured before Task 29: the new route regression test).
+- `bun run check` — 0 errors, 0 warnings; `bun run test` — **491 passed in 52
+  files** (the modularity baseline was 483/51; Task 29 adds
+  `emptyStates.dom.test.ts`).
+- The empty-state tests, run specifically: 52 passed across 7 panel test files.
+
+### Not proven (stated plainly)
+
+- Nobody has used the detached panels or the Preferences window by hand. The
+  tests prove the machinery, the DOM and the log order; only a person can say
+  the windows look and feel right (see "Needs a human", steps 5–7).
+- The `build/` SPA was rebuilt from the current tree for the Task 29 evidence,
+  because the checked-in `build/` predated the panel work.
+- Two out-of-scope findings are recorded in `.omo/evidence/task-29-boot.txt`:
+  the harness/CI display-isolation gap (GTK can pick the live Wayland session
+  unless `GDK_BACKEND=x11` is forced), and the `settings.json.bak` state of the
+  user's config on this machine.
+
+### Found but not fixed (out of Task 29's scope — for F1–F4)
+
+1. **`cargo test -p palace-app` overwrites the shared `settings.json`.**
+   `src-tauri/tests/cross_window_integration.rs:150` builds its app state from
+   `Settings::from_env()` (no identity, host `localhost`, user `Guest`) and
+   its `connect` invoke (line 305) reaches `commands::connect` →
+   `commands::persist_best_effort` (`src-tauri/src/commands.rs:81`), which
+   saves to the real config path. Observed twice: an app-suite run at 18:27
+   and this task's gate run at 20:15:56, each leaving a 155-byte file with
+   `"identity": null`. The suite should run against a scratch
+   `XDG_CONFIG_HOME` (that is how every safe probe in Task 29 ran). **This is
+   the user's live, shared config**: the original values, including the
+   identity this client and PalaceChat shared, survive in
+   `~/.config/org.palace.client/settings.json.bak`. Restoring them is one
+   copy — `cp ~/.config/org.palace.client/settings.json.bak
+   ~/.config/org.palace.client/settings.json` — and is left to the user
+   because it is their live configuration.
+2. **The multi-window harness and CI do not force `GDK_BACKEND=x11`.** The
+   per-test children do (`geometry_persistence.rs:618`,
+   `layout_lifecycle.rs:1435`), but the shared harness proves the display is
+   virtual without making GDK use it, and GTK3 can otherwise prefer the live
+   `wayland-0` socket. On a machine with a real session, harness windows can
+   land on the desktop. Reproduced with a GTK probe (display `wayland-0` vs
+   `:99`); the details and the reproduction are in
+   `.omo/evidence/task-29-boot.txt`.
+
 
 

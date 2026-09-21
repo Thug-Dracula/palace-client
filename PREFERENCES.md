@@ -106,16 +106,65 @@ The ten names above are the group names. Every row carries a valid apply value.
 Every row in the Connection & identity group is connection-scoped and therefore
 carries `reconnect`.
 
+## Implementation status — reconciled 2026-09-21
+
+This section records what is actually shipped, so nothing here describes an
+unimplemented control as working. All ten groups are wired into the Preferences
+window and reachable (`prefsShell.dom.test.ts`; every id in the registry has a
+component branch in `PreferencesWindow.svelte`). "Disabled" below means a real
+control rendered inoperative with a visible **Not supported** marker and a
+one-line reason; the option is still stored with its default so the document
+matches this specification, but no behaviour backs it.
+
+| Group | Shipped | Live keys (behaviour exists) | Deliberately disabled / unsupported |
+|---|---|---|---|
+| Connection & identity | yes | `host`, `port`, `username` (reconnect-scoped); `identity` (read-only fingerprint); `prefs.connection.last_servers` (cap 8, newest first), `home_palace`, `auto_connect` | Nothing: the no-password rule is test-pinned (`connection_prefs.rs`). Home palace never connects on its own — the launch banner needs an explicit Connect. |
+| Appearance | yes | `prefs.appearance.theme`, `font_family`, `font_size_px`, `ui_scale`, `fullscreen`, and `appearance.tokens` | Nothing. The five documented keys are used as written; `appearance.tokens` is an extra key (see the note below). Defaults reproduce today's look (a test reads `tokens.css` and compares value-for-value). |
+| Room & graphics behaviour | yes | `prefs.graphics.show_names`, `show_avatars`, `show_guests` | `animation`, `tinted_balloons`, `balloon_delay` — this build draws one still frame per prop and its bubbles are neither clock-expired nor per-speaker tinted. A test asserts these keys are never written. |
+| Sound | yes | `soundfont`, `audio_enabled`, `audio_volume` — the engine's one volume source | `prefs.sound.sfx_volume`, `music_volume`, `speech_voice` — the engine has a single volume and there is no speech integration. A saved SoundFont that has gone missing falls back to the bundled bank with a `WARN` that names both paths; the UI shows which case is in effect. |
+| Chat logging | yes | `prefs.chat_log.to_file`, `path`, `max_bytes`, `rotate_files` | Nothing. The in-memory log (500 lines) needs no key; the transcript is `chat-transcript.log`, a separate file from the diagnostic log, and every write is flushed before the call returns. |
+| Avatar & prop behaviour | yes (as a marked-unsupported group) | none | `prefs.avatar.prop_animation` and `saved_avatar_slots` are both disabled with reasons: no multi-frame playback, no stored slots. The group writes neither. |
+| Mute/ignore | yes | `prefs.mute.ignore_all`, `mute.identities` | Matching by account identity (the protocol carries no stable id), server-side mute (no command; the classic client was local too), and hiding the ignored user's avatar/motion (**muting hides messages only**). Suppression happens at the store's single reduction point, so every view agrees. |
+| Notifications | yes (opt-in, default off) | `prefs.notifications.enabled`, `on_mention`, `private_message` | `prefs.notifications.sound` — the OS owns its notification sound and exposes no choice. The key is stored with its default but the control is disabled. Notifications are fired from the Rust pump, never per window, so one message makes one notification. |
+| Layout memory | yes | the layout file, not `settings.json`: per-window geometry, detach flags, detach order, `remember`, and the `prefs` window's own rectangle | Nothing. "Remember layout" off genuinely stops all writes except the one that records the flag (see the corrected file section below). |
+| Preferences shell | yes | `prefs.shell.last_group` | Nothing. |
+
+Notes that matter in practice:
+
+- **`appearance.tokens` is a deliberate extra key.** This specification lists
+  only `theme` as a string, which cannot carry per-colour values, and the
+  appearance task requires editable colour tokens. It is an object of hex
+  colours, defaulting to empty (the compiled defaults live in `tokens.css`).
+- **"Restore defaults" resets every group except a nested map.** It writes
+  `default_prefs()` through the additive merge, and the merge is recursive, so
+  `appearance.tokens` (an object) is not cleared by an empty default, and the
+  `prefs.connection.*` keys are not in `default_prefs()` at all. Scalar keys in
+  all other groups do reset. Pinned by
+  `the_appearance_defaults_match_the_specification`.
+- **The identity is minted on first launch.** `ensure_identity` generates and
+  persists one when the file has none. That write is the only settings write at
+  startup; with an identity present, launch writes nothing.
+
 ## Layout memory lives in its own file
 
 The plan requires panel positions and sizes to persist, but also forbids writing
 geometry into the shared `settings.json` (Task 7). The layout record therefore
-goes to a sibling file in the same config directory:
+goes to a sibling file in the same config directory. **Corrected 2026-09-21 to
+the shipped names and shape:**
 
-- Path: `~/.config/org.palace.client/layout.json`.
-- Shape: `{ "windows": { "<label>": { "x", "y", "w", "h", "monitor", "detached" } }, "panel_order": [ ... ] }`.
-- Write timing: debounced on move and resize, and once on window close.
-- Restore timing: at startup, clamped onto an available monitor.
+- Path: `~/.config/org.palace.client/window-layout.json` (the specification
+  said `layout.json`; the shipped constant is
+  `geometry::LAYOUT_FILE = "window-layout.json"`). `PALACE_LAYOUT_FILE`
+  overrides the whole path.
+- Shape: `{ "version": 1, "remember": true, "order": ["users", "chat"],
+  "windows": { "<label>": { "x", "y", "w", "h", "monitor", "detached" } } }`.
+  The specification's `panel_order` is shipped as `order`, and `remember` is
+  the Layout memory group's flag (default `true`, so an old file behaves as it
+  did).
+- Write timing: debounced on move and resize (at most every 600 ms), and once
+  synchronously on window close. Writes are atomic (temp file then rename).
+- Restore timing: inside `setup`, before the client starts, clamped onto an
+  available monitor. See `WINDOWS-ARCHITECTURE.md` §6.2 for the measured order.
 - Share-safe: `separate`. PalaceChat never reads this file, and this client never
   merges it into `settings.json`.
 
@@ -157,56 +206,55 @@ These rules are mandatory for Task 8 and any future writer of `settings.json`.
     window geometry (Task 7) must not be folded into `settings.json` or into the
     diagnostic log.
 
-## What the writer does today and why it is a risk
+## What the writer used to do, and what it does now (Task 8 — DONE)
 
-This is stated plainly because Task 8 exists to fix it, and because the shared
-file makes it user-visible.
+The list below is the historical hazard this document was written to expose.
+**Task 8 replaced all of it**; the section is kept because the risks explain why
+the write contract is worded so strictly, and the fourth bullet is still true.
 
-- **The current `save()` does not preserve unknown keys.** It serialises the
-  whole typed `Settings` struct with `serde_json::to_string_pretty`
-  (`settings.rs:323`) and writes that over the file. Any key that is not a field
-  on the struct is silently dropped on the next write. So today, changing the
-  volume, choosing a SoundFont, or connecting can delete a sibling-client key.
-  This is not hypothetical: it is the behaviour of the code as it stands.
-- **There is no backup today.** `save()` (`settings.rs:316-331`) writes straight
-  over the target through a temp file; it never keeps a copy of what was there.
-- **There is no schema version today.** Nothing in the file records which client
-  wrote a given key, so a migration cannot tell new from old.
-- **The prop-bag work added no settings keys.** The pre-start refresh note for
-  this plan records that the prop bag lives in its own folder and `BagSlot`, not
-  in `settings.json`. So the additive merge and the backup are genuinely new, not
-  a switch to turn on.
-- **Formatting is not byte-stable today.** Fields are written in struct order
-  with two-space indentation. A file edited by another client will not survive a
-  current write byte-for-byte. The definition of done for the plan requires the
-  keys PalaceChat uses to be byte-identical after this work, which is exactly
-  what the additive merge must deliver.
+- ~~**`save()` did not preserve unknown keys.**~~ Now `settings::save` and
+  `settings::update_prefs` read the file as a generic JSON map, merge only our
+  keys, and write the merged document back, preserving every foreign key and its
+  order (pinned by `settings_persistence.rs` and the writer tests in
+  `settings.rs`).
+- ~~**There was no backup.**~~ A one-time `.bak` is written beside the file
+  before the first modified write (`BACKUP_SUFFIX`, `settings.rs:494`). This was
+  observed in practice during Task 29: `settings.json.bak` holds the user's
+  pre-client values while `settings.json` holds the merged document.
+- ~~**There was no schema version.**~~ `settings::update_prefs` stamps
+  `prefs.schema_version = 1` when the block has none, and never overwrites an
+  existing version (`PREFS_SCHEMA_VERSION`, `settings.rs:39`).
+- **The prop-bag work added no settings keys.** Still true: the prop bag lives
+  in its own folder and `BagSlot`, not in `settings.json`.
+- ~~**Formatting was not byte-stable.**~~ The merge rewrites the document with
+  two-space indentation, and the tests pin that foreign keys and their relative
+  order survive. The environment-is-weakest, then file, then command-line
+  precedence is unchanged (`settings.rs:246-264`).
 
 ## Risks
 
-1. **Silent deletion of sibling keys (live today).** Until Task 8 lands, a
-   settings write can drop any key the struct does not declare, because
-   `settings.rs:323` serialises the struct and overwrites. Owner: Task 8.
-   Mitigation: additive map merge plus one-time backup.
-2. **Unknown-key tolerance of the original PalaceChat client is unverified.**
+1. ~~**Silent deletion of sibling keys (live today).**~~ **Closed by Task 8**:
+   the additive map merge plus the one-time backup are shipped and tested.
+2. **Unknown-key tolerance of the original PalaceChat client is UNVERIFIED.**
    The additive design never modifies its keys, but the extra `prefs` block does
    sit in the same file. If PalaceChat rejects unknown keys, the fallback is to
-   move our preferences to a separate file, mirroring the layout decision. This
-   must be tested before shipping, not assumed.
-3. **Byte-identity is not guaranteed today.** Reordering and reformatting happen
-   on every current write (`settings.rs:323`). Task 8 must prove, by test, that
-   foreign keys and their order survive unchanged.
+   move our preferences to a separate file, mirroring the layout decision. No
+   test on this machine can prove how the closed-source sibling client parses
+   the file; the only real check is the user running PalaceChat against a file
+   this client has written. Label: unproven.
+3. ~~**Byte-identity is not guaranteed today.**~~ **Closed by Task 8**; see the
+   writer tests above.
 4. **Connection options must never take effect without a reconnect.** `host`,
-   `port`, `username`, and `identity` all mark `reconnect`. The QA check for this
-   document enforces that no row in that group carries `live`. A UI that
-   reconnects silently would violate the plan's guardrails.
-5. **Legacy `puid` and the credential.** Both must stay out of new writes;
-   `settings.rs:141-142` and `settings.rs:146` are the pins. A merge layer that
-   round-trips the raw map must be careful not to reintroduce `puid`.
-6. **Geometry must not leak into the shared file.** `layout.json` is separate by
-   design (`share-safe: separate`). Writing panel rectangles into
-   `settings.json` would expose this work to the sibling client and is forbidden
-   by Task 7.
+   `port`, `username`, and `identity` all mark `reconnect`. The shipped UI saves
+   them for the next connection and raises "Reconnect required" instead of
+   reconnecting (`connectionPrefs.dom.test.ts`, `prefs.rs`). Enforced.
+5. **Legacy `puid` and the credential.** Both stay out of new writes;
+   `settings.rs` keeps the `puid` migration read-once and the password
+   `#[serde(skip)]`, with a test that greps the saved document for
+   "password"/"secret" and finds none (`connection_prefs.rs`).
+6. **Geometry must not leak into the shared file.** `window-layout.json` is
+   separate by design (`share-safe: separate`); `settings.json` gains only the
+   `prefs` block.
 
 ## Verification of this document
 

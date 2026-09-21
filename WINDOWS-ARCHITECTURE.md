@@ -1,7 +1,11 @@
 # Windows Architecture: the multi-window state contract
 
-Status: Task 2 deliverable, written 2026-09-19 against commit `1dd56b5` plus the
-uncommitted prop bag and prop editor work.
+Status: Task 2 deliverable, written 2026-09-19 against commit `1dd56b5`.
+Reconciled to shipped behaviour by Task 29 (2026-09-21) against save point
+`44d76ac` + the Task 29 route fix: the `refresh()` replay list is now the
+shipped one, the Preferences window is documented as a tool window, the
+destroy→re-dock semantics and the measured startup order are recorded, and the
+routes are stated as fragment-only.
 Scope: this is a contract and decision document. It does not design UI and does
 not propose code. Every claim below was checked against the current sources;
 citations are `file:line`.
@@ -65,7 +69,7 @@ windows:
 
 There is exactly one `palace://event` channel (`src/lib/api.ts:6`,
 `src-tauri/src/commands.rs:22`) and one broadcast site
-(`src-tauri/src/lib.rs:176`, `app.emit`). Every window listens to the same
+(`src-tauri/src/lib.rs:298`, `app.emit`). Every window listens to the same
 channel. A detached window must never call `connect`, must never own a socket,
 and must never publish its own event channel.
 
@@ -182,7 +186,27 @@ Row justifications:
   goes through `store.toggleBagProp` -> `set_props`, which needs `store.self`
   from the `users` event.
 
-### 4.3 The editor is not a panel
+### 4.3 The Preferences window is a tool window, not a panel
+
+`prefs` (`src-tauri/src/windows.rs`, `ToolWindow::Preferences`) is a peer view
+but deliberately **not** a `Panel`: it is never docked, never marked detached,
+never reopened at startup, and its close is a plain discard (Task 19). Because
+it is not a `Panel`, it has no column in the §4.2 matrix. What it needs and
+where it gets it:
+
+- `prefs` values: the `get_prefs` / `set_prefs` / `reset_prefs` /
+  `set_connection_settings` commands (never `refresh`).
+- session state: none. It shows settings, not the session.
+- its own geometry: remembered like every other tracked window
+  (`windows::tracks_geometry` returns true for a tool-window label,
+  `windows.rs:191-193`), so move/resize/close are recorded and its saved
+  rectangle is re-applied when it is opened again (Task 27). It is still never
+  part of the detach order and never reopened by the restore loop.
+- route: `#/prefs`; label `prefs`; capability `capabilities/prefs.json` grants
+  `core:event:default` and no window create/close/destroy or dialog
+  permission (Task 19).
+
+### 4.4 The editor is not a panel
 
 The prop editor (`components/editor/EditorDialog.svelte`) is deliberately not in
 the detachable set, per the plan's recon decision. It stays a modal opened from
@@ -194,60 +218,54 @@ turned into a detached panel by a later task without revisiting this contract.
 
 ---
 
-## 5. The `refresh()` gap list (this is Task 10's specification)
+## 5. The `refresh()` replay (as shipped in `44d76ac`)
 
 `refresh` is an event replay, not a snapshot. The command is
-`src-tauri/src/commands.rs:562-564`; the runtime handles `ClientCommand::Refresh`
-at `crates/palace-client/src/runtime.rs:1072` and runs the resync block at
-`crates/palace-client/src/runtime.rs:1117-1144`. What that block re-emits is:
-status, banner, rooms, users, room (if any), the most recent 120 chat lines, and
-the last composed screen. Everything below is what a late-opening window is
-still missing.
+`src-tauri/src/commands.rs:629`; the runtime handles `ClientCommand::Refresh`
+and runs the resync block at `crates/palace-client/src/runtime.rs:1148-1178`.
+What that block re-emits, in order:
 
-1. **Chat scrollback: 120 replayed against a 500 cap.** The replay window is
-   120 (`crates/palace-client/src/runtime.rs:1134`); the frontend holds up to 500
-   (`CHAT_LIMIT`, `src/lib/store.svelte.ts:49`) and the backend transcript is
-   capped at 500 (`crates/palace-client/src/state.rs:302`). A detached Chat
-   window can open showing at most 120 prior lines. Task 10 must raise the
-   replay window to at least 500 or record a deliberate smaller justification.
-2. **Avatar roster is not replayed.** The resync block never emits `avatars`.
-   The roster is published only at the roster trigger sites
-   (`crates/palace-client/src/runtime.rs:1008-1753`, definition at `:2616-2623`). A late
-   Room view therefore gets the room frame and geometry from `screen`, but its
-   sprite layer (`Viewport.svelte:267-280`) stays empty until the next roster
-   trigger (someone moves, enters, changes props or face). This is a real gap
-   the plan's PRE-START note did not name. Task 10 should re-emit the roster
-   during resync, or the room panel will look wrong on open in the normal
-   sprite-drawing mode.
-3. **Notices are not replayed.** `notices` fills from `note` and `script`
-   events (`src/lib/store.svelte.ts:339-351`), which resync never re-sends. A
-   detached Room view opens with no notices until new ones fire. Acceptable as
-   transient, but the decision must be explicit.
-4. **Tooltip is not replayed.** It is hover state (`src/lib/store.svelte.ts:63`,
-   `crates/palace-client/src/runtime.rs:1488`). Dropping it on open is correct.
-5. **Settings are not replayed.** Only `TopBar.svelte:12-20` calls
-   `get_settings`. Any detached panel that reads `store.settings` (notably the
-   Chat panel for its local echo name, and the Status bar if a panel shows it)
-   must call `get_settings` itself on mount.
-6. **Audio state is not replayed.** Only `AudioDialog.svelte:15-24` calls
-   `get_audio_state`. No detached panel owns audio controls, so no action unless
-   that changes.
-7. **The bag snapshot is not replayed.** It is fetched with the `bag_*` and
+status, banner, rooms, users, room (if any), the **full** 500-line chat
+scrollback (`CHAT_REPLAY_LIMIT = CHAT_SCROLLBACK_CAP`,
+`runtime.rs:1165`, `state.rs:42`), the retained notices
+(`runtime.rs:1168`), the avatar roster (`runtime.rs:1171`), and the last
+composed screen.
+
+That closes the two real gaps this section listed when it was written:
+
+1. **Chat scrollback.** The replay window was 120 against a 500 cap; Task 10
+   raised it to the full cap (`runtime.rs:67`).
+2. **Avatar roster.** The resync block never used to emit `avatars`, so a
+   late-opening Room view drew no sprites until the next roster trigger;
+   Task 10 re-emits it (`runtime.rs:1171`).
+
+The remaining items were decisions, not gaps, and still hold:
+
+3. **Tooltip is not replayed.** It is hover state
+   (`src/lib/store.svelte.ts:91`); dropping it on open is correct.
+4. **Settings are not replayed, but every window that reads them fetches
+   them.** `ChatPanel.svelte:50` calls `get_settings` itself for its local
+   echo, as `TopBar.svelte:13` does in the shell
+   (`src-tauri/src/commands.rs`, `get_settings`).
+5. **Audio state is not replayed.** `get_audio_state` belongs to the Audio
+   dialog (`store.svelte.ts:448`, `AudioDialog.svelte:15`); no detached panel
+   owns audio controls.
+6. **The bag snapshot is not replayed.** It is fetched with the `bag_*` and
    `outfits_*` commands and gathered by `store.loadBag()`
-   (`src/lib/store.svelte.ts:193-213`). A detached Prop bag panel must call
-   `loadBag()` on mount exactly as the modal does today, or it opens empty.
-8. **The editor session is not replayed.** `EditorDialog` fetches it with
-   `editor_state` on mount (`EditorDialog.svelte:741-756`), and `editor_state`
-   returns `null` when no session is open (`src-tauri/src/editor.rs:1994`).
-9. **The viewport is not replayed and never should be.** Each window measures
-   its own DOM and calls `set_viewport` (`Viewport.svelte:114-115`). The
+   (`PropBagDialog.svelte:113,141`), which every mount calls.
+7. **The editor session is not replayed.** `EditorDialog` fetches it with
+   `editor_state` on mount; `editor_state` returns `null` when no session is
+   open (`src-tauri/src/editor.rs`).
+8. **The viewport is not replayed and never should be.** Each window measures
+   its own DOM and calls `set_viewport` (`Viewport.svelte:132`). The
    `screen.geometry` a window receives is computed for the viewport it last
-   reported. A detached Room window must report its own size before trusting
-   geometry; this is the cross-talk risk Task 17 owns.
-10. **Per-window UI state is not replayed by design.** `scale`, `native`,
-    `showNames`, `showAvatars` and `roomFilter` are not persisted and not
-    synchronized (section 2.2). Only the Layout memory group (Task 27) will
-    persist geometry and detach state, and even that is not shared live.
+   reported; the geometry reply is tagged with the owning label and a
+   monotonic epoch so a stale reply is ignored (Task 17).
+9. **Per-window UI state is not replayed by design.** `scale`, `native`,
+   `showNames`, `showAvatars` and `roomFilter` are not synchronized
+   (section 2.2). Layout memory (Task 27) persists geometry and detach state,
+   and broadcasts changes on `palace://layout`, but the values above stay
+   per-window.
 
 ### 5.1 Scrollback owner, stated unambiguously
 
@@ -278,13 +296,26 @@ back.
 **Titlebar close.** Closing a panel window from its own titlebar is defined as a
 re-attach, not a discard. The close is intercepted and turned into the same
 path as the Re-attach button. The main window must end up with exactly one
-docked panel and no duplicate window. Task 6 wires the signal; Task 14 has the
-edge-case test.
+docked panel and no duplicate window (Task 14's edge-case test).
 
-**App quit.** All windows close. Geometry and detach state are saved on
-move, resize and close (debounced), then restored on next launch with off-screen
-clamping. Geometry lives in its own file, never in the shared `settings.json`;
-the path and format are fixed in section 6.1.
+**Spontaneous death — destroy means re-dock.** A panel's webview can die
+without any close request (a crashed or killed renderer). `WindowEvent::
+Destroyed` classifies that case and re-docks the panel, so `main` never keeps a
+ghost placeholder over a window that no longer exists. The signal reuses
+`PANEL_CLOSED_EVENT` and logs `reattached … via=destroyed` to distinguish it
+from a user close (Task 18, `layout_lifecycle.rs`). The classifier is a pure
+function with three outcomes: re-dock (spontaneous death), silent (the app is
+quitting), ignore (the close was already handled, so no duplicate signal). A
+`main` webview that dies spontaneously runs the same quit path, so panels are
+never orphaned over a dead session.
+
+**App quit.** All windows are destroyed, including `prefs`. `main`'s close
+request destroys the open panels rather than close-requesting them, so a panel
+cannot veto the quit. Geometry and detach state are saved on move, resize and
+close (debounced), then restored on next launch with off-screen clamping.
+Detached flags are deliberately preserved across a quit, so the layout survives.
+Geometry lives in its own file, never in the shared `settings.json`; the path
+and format are fixed in section 6.1.
 
 **Apply semantics for options.** This document does not enumerate preference
 keys; `PREFERENCES.md` (Task 5) owns the per-key live-versus-reconnect column.
@@ -352,6 +383,73 @@ the detach/re-attach actions (Task 18). The window-event path saves geometry but
 never changes the flag: a panel closing because the app is quitting must stay
 marked detached, or the next launch would not reopen it.
 
+**Remembering can be turned off.** The layout file carries its own `remember`
+flag (default `true`). With it off, `LayoutStore::flush` is a no-op, so move,
+resize, detach and close cannot touch the file; the one exception is the write
+that records the flag itself. A store that reads `remember: false` deliberately
+does not load the saved geometry, so the session starts from the default
+single-window layout and turning memory back on cannot resurrect a stale detach
+flag. This is the Layout memory preference group (Task 27); the flag lives in
+this file, never in `settings.json`.
+
+### 6.2 Startup order (measured on `44d76ac`)
+
+This is the real order, observed in a launch log
+(`.omo/evidence/task-29-boot.txt`) and traced to `src-tauri/src/lib.rs`. The
+plan's prose ("layout restore → window creation → connection") is an
+idealisation; the differences are called out below.
+
+1. **Logging first.** `logging::init()` runs before the Tauri builder
+   (`lib.rs:472`), so a failure to open the log goes to stderr and everything
+   after it is captured.
+2. **Process-global slots and catalogs**, before any window exists: prop
+   catalog, bag service, editor slot, and settings defaults plus the command
+   line (`lib.rs:475-510`).
+3. **Window creation precedes `setup`.** Tauri creates the configured `main`
+   window when the event loop starts; `.setup` only *logs* it
+   (`lib.rs:641-645`). The window therefore exists before the layout file is
+   read.
+4. **`setup` runs, in this order** (`lib.rs:638-714`): log "palace-app
+   starting"; load settings from disk and resolve defaults/saved/args; ensure
+   an identity exists (persisting a generated one); log the target and spawn
+   the audio engine; `manage(AppState)`; read preferences and configure the
+   chat-log transcript and notification services **before the pump starts**, so
+   the session's first line is written; `LayoutStore::discover` + manage;
+   `spawn_autosave`; `geometry::schedule_restore`; `start_client` (pump +
+   connection); log "client runtime started".
+5. **The layout restore runs inline, between `schedule_restore` and the
+   "client runtime started" line.** `schedule_restore` asks
+   `AppHandle::run_on_main_thread` to run it "after `setup` returns"
+   (`geometry.rs:788`), but `tauri-runtime-wry` executes that message
+   immediately when the caller is already the main thread
+   (`send_user_message`, `tauri-runtime-wry 2.x`, `src/lib.rs:239`), and
+   `.setup` is on the main thread. So the restore — `main`'s remembered
+   position, then each detached panel reopened in saved order at its saved
+   rectangle (`geometry.rs:736-782`) — completes **before** `start_client` is
+   called. Nothing deadlocks; it is simply synchronous here.
+6. **Windows that were not mapped yet get a deferred second apply.** Immediately
+   after the placement, `apply_when_mapped` starts a short-lived background
+   thread that re-applies it once the window reports a real size
+   (`geometry.rs:699-727`).
+7. **Each window seeds itself once.** Every webview (the shell and every panel)
+   subscribes to `palace://event` and calls `refresh` exactly once on mount
+   (`src/lib/session.ts`, `PanelWindow.svelte`); the command logs
+   `refresh_requested epoch=N` per window (`commands.rs:629-632`).
+8. **`on_window_event(handle_window_event)` is attached before `.run()`**
+   (`lib.rs:716`), so move/resize/close/destroy from the very first frame are
+   seen by the geometry and lifecycle paths.
+
+One practical consequence: because the restore is synchronous with `setup`, a
+slow monitor query or a stuck window-placement call would delay `start_client`.
+The order above is what a launch log proves; it is not a claim that the phases
+are concurrent.
+
+**Route note.** Panel and tool-window labels load `#/panel/<id>` and
+`#/prefs`. The route must be a bare fragment: Tauri only treats the literal
+`index.html` as the root document, so `index.html#/panel/<id>` made the
+document's path `/index.html`, and SvelteKit's router rendered its own 404 page
+instead of the panel (found and fixed in Task 29, `windows.rs`).
+
 ---
 
 ## 7. Forbidden designs
@@ -372,21 +470,26 @@ marked detached, or the next launch would not reopen it.
 
 ## Appendix: verification notes
 
-The matrix was built by reading, not by assuming:
+The matrix was built by reading, not by assuming. Task 29 re-checked the claims
+that Tasks 13-28 changed and corrected the ones that no longer held; the two
+entries marked "(Task 29)" are the corrected ones.
 
 - The event union and the `refresh` / `onEvent` wrappers were read at
   `src/lib/api.ts:150-172`, `:475`, `:529`.
 - The exact replay set came from the resync block at
-  `crates/palace-client/src/runtime.rs:1117-1144`, and the transcript cap from
-  `crates/palace-client/src/state.rs:292-306`.
-- The seed pattern was read in `App.svelte:60-80`.
-- The avatar-roster gap was confirmed by checking every `emit_avatar_roster`
-  call site (`crates/palace-client/src/runtime.rs:1008,1021,1028,1040,1046,1296,1427,1440,1483,1497,1753`)
-  against the resync block: none is inside it.
+  `crates/palace-client/src/runtime.rs:1148-1178`, the transcript cap from
+  `crates/palace-client/src/state.rs:42`, and the replay count from
+  `CHAT_REPLAY_LIMIT` (`runtime.rs:67`). (Task 29: the block now also replays
+  notices and the avatar roster, and sends the full 500-line scrollback.)
+- The seed pattern was read in `src/lib/session.ts` and `PanelWindow.svelte`;
+  the old `App.svelte:60-80` citation is superseded.
+- ~~The avatar-roster gap was confirmed…~~ (Task 29: closed — `emit_avatar_roster`
+  runs inside the resync block at `runtime.rs:1171`.)
 - Bag and editor state were traced from
-  `PropBagDialog.svelte:308-321` -> `store.loadBag()` (`store.svelte.ts:193-213`)
-  -> `bag_*` commands (`api.ts:378-448`), and from
-  `EditorDialog.svelte:741-756` -> `api.editorState()` -> `editor_state`
-  (`editor.rs:1994`).
-- Settings and audio fetch sites were traced to `TopBar.svelte:12-20` and
-  `AudioDialog.svelte:15-24`.
+  `PropBagDialog.svelte:113,141` -> `store.loadBag()` -> `bag_*` commands, and
+  from `EditorDialog.svelte` -> `api.editorState()` -> `editor_state`
+  (`src-tauri/src/editor.rs`).
+- Settings and audio fetch sites were traced to `TopBar.svelte:13`,
+  `ChatPanel.svelte:50` and `store.svelte.ts:448`.
+- The startup order was checked against a real launch log; see
+  `.omo/evidence/task-29-boot.txt` for the raw lines and the step mapping.
