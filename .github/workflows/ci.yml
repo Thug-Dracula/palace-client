@@ -47,7 +47,10 @@ jobs:
       # behaviour is proven here instead: every display-gated test runs on the
       # real Tauri runtime under Xvfb. The display is given a real size because
       # `xvfb-run`'s 640x480 default is smaller than geometry_persistence's
-      # fixtures, which would make that test skip instead of run. The WEBKIT_*
+      # fixtures, which would make that test skip instead of run. `GDK_BACKEND`
+      # pins GTK to X11: without it GDK prefers Wayland whenever a `wayland-0`
+      # socket is reachable, which on a developer machine means the test paints
+      # on their real desktop instead of the virtual display. The WEBKIT_*
       # variables are the standard workaround for WebKitGTK on a GPU-less
       # runner; they change rendering, not behaviour. The Tests step above
       # already ran these binaries without a display, exercising their skip
@@ -55,6 +58,7 @@ jobs:
       - name: Real-window tests (real webviews on a virtual display)
         run: xvfb-run -a -s "-screen 0 1920x1080x24" cargo test -p palace-app --locked --no-fail-fast -- --nocapture --test-threads=1
         env:
+          GDK_BACKEND: "x11"
           WEBKIT_DISABLE_DMABUF_RENDERER: "1"
           WEBKIT_DISABLE_COMPOSITING_MODE: "1"
 

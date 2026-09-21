@@ -32,6 +32,13 @@
 //! session — including the developer's own — is a skip, not a test. The same
 //! check runs again inside [`Harness::launch`], so a test cannot bypass it.
 //!
+//! The gate is necessary but not sufficient: a proven-Xvfb `DISPLAY` does not
+//! stop GDK from choosing Wayland when the session's `wayland-0` socket is
+//! reachable. [`Harness::launch`] therefore also pins `GDK_BACKEND=x11`, drops
+//! `WAYLAND_DISPLAY`, and points `XDG_CONFIG_HOME` at a scratch directory, so a
+//! test can neither paint on the user's screen nor overwrite their real
+//! `settings.json`.
+//!
 //! # It does not depend on a dev server
 //!
 //! In a debug build Tauri resolves `WebviewUrl::App` against `build.devUrl`
@@ -233,6 +240,35 @@ fn process_commands() -> Vec<String> {
         .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
         .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Process isolation
+// ---------------------------------------------------------------------------
+
+/// Force this process onto X11 and give it a throwaway config directory.
+///
+/// Proving `DISPLAY` names an `Xvfb` is **not** enough on its own. With
+/// `GDK_BACKEND` unset, GDK prefers Wayland whenever the session's `wayland-0`
+/// socket is reachable — including the developer's real desktop — so the app
+/// would render on the user's screen even though `DISPLAY` points at the
+/// virtual one. `GDK_BACKEND=x11` removes that possibility, exactly as
+/// `geometry_persistence` and `layout_lifecycle` do for their child processes.
+///
+/// `XDG_CONFIG_HOME` is redirected to a scratch directory so a test that drives
+/// the production `connect` command cannot overwrite the user's real shared
+/// `settings.json` (the same file the sibling PalaceChat client reads, and the
+/// one holding the account identity).
+///
+/// Returns the scratch config directory, so callers can log or inspect it.
+fn isolate_process() -> PathBuf {
+    let config_dir =
+        std::env::temp_dir().join(format!("palace-harness-config-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&config_dir);
+    std::env::set_var("GDK_BACKEND", "x11");
+    std::env::remove_var("WAYLAND_DISPLAY");
+    std::env::set_var("XDG_CONFIG_HOME", &config_dir);
+    config_dir
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +487,7 @@ impl Harness {
         F: FnOnce(tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> + Send + 'static,
     {
         let display = virtual_display()?;
+        let isolated_config = isolate_process();
         let serial = SERIAL
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -463,6 +500,10 @@ impl Harness {
             );
         }
         reports().clear();
+        println!(
+            "harness_isolation gdk_backend=x11 wayland=removed config_home={}",
+            isolated_config.display()
+        );
 
         let log_path = ensure_logger()?;
         let server = start_page_server()?;
@@ -903,6 +944,29 @@ fn the_gate_accepts_xvfb_serving_the_display() {
     assert!(
         gate_from(Some("builder:99"), None, &processes).is_err(),
         "a remote display is not the local virtual one"
+    );
+}
+
+#[test]
+fn the_harness_isolation_pins_x11_and_a_scratch_config_directory() {
+    let config = isolate_process();
+    assert_eq!(
+        std::env::var("GDK_BACKEND").as_deref(),
+        Ok("x11"),
+        "GDK must be pinned to X11, or a reachable wayland-0 puts the window on the user's desktop"
+    );
+    assert!(
+        std::env::var_os("WAYLAND_DISPLAY").is_none(),
+        "the wayland socket must not be offered to GDK"
+    );
+    assert_eq!(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        Some(config.as_os_str()),
+        "settings must land in a scratch dir, never the user's real one"
+    );
+    assert!(
+        config.starts_with(std::env::temp_dir()),
+        "the scratch config dir must live under the temp dir"
     );
 }
 
