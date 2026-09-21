@@ -5,6 +5,11 @@
 //! it at `/tmp/palace-hidden.prp` (or `PALACE_PRP_FIXTURE`). Its counts and the
 //! one stale CRC are pinned below because they are the observable contract the
 //! later writer must preserve — not because the reader repairs them.
+//!
+//! Both real-fixture tests are `#[ignore]`d: the fixture is local data that is
+//! not in the repository, so a normal run — and CI — must skip them rather than
+//! fail. Run them with
+//! `cargo test -p palace-prop --test prp_read -- --ignored` once it is in place.
 
 use std::panic::catch_unwind;
 
@@ -161,6 +166,7 @@ fn every_prefix_of_the_synthetic_roster_is_handled_without_panicking() {
 }
 
 #[test]
+#[ignore = "reads a local copy of Palace - Hidden.PRP; set PALACE_PRP_FIXTURE or place it at /tmp/palace-hidden.prp"]
 fn the_real_hidden_roster_matches_the_pinned_facts() {
     let Some(buf) = real_prp() else {
         panic!(
@@ -236,6 +242,7 @@ fn the_real_hidden_roster_matches_the_pinned_facts() {
 }
 
 #[test]
+#[ignore = "reads a local copy of Palace - Hidden.PRP; set PALACE_PRP_FIXTURE or place it at /tmp/palace-hidden.prp"]
 fn a_truncated_real_roster_errors_without_panicking() {
     let Some(buf) = real_prp() else {
         panic!(
