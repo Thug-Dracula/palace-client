@@ -86,17 +86,22 @@ misleading once. The test is whether the user can click a button and have it wor
 
 ## Version
 
-Staying at **0.2.0** until the main flow works. The next release should be
-**0.3.0 as a pre-release**, because the client gained real capability (own
-identity, correct guest list, complete instruction coverage, and now a
-multi-window shell with a Preferences window) but the headline flow — join a
-room and click — still fails. Do not call anything 1.0 while that
-is true. A version number is a promise; only raise it for a measurable,
-user-visible leap, and say what the leap is.
+**0.3.0** — published as a pre-release (`v0.3.0-alpha`), 2026-09-21.
 
-The modularity work (2026-09-20/21) is a shell-and-settings leap, not a fix for
-the headline flow, so it was deliberately **not** version-bumped by the docs
-task that recorded it. The 0.3.0 pre-release intent above is unchanged.
+**The leap this number promises:** the client became a real multi-window
+application. Five panels — Users, Rooms, Chat/log, Prop bag and Room view —
+detach into their own OS windows and re-attach; the window layout is remembered
+across a restart; and a Preferences window covers ten groups (connection &
+identity, appearance, graphics/avatar, sound, chat logging, mute/ignore,
+notifications, layout memory and the shell itself).
+
+**What it explicitly does NOT promise:** a working main flow. Joining a room and
+clicking still fails — clicks land on the room but miss the hotspots — so this is
+a **pre-release**, and nothing here is called 1.0. Do not raise the version past a
+pre-release until the headline flow works.
+
+A version number is a promise; only raise it for a measurable, user-visible leap,
+and say what the leap is.
 
 ## The lesson this project taught
 

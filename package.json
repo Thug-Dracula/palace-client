@@ -1,6 +1,6 @@
 {
   "name": "palace-client",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Palace-compatible desktop client (Tauri v2 + SvelteKit 5)",
   "type": "module",
   "scripts": {

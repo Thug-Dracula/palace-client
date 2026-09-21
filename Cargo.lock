@@ -1939,11 +1939,11 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "iptscrae"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "iptscrae-palace"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "iptscrae",
  "palace-room",
@@ -2760,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "palace-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fontdue",
  "image",
@@ -2779,7 +2779,7 @@ dependencies = [
 
 [[package]]
 name = "palace-asset"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "palace-prop",
  "palace-wire",
@@ -2789,7 +2789,7 @@ dependencies = [
 
 [[package]]
 name = "palace-audio"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "palace-asset",
  "rodio",
@@ -2798,7 +2798,7 @@ dependencies = [
 
 [[package]]
 name = "palace-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "palace-asset",
  "palace-host",
@@ -2814,7 +2814,7 @@ dependencies = [
 
 [[package]]
 name = "palace-host"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "iptscrae",
@@ -2826,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "palace-probe"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "palace-wire",
  "serde_json",
@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "palace-prop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "png 0.18.1",
@@ -2842,7 +2842,7 @@ dependencies = [
 
 [[package]]
 name = "palace-render"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fontdue",
  "image",
@@ -2854,7 +2854,7 @@ dependencies = [
 
 [[package]]
 name = "palace-room"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "palace-wire",
  "serde_json",
@@ -2862,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "palace-wire"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
 ]

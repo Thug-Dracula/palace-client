@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # `ureq` 3.x (used by `palace-asset` for the media fetch) requires 1.85;
 # `rodio` 0.22 (used by `palace-audio`) requires 1.87.
