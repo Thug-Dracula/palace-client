@@ -73,13 +73,16 @@ misleading once. The test is whether the user can click a button and have it wor
   settings file is unproven: this client only adds keys and never edits
   PalaceChat's own, but whether the closed-source sibling tolerates an unknown
   block cannot be tested from here (see `PREFERENCES.md` → Risks 2).
-- **The multi-window test harness may not be display-isolated on a machine with
-  a live Wayland session.** `xvfb-run` sets `DISPLAY`, but GTK3 falls back to
-  the live `wayland-0` socket when `WAYLAND_DISPLAY` is unset, so a harness run
-  can land on the real desktop unless `GDK_BACKEND=x11` is forced. The
-  geometry tests already force it; the shared harness and CI do not. Found
-  during Task 29, not fixed here (out of scope) — evidence and reproduction in
-  `.omo/evidence/task-29-boot.txt`.
+- **The multi-window test harness was not display-isolated on a machine with a
+  live Wayland session — FIXED in `8f60327`.** `xvfb-run` sets `DISPLAY`, but
+  GTK3 falls back to the live `wayland-0` socket when `WAYLAND_DISPLAY` is
+  unset, so a harness run could land on the real desktop unless
+  `GDK_BACKEND=x11` is forced. The shared harness now forces it, removes
+  `WAYLAND_DISPLAY`, and redirects `XDG_CONFIG_HOME` to a scratch directory.
+  Verified by running the full suite with `WAYLAND_DISPLAY=wayland-0`
+  deliberately set: the log shows `harness_isolation gdk_backend=x11
+  wayland=removed`, and the user's real `settings.json` hash was unchanged
+  across the run.
 
 ## Version
 
@@ -547,8 +550,12 @@ document now states what a launch log shows.
 - `cargo clippy -p palace-app --all-targets -- -D warnings` — clean.
 - `cargo test -p palace-client` — **271 passed, 0 failed**.
 - `env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1920x1080x24" cargo test -p palace-app`
-  — **281 passed, 0 failed** across 17 test binaries (one more than the 280
-  measured before Task 29: the new route regression test).
+  — **287 passed, 0 failed** across 17 test binaries (lib 183,
+  geometry_persistence 17, layout_lifecycle 15, viewport_geometry 11,
+  panel_registry 11, chat_log 8, cross_window_integration 8,
+  multiwindow_harness 7, settings_persistence 7, single_window_baseline 7,
+  cross_window 4, sound_prefs 3, window_logging 3, connection_prefs 2,
+  log_panics 1). Independently re-confirmed by the F3 QA pass.
 - `bun run check` — 0 errors, 0 warnings; `bun run test` — **491 passed in 52
   files** (the modularity baseline was 483/51; Task 29 adds
   `emptyStates.dom.test.ts`).
@@ -561,36 +568,35 @@ document now states what a launch log shows.
   the windows look and feel right (see "Needs a human", steps 5–7).
 - The `build/` SPA was rebuilt from the current tree for the Task 29 evidence,
   because the checked-in `build/` predated the panel work.
-- Two out-of-scope findings are recorded in `.omo/evidence/task-29-boot.txt`:
-  the harness/CI display-isolation gap (GTK can pick the live Wayland session
-  unless `GDK_BACKEND=x11` is forced), and the `settings.json.bak` state of the
-  user's config on this machine.
+- Two findings from Task 29 are recorded in `.omo/evidence/task-29-boot.txt`.
+  Both were **fixed after Task 29** in `8f60327` (see "Fixed after Task 29"
+  below), except that the user's live `settings.json` still needs the one-line
+  restore.
 
-### Found but not fixed (out of Task 29's scope — for F1–F4)
+### Fixed after Task 29 (found during it, closed in `8f60327`)
 
-1. **`cargo test -p palace-app` overwrites the shared `settings.json`.**
-   `src-tauri/tests/cross_window_integration.rs:150` builds its app state from
-   `Settings::from_env()` (no identity, host `localhost`, user `Guest`) and
-   its `connect` invoke (line 305) reaches `commands::connect` →
-   `commands::persist_best_effort` (`src-tauri/src/commands.rs:81`), which
-   saves to the real config path. Observed twice: an app-suite run at 18:27
-   and this task's gate run at 20:15:56, each leaving a 155-byte file with
-   `"identity": null`. The suite should run against a scratch
-   `XDG_CONFIG_HOME` (that is how every safe probe in Task 29 ran). **This is
-   the user's live, shared config**: the original values, including the
-   identity this client and PalaceChat shared, survive in
-   `~/.config/org.palace.client/settings.json.bak`. Restoring them is one
-   copy — `cp ~/.config/org.palace.client/settings.json.bak
-   ~/.config/org.palace.client/settings.json` — and is left to the user
-   because it is their live configuration.
-2. **The multi-window harness and CI do not force `GDK_BACKEND=x11`.** The
-   per-test children do (`geometry_persistence.rs:618`,
-   `layout_lifecycle.rs:1435`), but the shared harness proves the display is
-   virtual without making GDK use it, and GTK3 can otherwise prefer the live
-   `wayland-0` socket. On a machine with a real session, harness windows can
-   land on the desktop. Reproduced with a GTK probe (display `wayland-0` vs
-   `:99`); the details and the reproduction are in
-   `.omo/evidence/task-29-boot.txt`.
+1. **`cargo test -p palace-app` overwrote the shared `settings.json` — FIXED.**
+   `cross_window_integration.rs` drives the real `connect` command, which
+   persists to the real config path; two runs (18:27 and 20:15:56) left a
+   155-byte file with `"identity": null`. The shared harness now redirects
+   `XDG_CONFIG_HOME` to a per-process scratch directory *before* the app builds,
+   so no test can reach the real file. Verified: the full suite ran with the
+   user's `settings.json` hash byte-identical before and after. **The live file
+   itself was already damaged before the fix** and is left for the user to
+   restore, because it is their shared configuration: the originals (host,
+   username, SoundFont, and the identity this client and PalaceChat share)
+   survive in `~/.config/org.palace.client/settings.json.bak`. One copy:
+   `cp ~/.config/org.palace.client/settings.json.bak
+   ~/.config/org.palace.client/settings.json`
+2. **The multi-window harness and CI did not force `GDK_BACKEND=x11` — FIXED.**
+   The per-test children already did, but the shared harness proved the display
+   was virtual without making GDK use it, and GTK3 could otherwise prefer the
+   live `wayland-0` socket — so a harness window could land on the desktop. The
+   harness now forces `GDK_BACKEND=x11` and removes `WAYLAND_DISPLAY`, and the
+   CI job sets `GDK_BACKEND: "x11"`. Verified by running the full suite with
+   `WAYLAND_DISPLAY=wayland-0` deliberately set; the log shows
+   `harness_isolation gdk_backend=x11 wayland=removed`. Regression test:
+   `the_harness_isolation_pins_x11_and_a_scratch_config_directory`.
 
 
 
