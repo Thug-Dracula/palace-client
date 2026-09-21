@@ -224,4 +224,22 @@ describe("detach control", () => {
     expect(document.querySelector('.sidebar[data-panel="users"]')).not.toBeNull();
     expect(document.querySelector("[data-detach]")).toBeNull();
   });
+
+  it("reports a failed detach instead of failing silently", async () => {
+    vi.mocked(api.openPanel).mockImplementationOnce(async () => {
+      throw new Error("window creation refused");
+    });
+    await renderMain();
+
+    document.querySelector<HTMLButtonElement>('[data-detach="users"]')?.click();
+    await vi.waitFor(() =>
+      expect(document.querySelector(".detach-error")?.textContent).toContain(
+        "window creation refused",
+      ),
+    );
+
+    expect(placeholder("users")).toBeNull();
+    expect(live("users")).not.toBeNull();
+    expect(document.querySelector('[data-detach="users"]')?.classList.contains("failed")).toBe(true);
+  });
 });

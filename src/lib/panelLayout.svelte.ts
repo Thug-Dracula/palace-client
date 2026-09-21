@@ -37,6 +37,20 @@ function allDocked(): Record<PanelId, boolean> {
 class PanelLayout {
   private state = $state<Record<PanelId, boolean>>(allDocked());
 
+  /**
+   * Why the last detach of a panel failed, if it did.
+   *
+   * It lives here rather than in the detach button because a failed detach
+   * re-docks the panel, which remounts that button and would discard any error
+   * held locally.
+   */
+  private errors = $state<Partial<Record<PanelId, string>>>({});
+
+  /** The message from the last failed detach of `panel`, if there was one. */
+  errorFor(panel: PanelId): string | null {
+    return this.errors[panel] ?? null;
+  }
+
   /** Whether `panel` currently lives in its own OS window. */
   isDetached(panel: PanelId): boolean {
     return this.state[panel];
@@ -55,6 +69,7 @@ class PanelLayout {
   /** Dock every panel again. */
   reset(): void {
     this.state = allDocked();
+    this.errors = {};
   }
 
   /**
@@ -122,17 +137,20 @@ class PanelLayout {
    * Move `panel` into its own window.
    *
    * Resolves once Rust has answered. If the window could not be created the
-   * grid slot is restored and the error re-thrown so the caller can report it.
+   * grid slot is restored, the reason is recorded for the panel header, and the
+   * error is re-thrown.
    */
   async detach(panel: PanelId): Promise<void> {
     if (this.state[panel]) {
       return;
     }
+    delete this.errors[panel];
     this.state[panel] = true;
     try {
       await api.openPanel(panel);
     } catch (error) {
       this.state[panel] = false;
+      this.errors[panel] = error instanceof Error ? error.message : String(error);
       throw error;
     }
   }

@@ -10,6 +10,11 @@
   // also keeps every panel header identical in both places.
   const detachable = !isPanelWindow();
 
+  // The store holds the reason, not this component: a failed detach re-docks the
+  // panel and remounts this button, so a local error would be lost. The catch
+  // only stops the rejection being unhandled; the store does the reporting.
+  const error = $derived(panelLayout.errorFor(panel));
+
   function onDetach(event: MouseEvent): void {
     // The header around this button is not interactive today, but stopping the
     // event keeps the control safe if a header ever becomes clickable.
@@ -21,10 +26,13 @@
 {#if detachable}
   <button
     class="btn ghost detach-btn"
+    class:failed={error !== null}
     type="button"
     data-detach={panel}
-    title="Detach to its own window"
-    aria-label={`Detach the ${panel} panel to its own window`}
+    title={error ? `Could not detach: ${error}` : "Detach to its own window"}
+    aria-label={error
+      ? `Could not detach the ${panel} panel: ${error}`
+      : `Detach the ${panel} panel to its own window`}
     onclick={onDetach}
   >
     <!-- A box with an arrow leaving it: the conventional "open in its own window". -->
@@ -34,6 +42,9 @@
       <path class="arrow" d="M10.5 1.5 5 7" />
     </svg>
   </button>
+  {#if error}
+    <span class="detach-error" role="alert">Couldn't detach: {error}</span>
+  {/if}
 {/if}
 
 <style>
@@ -54,6 +65,16 @@
 
   .detach-btn svg {
     display: block;
+  }
+
+  .detach-btn.failed {
+    color: var(--red);
+  }
+
+  .detach-error {
+    color: var(--red);
+    font-size: 0.7rem;
+    line-height: 1.2;
   }
 
   .box,

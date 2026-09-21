@@ -609,7 +609,7 @@ performed by the user's instruction (`settings.json` copied back from
 | Review | Verdict |
 |---|---|
 | F1 plan compliance | APPROVE — Must Have 8/8, Must NOT Have 10/10, Tasks 29/29 |
-| F2 code quality | APPROVE — fmt/clippy clean, 287 + 271 + 491 tests, no blocking slop; one silent-failure defect (cleanup item 1) |
+| F2 code quality | APPROVE — fmt/clippy clean, 287 + 271 + 491 tests, no blocking slop; one silent-failure defect found, since fixed |
 | F3 real QA | APPROVE — scenarios 58/58, integration 4/4, edge cases 4 |
 | F4 scope fidelity | APPROVE — tasks 29/29, contamination clean, 3 harmless unaccounted files |
 
@@ -629,12 +629,13 @@ Exact steps are under "Needs a human" above.
 
 ### Known cleanup items (found by the F2 review — none block approval)
 
-1. **`DetachButton.svelte:17` swallows a deliberately re-thrown failure.**
-   `panelLayout.detach()` re-throws when the panel window cannot be created
-   ("the error re-thrown so the caller can report it"), but the button discards
-   it with `.catch(() => {})`. So a failed detach does nothing and says nothing.
-   The grid slot is restored correctly; the failure is only invisible. Fixing it
-   needs a small UI choice about where to show the message.
+1. ~~**`DetachButton` swallowed a failed detach.**~~ **FIXED.** The reason now
+   lives in the layout store (`panelLayout.errorFor`) rather than in the button,
+   because a failed detach re-docks the panel and **remounts** that button — so a
+   locally-held error was discarded. The button now turns red, its tooltip and
+   accessible label carry the reason, and an inline `role="alert"` reads
+   "Couldn't detach: …". Pinned by `dockReflow.dom.test.ts` → "reports a failed
+   detach instead of failing silently".
 2. **Duplicated preference plumbing.** `booleanOr` is defined identically in
    `chatLogPrefs.ts`, `graphicsPrefs.ts` and `notificationsPrefs.ts`; the
    option-table + unsupported-keys + lookup trio is repeated five times; and five
