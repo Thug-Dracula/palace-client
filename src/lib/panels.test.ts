@@ -2,7 +2,7 @@
  * Route/view resolution for the panel-host split.
  *
  * The Rust registry (`src-tauri/src/windows.rs`) builds
- * `index.html#/panel/<id>` for every detached window, and its enum is the
+ * `#/panel/<id>` for every detached window, and its enum is the
  * authority on the five ids. These tests lock the frontend half of that
  * contract: which id a hash names, and whether a window showing it is the main
  * shell or a single detached panel.

@@ -46,7 +46,10 @@ pub const PREFS_LABEL: &str = "prefs";
 
 pub const PREFS_TITLE: &str = "Palace — Preferences";
 
-pub const PREFS_ROUTE: &str = "index.html#/prefs";
+/// A bare fragment on purpose: Tauri only treats the literal `index.html` as
+/// the root document, so `index.html#/prefs` would make the document path
+/// `/index.html` and SvelteKit's router would render its own 404 page.
+pub const PREFS_ROUTE: &str = "#/prefs";
 
 pub const PREFS_SIZE: (f64, f64) = (780.0, 620.0);
 
@@ -128,10 +131,10 @@ impl Panel {
     }
 
     /// The SPA route the window loads. The frontend's router reads the panel
-    /// name out of the hash.
+    /// name out of the hash. See [`PREFS_ROUTE`] for why it is fragment-only.
     #[must_use]
     pub fn route(self) -> String {
-        format!("index.html#/panel/{}", self.id())
+        format!("#/panel/{}", self.id())
     }
 
     /// Map a `panel_id` from the frontend onto the enum.
@@ -742,10 +745,31 @@ mod tests {
             assert!(is_panel_label(panel.label()));
             assert_eq!(
                 panel.route(),
-                format!("index.html#/panel/{}", panel.id()),
+                format!("#/panel/{}", panel.id()),
                 "the route is derived from the id"
             );
             assert_eq!(Panel::from_label(panel.label()), Some(panel));
+        }
+    }
+
+    #[test]
+    fn every_route_keeps_the_document_at_the_spa_root() {
+        // Regression: `index.html#/panel/users` joined onto the app URL gives
+        // the document the path `/index.html`, and SvelteKit answers that path
+        // with its own 404 page, so the panel window never mounted the panel.
+        let app_url = tauri::Url::parse("tauri://localhost/").expect("a valid app url");
+        let routes = Panel::ALL
+            .iter()
+            .map(|panel| panel.route())
+            .chain(std::iter::once(ToolWindow::Preferences.route()));
+        for route in routes {
+            let url = app_url.join(&route).expect("the route joins the app url");
+            assert_eq!(url.path(), "/", "document must stay at the root: {url}");
+            assert_eq!(
+                url.fragment(),
+                Some(route.trim_start_matches('#')),
+                "the route must travel in the hash: {route}"
+            );
         }
     }
 
@@ -903,7 +927,7 @@ mod tests {
         assert_eq!(ToolWindow::ALL, [ToolWindow::Preferences]);
         assert_eq!(ToolWindow::Preferences.label(), "prefs");
         assert_eq!(ToolWindow::Preferences.title(), "Palace — Preferences");
-        assert_eq!(ToolWindow::Preferences.route(), "index.html#/prefs");
+        assert_eq!(ToolWindow::Preferences.route(), "#/prefs");
         assert_eq!(
             ToolWindow::from_label("prefs"),
             Some(ToolWindow::Preferences)

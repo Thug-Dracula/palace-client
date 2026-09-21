@@ -1,8 +1,9 @@
 /**
  * The frontend half of the panel registry contract.
  *
- * `src-tauri/src/windows.rs` owns the closed enum and builds
- * `index.html#/panel/<id>` for every detached window. This module mirrors that
+ * `src-tauri/src/windows.rs` owns the closed enum and builds `#/panel/<id>`
+ * for every detached window (the route travels in the hash so the document
+ * stays at the SPA root). This module mirrors that
  * set and parses the hash back into a view, so App can mount either the full
  * shell (`main`) or exactly one panel.
  *
